@@ -336,6 +336,8 @@ export class PrIndexStore {
   private readonly enableVector: boolean;
   private db = new DatabaseSync(":memory:");
   private provider: LocalEmbeddingProvider | null = null;
+  private embeddingProviderInitPromise: Promise<LocalEmbeddingProvider | null> | null = null;
+  private embeddingProviderInitAttempted = false;
   private vectorAvailable = false;
   private vectorError: string | undefined;
   private initialized = false;
@@ -365,7 +367,7 @@ export class PrIndexStore {
     this.ensureSchema();
     if (this.enableVector) {
       await this.initVector();
-      await this.initEmbeddingProvider();
+      this.setMeta(META_EMBEDDING_MODEL, this.embeddingModel);
     } else {
       this.vectorAvailable = false;
       this.vectorError = "disabled";
@@ -493,14 +495,33 @@ export class PrIndexStore {
     }
   }
 
-  private async initEmbeddingProvider(): Promise<void> {
-    try {
-      this.provider = await createLocalEmbeddingProvider(this.embeddingModel);
-    } catch (error) {
-      this.provider = null;
-      this.vectorError = error instanceof Error ? error.message : String(error);
+  private async ensureEmbeddingProvider(): Promise<LocalEmbeddingProvider | null> {
+    if (!this.enableVector || !this.vectorAvailable) {
+      return null;
     }
-    this.setMeta(META_EMBEDDING_MODEL, this.embeddingModel);
+    if (this.provider) {
+      return this.provider;
+    }
+    if (this.embeddingProviderInitAttempted) {
+      return null;
+    }
+    if (!this.embeddingProviderInitPromise) {
+      this.embeddingProviderInitPromise = (async () => {
+        try {
+          const provider = await createLocalEmbeddingProvider(this.embeddingModel);
+          this.provider = provider;
+          return provider;
+        } catch (error) {
+          this.provider = null;
+          this.vectorError = error instanceof Error ? error.message : String(error);
+          return null;
+        } finally {
+          this.embeddingProviderInitAttempted = true;
+          this.embeddingProviderInitPromise = null;
+        }
+      })();
+    }
+    return this.embeddingProviderInitPromise;
   }
 
   private ensureVectorTable(dimensions: number): void {
@@ -572,7 +593,11 @@ export class PrIndexStore {
 
   private async embedDocuments(docs: SearchDocument[]): Promise<Map<string, number[]>> {
     const byHash = this.collectCachedEmbeddings(docs.map((doc) => doc.hash));
-    if (!this.provider || !this.vectorAvailable) {
+    if (!this.vectorAvailable) {
+      return byHash;
+    }
+    const provider = await this.ensureEmbeddingProvider();
+    if (!provider) {
       return byHash;
     }
     const missing = docs.filter((doc) => !byHash.has(doc.hash));
@@ -580,7 +605,7 @@ export class PrIndexStore {
       return byHash;
     }
     try {
-      const vectors = await this.provider.embedBatch(missing.map((doc) => doc.text));
+      const vectors = await provider.embedBatch(missing.map((doc) => doc.text));
       const timestamp = isoNow();
       for (let index = 0; index < missing.length; index += 1) {
         const doc = missing[index]!;
@@ -602,6 +627,66 @@ export class PrIndexStore {
       this.vectorAvailable = false;
     }
     return byHash;
+  }
+
+  private getAllSearchDocuments(): SearchDocument[] {
+    const rows = this.db
+      .prepare("SELECT * FROM search_docs ORDER BY updated_at DESC, doc_id ASC")
+      .all() as Array<{
+      doc_id: string;
+      pr_number: number;
+      doc_kind: "pr_body" | "comment";
+      title: string;
+      text: string;
+      updated_at: string;
+      hash: string;
+    }>;
+    return rows.map((row) => ({
+      docId: row.doc_id,
+      prNumber: row.pr_number,
+      kind: row.doc_kind,
+      title: row.title,
+      text: row.text,
+      updatedAt: row.updated_at,
+      hash: row.hash,
+    }));
+  }
+
+  private async ensureVectorIndex(): Promise<void> {
+    if (!this.vectorAvailable) {
+      return;
+    }
+    const docs = this.getAllSearchDocuments();
+    if (docs.length === 0) {
+      return;
+    }
+    if (this.vectorDims && this.countRows(VECTOR_TABLE) >= docs.length) {
+      return;
+    }
+    const docEmbeddings = await this.embedDocuments(docs);
+    const sampleEmbedding = docEmbeddings.values().next().value as number[] | undefined;
+    if (!sampleEmbedding?.length) {
+      return;
+    }
+    this.ensureVectorTable(sampleEmbedding.length);
+
+    this.db.exec("BEGIN");
+    try {
+      this.db.exec(`DELETE FROM ${VECTOR_TABLE}`);
+      for (const doc of docs) {
+        const embedding = docEmbeddings.get(doc.hash);
+        if (!embedding?.length) {
+          continue;
+        }
+        this.db
+          .prepare(`INSERT INTO ${VECTOR_TABLE} (id, embedding) VALUES (?, ?)`)
+          .run(doc.docId, toVectorBlob(embedding));
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   private upsertIssue(issue: IssueRecord): void {
@@ -658,10 +743,16 @@ export class PrIndexStore {
     }
   }
 
-  private upsertHydratedPullRequest(payload: HydratedPullRequest): Promise<void> {
+  private upsertHydratedPullRequest(
+    payload: HydratedPullRequest,
+    options: { indexVectors?: boolean } = {},
+  ): Promise<void> {
     return (async () => {
       const docs = buildSearchDocuments(payload);
-      const docEmbeddings = await this.embedDocuments(docs);
+      const indexVectors = options.indexVectors ?? true;
+      const docEmbeddings = indexVectors
+        ? await this.embedDocuments(docs)
+        : new Map<string, number[]>();
       const sampleEmbedding = docEmbeddings.values().next().value as number[] | undefined;
       if (sampleEmbedding?.length) {
         this.ensureVectorTable(sampleEmbedding.length);
@@ -762,7 +853,7 @@ export class PrIndexStore {
             )
             .run(doc.title, doc.text, doc.docId, doc.prNumber, doc.kind);
 
-          if (this.vectorAvailable && this.vectorDims) {
+          if (indexVectors && this.vectorAvailable && this.vectorDims) {
             const embedding = docEmbeddings.get(doc.hash);
             if (embedding?.length) {
               this.db
@@ -816,12 +907,12 @@ export class PrIndexStore {
     }
 
     for (const payload of shallowPullRequests) {
-      await this.upsertHydratedPullRequest(payload);
+      await this.upsertHydratedPullRequest(payload, { indexVectors: false });
     }
 
     const tasks = toProcess.map((prNumber) => async () => {
       const hydrated = await params.source.hydratePullRequest(params.repo, prNumber);
-      await this.upsertHydratedPullRequest(hydrated);
+      await this.upsertHydratedPullRequest(hydrated, { indexVectors: false });
       return prNumber;
     });
 
@@ -1133,12 +1224,20 @@ export class PrIndexStore {
     parsed: ParsedSearchQuery,
     limit: number,
   ): Promise<SearchDocRow[]> {
-    if (!this.vectorAvailable || !this.vectorDims || !this.provider) {
+    if (!this.vectorAvailable) {
+      return [];
+    }
+    await this.ensureVectorIndex();
+    if (!this.vectorDims) {
+      return [];
+    }
+    const provider = await this.ensureEmbeddingProvider();
+    if (!provider) {
       return [];
     }
     let queryVec: number[];
     try {
-      queryVec = await this.provider.embedQuery(parsed.text);
+      queryVec = await provider.embedQuery(parsed.text);
     } catch (error) {
       this.vectorError = error instanceof Error ? error.message : String(error);
       return [];

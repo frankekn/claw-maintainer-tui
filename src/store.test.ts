@@ -1,7 +1,8 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import * as path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as embeddingModule from "./embedding.js";
 import { PrIndexStore } from "./store.js";
 import type {
   HydratedPullRequest,
@@ -190,13 +191,12 @@ describe("PrIndexStore", () => {
     expect(summary.commentCount).toBe(1);
     expect(summary.docCount).toBe(2);
     expect(summary.labelCount).toBe(2);
-    expect(summary.vectorAvailable).toBe(false);
 
     const status = await store.status();
     expect(status.prCount).toBe(1);
     expect(status.commentCount).toBe(1);
     expect(status.docCount).toBe(2);
-    expect(status.vectorAvailable).toBe(false);
+    expect(status.vectorAvailable).toBe(summary.vectorAvailable);
 
     const exact = await store.search("#35983");
     expect(exact).toHaveLength(1);
@@ -283,6 +283,20 @@ describe("PrIndexStore", () => {
     const result = await store.search('label:contributor "Shallow full sync"');
     expect(result).toHaveLength(1);
     expect(result[0]?.prNumber).toBe(50001);
+  });
+
+  it("does not initialize embeddings during status or shallow sync", async () => {
+    const createProvider = vi
+      .spyOn(embeddingModule, "createLocalEmbeddingProvider")
+      .mockRejectedValue(new Error("embedding init should stay lazy"));
+    const store = await createStore();
+    const source = new FakePullRequestDataSource([makePullRequest(50002)]);
+
+    await store.status();
+    const summary = await store.sync({ repo, source, full: true });
+
+    expect(summary.processedPrs).toBe(1);
+    expect(createProvider).not.toHaveBeenCalled();
   });
 
   it("stores issues, supports issue search, and cross references issues to pull requests", async () => {
