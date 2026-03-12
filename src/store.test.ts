@@ -24,6 +24,7 @@ class FakePullRequestDataSource implements PullRequestDataSource {
   private readonly facts = new Map<number, PullRequestFactRecord>();
   private readonly searchResults = new Map<string, number[]>();
   changedPrNumbers: number[] = [];
+  changedPrs: PullRequestRecord[] = [];
   hydrateCalls: number[] = [];
 
   constructor(items: HydratedPullRequest[]) {
@@ -55,6 +56,10 @@ class FakePullRequestDataSource implements PullRequestDataSource {
     return [...this.changedPrNumbers];
   }
 
+  async listChangedPullRequestsSince(_repo: RepoRef, _since: string): Promise<PullRequestRecord[]> {
+    return [...this.changedPrs];
+  }
+
   async hydratePullRequest(_repo: RepoRef, prNumber: number): Promise<HydratedPullRequest> {
     this.hydrateCalls.push(prNumber);
     const payload = this.hydrated.get(prNumber);
@@ -84,6 +89,8 @@ class FakePullRequestDataSource implements PullRequestDataSource {
 class FakeIssueDataSource implements IssueDataSource {
   private readonly issues = new Map<number, IssueRecord>();
   changedIssueNumbers: number[] = [];
+  changedIssues: IssueRecord[] = [];
+  getIssueCalls: number[] = [];
 
   constructor(items: IssueRecord[]) {
     for (const item of items) {
@@ -106,7 +113,12 @@ class FakeIssueDataSource implements IssueDataSource {
     return [...this.changedIssueNumbers];
   }
 
+  async listChangedIssuesSince(_repo: RepoRef, _since: string): Promise<IssueRecord[]> {
+    return [...this.changedIssues];
+  }
+
   async getIssue(_repo: RepoRef, issueNumber: number): Promise<IssueRecord> {
+    this.getIssueCalls.push(issueNumber);
     const payload = this.issues.get(issueNumber);
     if (!payload) {
       throw new Error(`missing issue ${issueNumber}`);
@@ -294,25 +306,25 @@ describe("PrIndexStore", () => {
       labels: ["size: M"],
       updatedAt: "2026-03-10T00:00:00.000Z",
     });
+    first.comments.push(makeComment("issue:xs", "Existing comment should stay cached."));
     const source = new FakePullRequestDataSource([first, second]);
 
-    await store.sync({ repo, source, full: true });
+    await store.sync({ repo, source, full: true, hydrateAll: true });
     source.hydrateCalls = [];
 
-    source.setPullRequest(
-      makePullRequest(35983, {
-        title: "Updated label state",
-        body: "The PR moved out of XS and now tracks size S.",
-        labels: ["size: S"],
-        updatedAt: "2026-03-11T00:00:00.000Z",
-      }),
-    );
-    source.changedPrNumbers = [35983];
+    const updated = makePullRequest(35983, {
+      title: "Updated label state",
+      body: "The PR moved out of XS and now tracks size S.",
+      labels: ["size: S"],
+      updatedAt: "2026-03-11T00:00:00.000Z",
+    });
+    source.setPullRequest(updated);
+    source.changedPrs = [updated.pr];
 
     const summary = await store.sync({ repo, source });
     expect(summary.mode).toBe("incremental");
     expect(summary.processedPrs).toBe(1);
-    expect(source.hydrateCalls).toEqual([35983]);
+    expect(source.hydrateCalls).toEqual([]);
 
     const oldLabel = await store.search('label:"size: XS"');
     expect(oldLabel).toHaveLength(0);
@@ -325,6 +337,10 @@ describe("PrIndexStore", () => {
     const unchanged = await store.search("#40001");
     expect(unchanged).toHaveLength(1);
     expect(unchanged[0]?.title).toBe("Unchanged PR");
+
+    const shown = await store.show(35983);
+    expect(shown.comments).toHaveLength(1);
+    expect(shown.comments[0]?.excerpt).toContain("Existing comment");
   });
 
   it("uses shallow full sync by default to avoid hydrating every PR", async () => {
@@ -405,6 +421,38 @@ describe("PrIndexStore", () => {
     const status = await store.status();
     expect(status.issueCount).toBe(1);
     expect(status.issueLabelCount).toBe(2);
+  });
+
+  it("refreshes changed issues incrementally without refetching each issue", async () => {
+    const store = await createStore();
+    const source = new FakeIssueDataSource([
+      makeIssue(42001, {
+        title: "Initial issue state",
+        body: "Tracks the original body.",
+        labels: ["bug"],
+        updatedAt: "2026-03-10T00:00:00.000Z",
+      }),
+    ]);
+
+    await store.syncIssues({ repo, source, full: true });
+    source.getIssueCalls = [];
+    source.changedIssues = [
+      makeIssue(42001, {
+        title: "Updated issue state",
+        body: "Tracks the updated issue body.",
+        labels: ["bug", "needs-triage"],
+        updatedAt: "2026-03-11T00:00:00.000Z",
+      }),
+    ];
+
+    const summary = await store.syncIssues({ repo, source });
+    expect(summary.mode).toBe("incremental");
+    expect(summary.processedIssues).toBe(1);
+    expect(source.getIssueCalls).toEqual([]);
+
+    const results = await store.searchIssues('label:"needs-triage" updated');
+    expect(results).toHaveLength(1);
+    expect(results[0]?.title).toBe("Updated issue state");
   });
 
   it("clusters linked-issue PRs by best base coverage and keeps merge readiness separate", async () => {

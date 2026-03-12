@@ -302,6 +302,10 @@ export class BlessedTuiRenderer {
       return;
     }
     if (key.name === "enter" || key.name === "return") {
+      if (this.controller.isNavFocus()) {
+        await this.controller.triggerAction(1);
+        return;
+      }
       await this.controller.openSelected();
       return;
     }

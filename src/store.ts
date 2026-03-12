@@ -29,6 +29,7 @@ import type {
   PullRequestFactRecord,
   PullRequestLinkSource,
   PullRequestLinkedIssue,
+  PullRequestRecord,
   PullRequestReviewFact,
   ReviewFactDecision,
   RepoRef,
@@ -1143,6 +1144,126 @@ export class PrIndexStore {
     }
   }
 
+  private upsertPullRequestSummary(pr: PullRequestRecord): void {
+    const existing = this.db
+      .prepare(
+        `SELECT state, is_draft, base_ref, head_ref, url, closed_at, merged_at
+           FROM prs
+          WHERE number = ?`,
+      )
+      .get(pr.number) as
+      | {
+          state: PullRequestRecord["state"];
+          is_draft: number;
+          base_ref: string;
+          head_ref: string;
+          url: string;
+          closed_at: string | null;
+          merged_at: string | null;
+        }
+      | undefined;
+    const mergedState = pr.state === "closed" && existing?.state === "merged" ? "merged" : pr.state;
+    const preserved = {
+      isDraft: existing ? Boolean(existing.is_draft) : pr.isDraft,
+      baseRef: pr.baseRef || existing?.base_ref || "",
+      headRef: pr.headRef || existing?.head_ref || "",
+      url: pr.url || existing?.url || "",
+      closedAt: pr.closedAt ?? existing?.closed_at ?? null,
+      mergedAt: pr.mergedAt ?? existing?.merged_at ?? null,
+    };
+    const mergedRecord: PullRequestRecord = {
+      ...pr,
+      state: mergedState,
+      ...preserved,
+    };
+    const docs = buildSearchDocuments({ pr: mergedRecord, comments: [] });
+    const prDoc = docs.find((doc) => doc.kind === "pr_body") ?? null;
+
+    this.db.exec("BEGIN");
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO prs (
+            number, title, body, state, is_draft, author, base_ref, head_ref, url,
+            created_at, updated_at, closed_at, merged_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(number) DO UPDATE SET
+            title = excluded.title,
+            body = excluded.body,
+            state = excluded.state,
+            is_draft = excluded.is_draft,
+            author = excluded.author,
+            base_ref = excluded.base_ref,
+            head_ref = excluded.head_ref,
+            url = excluded.url,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at,
+            closed_at = excluded.closed_at,
+            merged_at = excluded.merged_at`,
+        )
+        .run(
+          mergedRecord.number,
+          mergedRecord.title,
+          mergedRecord.body,
+          mergedRecord.state,
+          mergedRecord.isDraft ? 1 : 0,
+          mergedRecord.author,
+          mergedRecord.baseRef,
+          mergedRecord.headRef,
+          mergedRecord.url,
+          mergedRecord.createdAt,
+          mergedRecord.updatedAt,
+          mergedRecord.closedAt,
+          mergedRecord.mergedAt,
+        );
+
+      this.upsertDerivedIssueLinksForPr(mergedRecord.number, mergedRecord.title, mergedRecord.body);
+
+      this.db.prepare("DELETE FROM pr_labels WHERE pr_number = ?").run(mergedRecord.number);
+      for (const label of mergedRecord.labels) {
+        this.db
+          .prepare("INSERT INTO pr_labels (pr_number, label_name) VALUES (?, ?)")
+          .run(mergedRecord.number, label);
+      }
+
+      this.db.prepare("DELETE FROM search_docs WHERE doc_id = ?").run(`pr:${mergedRecord.number}`);
+      this.db.prepare(`DELETE FROM ${FTS_TABLE} WHERE doc_id = ?`).run(`pr:${mergedRecord.number}`);
+      if (this.vectorDims) {
+        this.db
+          .prepare(`DELETE FROM ${VECTOR_TABLE} WHERE id = ?`)
+          .run(`pr:${mergedRecord.number}`);
+      }
+
+      if (prDoc) {
+        this.db
+          .prepare(
+            `INSERT INTO search_docs (doc_id, pr_number, doc_kind, title, text, updated_at, hash)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            prDoc.docId,
+            prDoc.prNumber,
+            prDoc.kind,
+            prDoc.title,
+            prDoc.text,
+            prDoc.updatedAt,
+            prDoc.hash,
+          );
+        this.db
+          .prepare(
+            `INSERT INTO ${FTS_TABLE} (title, text, doc_id, pr_number, doc_kind)
+             VALUES (?, ?, ?, ?, ?)`,
+          )
+          .run(prDoc.title, prDoc.text, prDoc.docId, prDoc.prNumber, prDoc.kind);
+      }
+
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   private upsertHydratedPullRequest(
     payload: HydratedPullRequest,
     options: { indexVectors?: boolean } = {},
@@ -1287,6 +1408,7 @@ export class PrIndexStore {
 
     const toProcess: number[] = [];
     const shallowPullRequests: HydratedPullRequest[] = [];
+    const summaryPullRequests: PullRequestRecord[] = [];
     let skippedPrs = 0;
 
     if (mode === "full") {
@@ -1303,13 +1425,22 @@ export class PrIndexStore {
         }
       }
     } else if (watermark) {
-      toProcess.push(
-        ...(await params.source.listChangedPullRequestNumbersSince(params.repo, watermark)),
-      );
+      if (params.source.listChangedPullRequestsSince) {
+        summaryPullRequests.push(
+          ...(await params.source.listChangedPullRequestsSince(params.repo, watermark)),
+        );
+      } else {
+        toProcess.push(
+          ...(await params.source.listChangedPullRequestNumbersSince(params.repo, watermark)),
+        );
+      }
     }
 
     for (const payload of shallowPullRequests) {
       await this.upsertHydratedPullRequest(payload, { indexVectors: false });
+    }
+    for (const pr of summaryPullRequests) {
+      this.upsertPullRequestSummary(pr);
     }
 
     const tasks = toProcess.map((prNumber) => async () => {
@@ -1335,7 +1466,7 @@ export class PrIndexStore {
       mode,
       entity: "prs",
       repo: repoName,
-      processedPrs: toProcess.length + shallowPullRequests.length,
+      processedPrs: toProcess.length + shallowPullRequests.length + summaryPullRequests.length,
       processedIssues: 0,
       skippedPrs,
       skippedIssues: 0,
@@ -1374,7 +1505,13 @@ export class PrIndexStore {
         shallowIssues.push(issue);
       }
     } else if (watermark) {
-      toProcess.push(...(await params.source.listChangedIssueNumbersSince(params.repo, watermark)));
+      if (params.source.listChangedIssuesSince) {
+        shallowIssues.push(...(await params.source.listChangedIssuesSince(params.repo, watermark)));
+      } else {
+        toProcess.push(
+          ...(await params.source.listChangedIssueNumbersSince(params.repo, watermark)),
+        );
+      }
     }
 
     for (const issue of shallowIssues) {

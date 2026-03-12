@@ -399,6 +399,7 @@ export type SyncSummary = {
 export interface PullRequestDataSource {
   listAllPullRequests(repo: RepoRef): AsyncGenerator<PullRequestRecord>;
   listChangedPullRequestNumbersSince(repo: RepoRef, since: string): Promise<number[]>;
+  listChangedPullRequestsSince?(repo: RepoRef, since: string): Promise<PullRequestRecord[]>;
   hydratePullRequest(repo: RepoRef, prNumber: number): Promise<HydratedPullRequest>;
   fetchPullRequestFacts?(repo: RepoRef, prNumber: number): Promise<PullRequestFactRecord>;
   searchPullRequestNumbers?(
@@ -411,5 +412,6 @@ export interface PullRequestDataSource {
 export interface IssueDataSource {
   listAllIssues(repo: RepoRef): AsyncGenerator<IssueRecord>;
   listChangedIssueNumbersSince(repo: RepoRef, since: string): Promise<number[]>;
+  listChangedIssuesSince?(repo: RepoRef, since: string): Promise<IssueRecord[]>;
   getIssue(repo: RepoRef, issueNumber: number): Promise<IssueRecord>;
 }

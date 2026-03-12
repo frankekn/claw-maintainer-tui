@@ -159,6 +159,25 @@ function toIssueRecord(value: RestIssue): IssueRecord {
   };
 }
 
+function toShallowPullRequestRecord(value: RestIssue): PullRequestRecord {
+  return {
+    number: value.number,
+    title: value.title?.trim() ?? "",
+    body: value.body ?? "",
+    state: value.state === "open" ? "open" : "closed",
+    isDraft: false,
+    author: value.user?.login?.trim() ?? "",
+    baseRef: "",
+    headRef: "",
+    url: value.html_url?.trim() ?? "",
+    createdAt: value.created_at ?? new Date(0).toISOString(),
+    updatedAt: value.updated_at ?? new Date(0).toISOString(),
+    closedAt: value.closed_at ?? null,
+    mergedAt: null,
+    labels: normalizeLabels(value.labels),
+  };
+}
+
 function toIssueCommentRecord(value: RestIssueComment): PullRequestCommentRecord | null {
   const body = value.body?.trim() ?? "";
   if (!body) {
@@ -448,6 +467,25 @@ export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueD
     return Array.from(seen).sort((a, b) => a - b);
   }
 
+  async listChangedPullRequestsSince(repo: RepoRef, since: string): Promise<PullRequestRecord[]> {
+    const items = await collectPaginated<RestIssue>(
+      (page) =>
+        `repos/${repo.owner}/${repo.name}/issues?state=all&sort=updated&direction=desc&since=${encodeURIComponent(
+          since,
+        )}&per_page=${PAGE_SIZE}&page=${page}`,
+    );
+    const seen = new Set<number>();
+    const out: PullRequestRecord[] = [];
+    for (const item of items) {
+      if (!item.pull_request || !Number.isInteger(item.number) || seen.has(item.number)) {
+        continue;
+      }
+      seen.add(item.number);
+      out.push(toShallowPullRequestRecord(item));
+    }
+    return out.sort((a, b) => a.number - b.number);
+  }
+
   async *listAllIssues(repo: RepoRef): AsyncGenerator<IssueRecord> {
     for (let page = 1; ; page += 1) {
       const items = await ghApiJsonWithRetry<RestIssue[]>(
@@ -482,6 +520,25 @@ export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueD
       }
     }
     return Array.from(seen).sort((a, b) => a - b);
+  }
+
+  async listChangedIssuesSince(repo: RepoRef, since: string): Promise<IssueRecord[]> {
+    const items = await collectPaginated<RestIssue>(
+      (page) =>
+        `repos/${repo.owner}/${repo.name}/issues?state=all&sort=updated&direction=desc&since=${encodeURIComponent(
+          since,
+        )}&per_page=${PAGE_SIZE}&page=${page}`,
+    );
+    const seen = new Set<number>();
+    const out: IssueRecord[] = [];
+    for (const item of items) {
+      if (item.pull_request || !Number.isInteger(item.number) || seen.has(item.number)) {
+        continue;
+      }
+      seen.add(item.number);
+      out.push(toIssueRecord(item));
+    }
+    return out.sort((a, b) => a.number - b.number);
   }
 
   async getIssue(repo: RepoRef, issueNumber: number): Promise<IssueRecord> {

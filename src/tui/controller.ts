@@ -160,6 +160,10 @@ export class TuiController {
     return this.focus === "query";
   }
 
+  isNavFocus(): boolean {
+    return this.focus === "nav";
+  }
+
   startQueryEntry(): void {
     if (this.mode === "status") {
       return;
