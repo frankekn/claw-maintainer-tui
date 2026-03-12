@@ -79,6 +79,7 @@ const syncSummary: SyncSummary = {
 
 class FakeTuiDataService implements TuiDataService {
   searchCalls: string[] = [];
+  issueSearchCalls: string[] = [];
   syncBlocked = false;
   syncPrsCalls = 0;
   syncIssuesCalls = 0;
@@ -94,7 +95,8 @@ class FakeTuiDataService implements TuiDataService {
     return [makePr(41793), makePr(42212)];
   }
 
-  async searchIssues() {
+  async searchIssues(query: string) {
+    this.issueSearchCalls.push(query);
     return [makeIssue(41789)];
   }
 
@@ -183,6 +185,21 @@ class FakeTuiDataService implements TuiDataService {
 }
 
 describe("TuiController", () => {
+  it("loads recent open PRs on startup so the landing state is useful", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+
+    expect(service.searchCalls).toEqual(["state:open"]);
+    expect(controller.getRenderModel().resultTitle).toBe("Recent Open PRs");
+    expect(controller.getRenderModel().rows).toHaveLength(2);
+  });
+
   it("runs PR search and opens the selected PR detail", async () => {
     const service = new FakeTuiDataService();
     const controller = new TuiController(service, {
@@ -195,10 +212,29 @@ describe("TuiController", () => {
     await controller.submitQuery("marker spoofing");
 
     const model = controller.getRenderModel();
-    expect(service.searchCalls).toEqual(["marker spoofing"]);
+    expect(service.searchCalls).toEqual(["state:open", "marker spoofing"]);
     expect(model.rows).toHaveLength(2);
     expect(model.detailText).toContain("PR #41793");
     expect(model.activeUrl).toBe("https://github.com/openclaw/openclaw/pull/41793");
+  });
+
+  it("edits the query inline before submitting", async () => {
+    const controller = new TuiController(new FakeTuiDataService(), {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    controller.startQueryEntry();
+    controller.appendQueryCharacter("m");
+    controller.appendQueryCharacter("a");
+    controller.appendQueryCharacter("r");
+    controller.backspaceQuery();
+    controller.appendQueryCharacter("r");
+
+    expect(controller.getRenderModel().focus).toBe("query");
+    expect(controller.getRenderModel().query).toBe("mar");
   });
 
   it("navigates into PR xref and back out", async () => {

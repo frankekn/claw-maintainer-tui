@@ -47,29 +47,48 @@ function truncate(value: string, limit: number): string {
   return `${trimmed.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
 }
 
+function section(title: string): string {
+  return title.toUpperCase();
+}
+
+function padRight(value: string, width: number): string {
+  return value.length >= width ? value.slice(0, width) : value.padEnd(width);
+}
+
+function formatState(value: string): string {
+  return padRight(value.toUpperCase(), 6);
+}
+
 function formatPrRow(result: SearchResult): string {
-  return `#${result.prNumber} ${truncate(result.title, 78)} [${result.state}] ${result.score.toFixed(3)}`;
+  return `#${String(result.prNumber).padEnd(6)} ${formatState(result.state)} ${result.score
+    .toFixed(3)
+    .padStart(5)}  ${truncate(result.title, 64)}`;
 }
 
 function formatIssueRow(result: IssueSearchResult): string {
-  return `#${result.issueNumber} ${truncate(result.title, 78)} [${result.state}] ${result.score.toFixed(3)}`;
+  return `#${String(result.issueNumber).padEnd(6)} ${formatState(result.state)} ${result.score
+    .toFixed(3)
+    .padStart(5)}  ${truncate(result.title, 64)}`;
 }
 
 function formatClusterCandidateRow(candidate: ClusterCandidate): string {
-  const extras = [
-    candidate.status,
-    `by:${candidate.matchedBy}`,
-    `prod:${candidate.relevantProdFiles.length}/${candidate.prodFiles.length}`,
-    `test:${candidate.relevantTestFiles.length}/${candidate.testFiles.length}`,
-    `noise:${candidate.noiseFilesCount}`,
+  const coverage = [
+    padRight(candidate.status.toUpperCase(), 9),
+    padRight(candidate.matchedBy, 12),
+    `p${candidate.relevantProdFiles.length}/${candidate.prodFiles.length}`,
+    `t${candidate.relevantTestFiles.length}/${candidate.testFiles.length}`,
+    `n${candidate.noiseFilesCount}`,
   ];
-  return `#${candidate.prNumber} ${truncate(candidate.title, 52)} ${extras.join(" ")}`;
+  return `#${String(candidate.prNumber).padEnd(6)} ${coverage.join(" ")} ${truncate(candidate.title, 40)}`;
 }
 
 function formatClusterExcludedRow(candidate: ClusterExcludedCandidate): string {
   const scoreSuffix =
     candidate.semanticScore !== undefined ? ` score:${candidate.semanticScore.toFixed(2)}` : "";
-  return `#${candidate.prNumber} ${truncate(candidate.title, 58)} excluded:${candidate.excludedReasonCode}${scoreSuffix}`;
+  return `#${String(candidate.prNumber).padEnd(6)} EXCLUDED ${padRight(
+    candidate.excludedReasonCode,
+    14,
+  )} ${truncate(candidate.title, 42)}${scoreSuffix}`;
 }
 
 export function formatResultRow(row: TuiResultRow): string {
@@ -99,16 +118,15 @@ export function formatPrDetail(
 ): string {
   const lines = [
     `PR #${pr.prNumber} ${pr.title}`,
-    `state: ${pr.state}`,
-    `author: ${pr.author}`,
-    `updated_at: ${pr.updatedAt}`,
-    `labels: ${formatLabelBlock(pr.labels)}`,
-    `url: ${pr.url}`,
+    `${formatState(pr.state).trim()}  ${pr.author}  ${pr.updatedAt}`,
+    `labels  ${formatLabelBlock(pr.labels)}`,
+    `github  ${pr.url}`,
     "",
+    section("Summary"),
     truncate(pr.matchedExcerpt, 560),
   ];
   if (comments.length > 0) {
-    lines.push("", "comments:");
+    lines.push("", `${section("Comments")} (${comments.length})`);
     for (const comment of comments) {
       lines.push(`- [${comment.kind}] ${comment.author} ${comment.createdAt}`);
       lines.push(`  ${truncate(comment.excerpt, 200)}`);
@@ -120,12 +138,11 @@ export function formatPrDetail(
 export function formatIssueDetail(issue: IssueSearchResult): string {
   return [
     `Issue #${issue.issueNumber} ${issue.title}`,
-    `state: ${issue.state}`,
-    `author: ${issue.author}`,
-    `updated_at: ${issue.updatedAt}`,
-    `labels: ${formatLabelBlock(issue.labels)}`,
-    `url: ${issue.url}`,
+    `${formatState(issue.state).trim()}  ${issue.author}  ${issue.updatedAt}`,
+    `labels  ${formatLabelBlock(issue.labels)}`,
+    `github  ${issue.url}`,
     "",
+    section("Summary"),
     truncate(issue.matchedExcerpt, 560),
   ].join("\n");
 }
@@ -140,7 +157,10 @@ export function formatClusterDetail(
   candidate: ClusterCandidate | ClusterExcludedCandidate,
 ): string {
   const lines = [
+    section("Seed"),
     analysis.seedLabel,
+    "",
+    section("Cluster"),
     `cluster_basis: ${analysis.clusterBasis}`,
     `cluster_issues: ${
       analysis.clusterIssues.length > 0
@@ -153,6 +173,7 @@ export function formatClusterDetail(
   }
   lines.push("");
   if ("excludedReasonCode" in candidate) {
+    lines.push(section("Excluded Candidate"));
     lines.push(`excluded_candidate: #${candidate.prNumber} ${candidate.title}`);
     lines.push(`matched_by: ${candidate.matchedBy}`);
     lines.push(`reason: ${candidate.reason}`);
@@ -163,6 +184,7 @@ export function formatClusterDetail(
       lines.push(`semantic_score: ${candidate.semanticScore.toFixed(2)}`);
     }
   } else {
+    lines.push(section("Candidate"));
     lines.push(`candidate: #${candidate.prNumber} ${candidate.title}`);
     lines.push(`status: ${candidate.status}`);
     lines.push(`matched_by: ${candidate.matchedBy}`);
@@ -188,21 +210,62 @@ export function formatClusterDetail(
 
 export function formatStatusDetail(status: StatusSnapshot, now = new Date()): string {
   return [
+    section("Index Status"),
     `repo: ${status.repo}`,
     `last_sync_at: ${formatTimestamp(status.lastSyncAt)}`,
     `last_sync_age: ${formatRelativeAge(status.lastSyncAt, now)}`,
     `issue_last_sync_at: ${formatTimestamp(status.issueLastSyncAt)}`,
     `issue_last_sync_age: ${formatRelativeAge(status.issueLastSyncAt, now)}`,
+    "",
+    section("Counts"),
     `prs: ${status.prCount}`,
     `issues: ${status.issueCount}`,
     `labels: ${status.labelCount}`,
     `issue_labels: ${status.issueLabelCount}`,
     `comments: ${status.commentCount}`,
     `docs: ${status.docCount}`,
+    "",
+    section("Vector"),
     `vector_available: ${status.vectorAvailable}`,
     `vector_error: ${status.vectorError ?? "(none)"}`,
     `embedding_model: ${status.embeddingModel}`,
+    "",
+    section("Tips"),
+    "Press / to filter the active list.",
+    "Use x for cross-reference and c for cluster analysis.",
   ].join("\n");
+}
+
+export function formatSearchLandingDetail(
+  mode: "pr-search" | "issue-search",
+  status: StatusSnapshot | null,
+  now = new Date(),
+): string {
+  const noun = mode === "pr-search" ? "PR" : "issue";
+  const plural = mode === "pr-search" ? "PRs" : "issues";
+  const count = status ? (mode === "pr-search" ? status.prCount : status.issueCount) : null;
+  const lines = [section("Desk Brief"), `Active list: recent open ${plural}`];
+  if (status) {
+    lines.push(`Repo: ${status.repo}`);
+    lines.push(`Local rows: ${count}`);
+    lines.push(
+      `Freshness: PR ${formatRelativeAge(status.lastSyncAt, now)}  Issue ${formatRelativeAge(status.issueLastSyncAt, now)}`,
+    );
+    lines.push(
+      `Vector: ${status.vectorAvailable ? "ready" : (status.vectorError ?? "unavailable")}`,
+    );
+  }
+  lines.push(
+    "",
+    section("Next"),
+    `Press / to refine the ${noun} list without leaving this view.`,
+    "Press Enter to inspect the selected row.",
+    mode === "pr-search"
+      ? "Press x to jump into linked issues and c to inspect cluster neighbors."
+      : "Press x to jump into linked pull requests.",
+    "Press o to open the selected GitHub page in the browser.",
+  );
+  return lines.join("\n");
 }
 
 export function buildStatusRows(status: StatusSnapshot): TuiResultRow[] {
@@ -275,12 +338,12 @@ export function formatModeRail(activeMode: string, focus: TuiFocus): string[] {
   return TUI_MODE_ORDER.map((mode) => {
     const selected = mode.id === activeMode;
     const prefix = selected ? ">" : " ";
-    const label = `${prefix} ${mode.label}`;
+    const label = `${prefix} ${mode.label}`.padEnd(16);
     if (!selected) {
       return label;
     }
     if (focus === "nav") {
-      return `{black-fg}{cyan-bg}${label.padEnd(14)}{/}`;
+      return `{black-fg}{cyan-bg}${label}{/}`;
     }
     return `{cyan-fg}${label}{/}`;
   });
@@ -288,7 +351,7 @@ export function formatModeRail(activeMode: string, focus: TuiFocus): string[] {
 
 export function formatResults(model: TuiRenderModel): string[] {
   if (model.rows.length === 0) {
-    return ["(no rows)"];
+    return ["No rows.", "Press / to search this view."];
   }
   return model.rows.map((row, index) => {
     const line = formatResultRow(row);
@@ -303,5 +366,5 @@ export function formatResults(model: TuiRenderModel): string[] {
 }
 
 export function defaultHintText(): string {
-  return "Tab focus  / query  Enter open  x xref  c cluster  s/S sync  r refresh facts  o open URL  b back  q quit";
+  return "Tab focus | / query | Enter inspect | x xref | c cluster | s/S sync | r facts | o open | b back | q quit";
 }

@@ -48,6 +48,7 @@ export class BlessedTuiRenderer {
       label: " Modes ",
       tags: true,
       border: "line",
+      wrap: false,
       scrollable: true,
       alwaysScroll: true,
       style: { border: { fg: "#44515f" }, fg: "white", bg: "#0d1117" },
@@ -62,6 +63,7 @@ export class BlessedTuiRenderer {
       label: " Results ",
       tags: true,
       border: "line",
+      wrap: false,
       scrollable: true,
       alwaysScroll: true,
       style: { border: { fg: "#44515f" }, fg: "white", bg: "#0d1117" },
@@ -70,8 +72,8 @@ export class BlessedTuiRenderer {
     this.detailBox = blessed.box({
       parent: this.screen,
       top: 3,
-      left: "58%",
-      width: "42%",
+      left: "52%",
+      width: "48%",
       bottom: 4,
       label: " Detail ",
       tags: true,
@@ -132,19 +134,10 @@ export class BlessedTuiRenderer {
   }
 
   private bindKeys(): void {
-    this.screen.key(["q", "C-c"], () => this.screen.destroy());
-    this.screen.key(["tab"], () => this.controller.focusNext());
-    this.screen.key(["up", "k"], () => void this.controller.moveSelection(-1));
-    this.screen.key(["down", "j"], () => void this.controller.moveSelection(1));
-    this.screen.key(["enter"], () => void this.controller.openSelected());
-    this.screen.key(["b"], () => this.controller.goBack());
-    this.screen.key(["x"], () => void this.controller.crossReferenceSelected());
-    this.screen.key(["c"], () => void this.controller.clusterSelected());
-    this.screen.key(["s"], () => void this.controller.syncPrs());
-    this.screen.key(["S"], () => void this.controller.syncIssues());
-    this.screen.key(["r"], () => void this.controller.refreshFacts());
-    this.screen.key(["o"], () => void this.openActiveUrl());
-    this.screen.key(["/"], () => void this.captureQuery());
+    this.screen.key(["C-c"], () => this.screen.destroy());
+    this.screen.on("keypress", (ch, key) => {
+      void this.handleKeypress(ch, key);
+    });
   }
 
   private render(model: TuiRenderModel): void {
@@ -152,17 +145,21 @@ export class BlessedTuiRenderer {
     this.navBox.setLabel(` Modes ${model.focus === "nav" ? "[active]" : ""} `);
     this.navBox.setContent(formatModeRail(model.mode, model.focus).join("\n"));
     this.resultsBox.setLabel(
-      ` ${model.resultTitle}${model.focus === "results" ? " [active]" : ""} `,
+      ` ${model.resultTitle} · ${model.rows.length}${model.focus === "results" ? " [active]" : ""} `,
     );
     this.resultsBox.setContent(formatResults(model).join("\n"));
     this.detailBox.setLabel(` ${model.detailTitle} `);
     this.detailBox.setContent(model.detailText);
-    this.messageBox.setContent(`${model.footer.hintText}\n${model.footer.message}`);
-    const promptPrefix =
-      model.focus === "query"
-        ? `{black-fg}{white-bg} ${model.footer.queryPrompt} {/}`
-        : `{black-fg}{white-bg} ${model.footer.queryPrompt} {/}`;
-    this.inputBox.setContent(`${promptPrefix} ${model.footer.queryValue || "<empty>"}`);
+    this.messageBox.setContent(`KEYS   ${model.footer.hintText}\nSTATUS ${model.footer.message}`);
+    const promptPrefix = `{black-fg}{white-bg} QUERY {/} ${model.footer.queryPrompt} >`;
+    const queryValue =
+      model.footer.queryValue.length > 0
+        ? model.footer.queryValue
+        : model.focus === "query"
+          ? ""
+          : "[press / to type]";
+    const cursor = model.focus === "query" ? "█" : "";
+    this.inputBox.setContent(`${promptPrefix} ${queryValue}${cursor}`);
     this.updateFocusStyle(model);
     this.syncScroll(model);
     if (model.busy && model.header.busyMessage) {
@@ -208,29 +205,84 @@ export class BlessedTuiRenderer {
     }
   }
 
-  private async captureQuery(): Promise<void> {
-    const model = this.controller.getRenderModel();
-    const prompt = blessed.prompt({
-      parent: this.screen,
-      border: "line",
-      height: 8,
-      width: "70%",
-      top: "center",
-      left: "center",
-      tags: true,
-      label: ` ${model.footer.queryPrompt} `,
-      style: { bg: "#11161b", border: { fg: "#4bb6ff" }, fg: "white" },
-    });
-    await new Promise<void>((resolve) => {
-      prompt.input(model.footer.queryPrompt, model.query, async (_error, value) => {
-        prompt.destroy();
-        this.screen.render();
-        if (typeof value === "string") {
-          await this.controller.submitQuery(value);
-        }
-        resolve();
-      });
-    });
+  private async handleKeypress(
+    ch: string,
+    key: blessed.Widgets.Events.IKeyEventArg,
+  ): Promise<void> {
+    if (this.controller.isQueryFocus()) {
+      if (key.name === "escape") {
+        this.controller.stopQueryEntry();
+        return;
+      }
+      if (key.name === "tab") {
+        this.controller.focusNext();
+        return;
+      }
+      if (key.name === "enter" || key.name === "return") {
+        await this.controller.submitCurrentQuery();
+        return;
+      }
+      if (key.name === "backspace" || key.name === "delete") {
+        this.controller.backspaceQuery();
+        return;
+      }
+      if (!key.ctrl && !key.meta && ch && ch >= " ") {
+        this.controller.appendQueryCharacter(ch);
+      }
+      return;
+    }
+
+    if (key.name === "q") {
+      this.screen.destroy();
+      return;
+    }
+    if (key.name === "tab") {
+      this.controller.focusNext();
+      return;
+    }
+    if (key.name === "up" || key.name === "k") {
+      void this.controller.moveSelection(-1);
+      return;
+    }
+    if (key.name === "down" || key.name === "j") {
+      void this.controller.moveSelection(1);
+      return;
+    }
+    if (key.name === "enter" || key.name === "return") {
+      await this.controller.openSelected();
+      return;
+    }
+    if (ch === "/" || key.full === "/" || key.name === "slash") {
+      this.controller.startQueryEntry();
+      return;
+    }
+    if (key.name === "b") {
+      this.controller.goBack();
+      return;
+    }
+    if (key.name === "x") {
+      await this.controller.crossReferenceSelected();
+      return;
+    }
+    if (key.name === "c") {
+      await this.controller.clusterSelected();
+      return;
+    }
+    if (key.name === "s" && key.shift) {
+      await this.controller.syncIssues();
+      return;
+    }
+    if (key.name === "s") {
+      await this.controller.syncPrs();
+      return;
+    }
+    if (key.name === "r") {
+      await this.controller.refreshFacts();
+      return;
+    }
+    if (key.name === "o") {
+      await this.openActiveUrl();
+    }
   }
 
   private async openActiveUrl(): Promise<void> {

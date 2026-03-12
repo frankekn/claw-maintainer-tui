@@ -4,6 +4,7 @@ import {
   formatClusterDetail,
   formatIssueDetail,
   formatPrDetail,
+  formatSearchLandingDetail,
   formatStatusDetail,
 } from "./format.js";
 import { TUI_MODE_ORDER } from "./types.js";
@@ -54,6 +55,7 @@ export class TuiController {
   private message = "Ready.";
   private readonly history: TuiViewSnapshot[] = [];
   private detailRequestId = 0;
+  private listRequestId = 0;
   private clusterContext: ClusterContextState | null = null;
 
   constructor(
@@ -105,9 +107,7 @@ export class TuiController {
 
   async initialize(): Promise<void> {
     await this.refreshStatus();
-    this.detailText = this.statusSnapshot
-      ? `${formatStatusDetail(this.statusSnapshot)}\n\nUse / to search PRs.`
-      : "Use / to search PRs.";
+    await this.loadLandingRows("pr-search");
     this.emit();
   }
 
@@ -138,7 +138,53 @@ export class TuiController {
       this.detailTitle = "Detail";
       this.detailText = `Use / to ${TUI_MODE_ORDER.find((item) => item.id === mode)?.queryPrompt.toLowerCase()}.`;
       this.resultTitle = TUI_MODE_ORDER.find((item) => item.id === mode)?.label ?? "Results";
+      this.query = "";
     }
+    this.emit();
+    if (mode === "pr-search" || mode === "issue-search") {
+      void this.loadLandingRows(mode);
+    }
+  }
+
+  isQueryFocus(): boolean {
+    return this.focus === "query";
+  }
+
+  startQueryEntry(): void {
+    if (this.mode === "status") {
+      return;
+    }
+    this.focus = "query";
+    this.emit();
+  }
+
+  stopQueryEntry(): void {
+    if (this.focus !== "query") {
+      return;
+    }
+    this.focus = "results";
+    this.emit();
+  }
+
+  appendQueryCharacter(value: string): void {
+    if (this.focus !== "query") {
+      return;
+    }
+    this.query += value;
+    this.emit();
+  }
+
+  backspaceQuery(): void {
+    if (this.focus !== "query" || this.query.length === 0) {
+      return;
+    }
+    this.query = this.query.slice(0, -1);
+    this.emit();
+  }
+
+  async submitCurrentQuery(): Promise<void> {
+    await this.submitQuery(this.query);
+    this.focus = "results";
     this.emit();
   }
 
@@ -160,10 +206,14 @@ export class TuiController {
   async submitQuery(value: string): Promise<void> {
     this.query = value.trim();
     this.errorMessage = null;
+    const requestId = ++this.listRequestId;
     switch (this.mode) {
       case "pr-search":
         await this.runBusy("Searching PRs", async () => {
           const results = this.query ? await this.service.search(this.query, this.resultLimit) : [];
+          if (requestId !== this.listRequestId || this.mode !== "pr-search") {
+            return;
+          }
           this.rows = results.map((pr) => ({ kind: "pr", pr }));
           this.selectedIndex = 0;
           this.resultTitle = `PR Search${this.query ? ` · ${this.query}` : ""}`;
@@ -179,6 +229,9 @@ export class TuiController {
           const results = this.query
             ? await this.service.searchIssues(this.query, this.resultLimit)
             : [];
+          if (requestId !== this.listRequestId || this.mode !== "issue-search") {
+            return;
+          }
           this.rows = results.map((issue) => ({ kind: "issue", issue }));
           this.selectedIndex = 0;
           this.resultTitle = `Issue Search${this.query ? ` · ${this.query}` : ""}`;
@@ -443,6 +496,53 @@ export class TuiController {
       this.rows = buildStatusRows(this.statusSnapshot);
       this.detailText = formatStatusDetail(this.statusSnapshot);
       this.detailTitle = "Repository Status";
+    }
+  }
+
+  private async loadLandingRows(mode: "pr-search" | "issue-search"): Promise<void> {
+    const requestId = ++this.listRequestId;
+    this.message =
+      mode === "pr-search" ? "Loading recent open PRs..." : "Loading recent open issues...";
+    this.emit();
+    try {
+      if (mode === "pr-search") {
+        const results = await this.service.search("state:open", this.resultLimit);
+        if (requestId !== this.listRequestId || this.mode !== "pr-search") {
+          return;
+        }
+        this.rows = results.map((pr) => ({ kind: "pr", pr }));
+        this.selectedIndex = 0;
+        this.resultTitle = "Recent Open PRs";
+        this.detailTitle = "PR Detail";
+        this.detailText = formatSearchLandingDetail("pr-search", this.statusSnapshot);
+        this.message =
+          results.length > 0
+            ? `Loaded ${results.length} recent open PR(s). Press / to refine the list.`
+            : "No open PRs found in the local index.";
+        await this.refreshDetailForSelection();
+        return;
+      }
+      const issues = await this.service.searchIssues("state:open", this.resultLimit);
+      if (requestId !== this.listRequestId || this.mode !== "issue-search") {
+        return;
+      }
+      this.rows = issues.map((issue) => ({ kind: "issue", issue }));
+      this.selectedIndex = 0;
+      this.resultTitle = "Recent Open Issues";
+      this.detailTitle = "Issue Detail";
+      this.detailText = formatSearchLandingDetail("issue-search", this.statusSnapshot);
+      this.message =
+        issues.length > 0
+          ? `Loaded ${issues.length} recent open issue(s). Press / to refine the list.`
+          : "No open issues found in the local index.";
+      await this.refreshDetailForSelection();
+    } catch (error) {
+      if (requestId !== this.listRequestId || this.mode !== mode) {
+        return;
+      }
+      this.errorMessage = error instanceof Error ? error.message : String(error);
+      this.message = "Failed to load landing rows.";
+      this.emit();
     }
   }
 

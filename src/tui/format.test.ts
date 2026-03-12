@@ -3,6 +3,7 @@ import {
   buildStatusRows,
   formatClusterDetail,
   formatHeader,
+  formatSearchLandingDetail,
   formatResultRow,
   formatStatusDetail,
 } from "./format.js";
@@ -82,7 +83,8 @@ describe("tui formatting", () => {
       reason: "broader relevant production coverage",
     };
 
-    expect(formatResultRow({ kind: "cluster-candidate", candidate })).toContain("prod:2/2");
+    expect(formatResultRow({ kind: "cluster-candidate", candidate })).toContain("BEST_BASE");
+    expect(formatResultRow({ kind: "cluster-candidate", candidate })).toContain("p2/2");
     expect(
       formatClusterDetail(
         {
@@ -94,5 +96,17 @@ describe("tui formatting", () => {
         candidate,
       ),
     ).toContain("reason: broader relevant production coverage");
+  });
+
+  it("formats a landing brief for the default search desks", () => {
+    const detail = formatSearchLandingDetail(
+      "pr-search",
+      status,
+      new Date("2026-03-11T08:28:13.832Z"),
+    );
+
+    expect(detail).toContain("DESK BRIEF");
+    expect(detail).toContain("Local rows: 23935");
+    expect(detail).toContain("Press / to refine the PR list");
   });
 });
