@@ -42,23 +42,26 @@ describe("tui formatting", () => {
       new Date("2026-03-11T08:28:13.832Z"),
     );
     expect(header).toContain("PR Search");
-    expect(header).toContain("repo openclaw/openclaw");
-    expect(header).toContain("pr 1h");
-    expect(header).toContain("vector ok");
+    expect(header).toContain("REPO openclaw/openclaw");
+    expect(header).toContain("PR 1h");
+    expect(header).toContain("VECTOR READY");
+    expect(header).toContain("{#63c8ff-bg}");
   });
 
   it("formats status detail and rows from the repository snapshot", () => {
-    expect(formatStatusDetail(status, new Date("2026-03-11T08:28:13.832Z"))).toContain(
-      "prs: 23935",
-    );
+    const detail = formatStatusDetail(status, new Date("2026-03-11T08:28:13.832Z"));
+    expect(detail).toContain("COUNTS");
+    expect(detail).toContain("prs{/} 23935");
+    expect(detail).toContain("vector_available{/} {#4fd1a1-fg}true{/}");
+
     expect(buildStatusRows(status)).toEqual([
-      { kind: "status", label: "PRs", value: "23935" },
-      { kind: "status", label: "Issues", value: "17535" },
-      { kind: "status", label: "PR Labels", value: "61148" },
-      { kind: "status", label: "Issue Labels", value: "14230" },
-      { kind: "status", label: "Comments", value: "100" },
-      { kind: "status", label: "Docs", value: "24035" },
-      { kind: "status", label: "Vector", value: "available" },
+      { kind: "status", label: "{#9fb0c4-fg}PRs{/}", value: "{#4fd1a1-fg}23935{/}" },
+      { kind: "status", label: "{#9fb0c4-fg}Issues{/}", value: "{#4fd1a1-fg}17535{/}" },
+      { kind: "status", label: "{#9fb0c4-fg}PR Labels{/}", value: "{#e7edf5-fg}61148{/}" },
+      { kind: "status", label: "{#9fb0c4-fg}Issue Labels{/}", value: "{#e7edf5-fg}14230{/}" },
+      { kind: "status", label: "{#9fb0c4-fg}Comments{/}", value: "{#e7edf5-fg}100{/}" },
+      { kind: "status", label: "{#9fb0c4-fg}Docs{/}", value: "{#e7edf5-fg}24035{/}" },
+      { kind: "status", label: "{#9fb0c4-fg}Vector{/}", value: "{#4fd1a1-fg}available{/}" },
     ]);
   });
 
@@ -95,7 +98,7 @@ describe("tui formatting", () => {
         },
         candidate,
       ),
-    ).toContain("reason: broader relevant production coverage");
+    ).toContain("reason{/} broader relevant production coverage");
   });
 
   it("formats a landing brief for the default search desks", () => {
@@ -106,7 +109,7 @@ describe("tui formatting", () => {
     );
 
     expect(detail).toContain("DESK BRIEF");
-    expect(detail).toContain("Local rows: 23935");
+    expect(detail).toContain("Local rows{/} 23935");
     expect(detail).toContain("Press / to refine the PR list");
   });
 });

@@ -5,6 +5,14 @@ import type {
   SearchResult,
   StatusSnapshot,
 } from "../types.js";
+import {
+  TUI_THEME,
+  badge,
+  section as sectionLabel,
+  selectedLine,
+  text,
+  valueTone,
+} from "./theme.js";
 import { TUI_MODE_ORDER } from "./types.js";
 import type { TuiFocus, TuiHeaderModel, TuiRenderModel, TuiResultRow } from "./types.js";
 
@@ -47,16 +55,38 @@ function truncate(value: string, limit: number): string {
   return `${trimmed.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
 }
 
-function section(title: string): string {
-  return title.toUpperCase();
-}
-
 function padRight(value: string, width: number): string {
   return value.length >= width ? value.slice(0, width) : value.padEnd(width);
 }
 
 function formatState(value: string): string {
   return padRight(value.toUpperCase(), 6);
+}
+
+function freshnessTone(value: string | null, now = new Date()): "ok" | "warn" {
+  if (!value) {
+    return "warn";
+  }
+  const then = new Date(value);
+  const diffMs = Math.max(0, now.getTime() - then.getTime());
+  return diffMs < 1000 * 60 * 60 * 12 ? "ok" : "warn";
+}
+
+function stateTone(value: string): "ok" | "warn" | "error" | "muted" {
+  switch (value.toLowerCase()) {
+    case "open":
+      return "ok";
+    case "merged":
+      return "warn";
+    case "closed":
+      return "muted";
+    default:
+      return "muted";
+  }
+}
+
+function accentMeta(label: string, value: string): string {
+  return `${text(label, "muted")} ${value}`;
 }
 
 function formatPrRow(result: SearchResult): string {
@@ -117,18 +147,20 @@ export function formatPrDetail(
   comments: Array<{ kind: string; author: string; createdAt: string; excerpt: string }>,
 ): string {
   const lines = [
-    `PR #${pr.prNumber} ${pr.title}`,
-    `${formatState(pr.state).trim()}  ${pr.author}  ${pr.updatedAt}`,
-    `labels  ${formatLabelBlock(pr.labels)}`,
-    `github  ${pr.url}`,
+    `${text(`PR #${pr.prNumber}`, "accent")} ${pr.title}`,
+    `${valueTone(formatState(pr.state).trim(), stateTone(pr.state))}  ${text(pr.author, "muted")}  ${text(pr.updatedAt, "dim")}`,
+    accentMeta("labels", formatLabelBlock(pr.labels)),
+    accentMeta("github", pr.url),
     "",
-    section("Summary"),
+    sectionLabel("Summary"),
     truncate(pr.matchedExcerpt, 560),
   ];
   if (comments.length > 0) {
-    lines.push("", `${section("Comments")} (${comments.length})`);
+    lines.push("", `${sectionLabel("Comments")} ${text(`(${comments.length})`, "muted")}`);
     for (const comment of comments) {
-      lines.push(`- [${comment.kind}] ${comment.author} ${comment.createdAt}`);
+      lines.push(
+        `- ${text(`[${comment.kind}]`, "muted")} ${comment.author} ${text(comment.createdAt, "dim")}`,
+      );
       lines.push(`  ${truncate(comment.excerpt, 200)}`);
     }
   }
@@ -137,12 +169,12 @@ export function formatPrDetail(
 
 export function formatIssueDetail(issue: IssueSearchResult): string {
   return [
-    `Issue #${issue.issueNumber} ${issue.title}`,
-    `${formatState(issue.state).trim()}  ${issue.author}  ${issue.updatedAt}`,
-    `labels  ${formatLabelBlock(issue.labels)}`,
-    `github  ${issue.url}`,
+    `${text(`Issue #${issue.issueNumber}`, "accent")} ${issue.title}`,
+    `${valueTone(formatState(issue.state).trim(), stateTone(issue.state))}  ${text(issue.author, "muted")}  ${text(issue.updatedAt, "dim")}`,
+    accentMeta("labels", formatLabelBlock(issue.labels)),
+    accentMeta("github", issue.url),
     "",
-    section("Summary"),
+    sectionLabel("Summary"),
     truncate(issue.matchedExcerpt, 560),
   ].join("\n");
 }
@@ -157,52 +189,52 @@ export function formatClusterDetail(
   candidate: ClusterCandidate | ClusterExcludedCandidate,
 ): string {
   const lines = [
-    section("Seed"),
+    sectionLabel("Seed"),
     analysis.seedLabel,
     "",
-    section("Cluster"),
-    `cluster_basis: ${analysis.clusterBasis}`,
-    `cluster_issues: ${
+    sectionLabel("Cluster"),
+    `${text("cluster_basis", "muted")} ${analysis.clusterBasis}`,
+    `${text("cluster_issues", "muted")} ${
       analysis.clusterIssues.length > 0
         ? analysis.clusterIssues.map((issue) => `#${issue}`).join(", ")
         : "(none)"
     }`,
   ];
   if (analysis.mergeSummary) {
-    lines.push(`merge_readiness: ${analysis.mergeSummary}`);
+    lines.push(`${text("merge_readiness", "muted")} ${valueTone(analysis.mergeSummary, "warn")}`);
   }
   lines.push("");
   if ("excludedReasonCode" in candidate) {
-    lines.push(section("Excluded Candidate"));
-    lines.push(`excluded_candidate: #${candidate.prNumber} ${candidate.title}`);
-    lines.push(`matched_by: ${candidate.matchedBy}`);
-    lines.push(`reason: ${candidate.reason}`);
+    lines.push(sectionLabel("Excluded Candidate"));
+    lines.push(`${text("excluded_candidate", "muted")} #${candidate.prNumber} ${candidate.title}`);
+    lines.push(`${text("matched_by", "muted")} ${candidate.matchedBy}`);
+    lines.push(`${text("reason", "muted")} ${valueTone(candidate.reason, "warn")}`);
     lines.push(
-      `linked_issues: ${candidate.linkedIssues.map((issue) => `#${issue}`).join(", ") || "(none)"}`,
+      `${text("linked_issues", "muted")} ${candidate.linkedIssues.map((issue) => `#${issue}`).join(", ") || "(none)"}`,
     );
     if (candidate.semanticScore !== undefined) {
-      lines.push(`semantic_score: ${candidate.semanticScore.toFixed(2)}`);
+      lines.push(`${text("semantic_score", "muted")} ${candidate.semanticScore.toFixed(2)}`);
     }
   } else {
-    lines.push(section("Candidate"));
-    lines.push(`candidate: #${candidate.prNumber} ${candidate.title}`);
-    lines.push(`status: ${candidate.status}`);
-    lines.push(`matched_by: ${candidate.matchedBy}`);
+    lines.push(sectionLabel("Candidate"));
+    lines.push(`${text("candidate", "muted")} #${candidate.prNumber} ${candidate.title}`);
+    lines.push(`${text("status", "muted")} ${valueTone(candidate.status, "ok")}`);
+    lines.push(`${text("matched_by", "muted")} ${candidate.matchedBy}`);
     lines.push(
-      `relevant_prod: ${candidate.relevantProdFiles.length}/${candidate.prodFiles.length}`,
+      `${text("relevant_prod", "muted")} ${candidate.relevantProdFiles.length}/${candidate.prodFiles.length}`,
     );
     lines.push(
-      `relevant_test: ${candidate.relevantTestFiles.length}/${candidate.testFiles.length}`,
+      `${text("relevant_test", "muted")} ${candidate.relevantTestFiles.length}/${candidate.testFiles.length}`,
     );
-    lines.push(`noise: ${candidate.noiseFilesCount}`);
+    lines.push(`${text("noise", "muted")} ${candidate.noiseFilesCount}`);
     lines.push(
-      `linked_issues: ${candidate.linkedIssues.map((issue) => `#${issue}`).join(", ") || "(none)"}`,
+      `${text("linked_issues", "muted")} ${candidate.linkedIssues.map((issue) => `#${issue}`).join(", ") || "(none)"}`,
     );
     if (candidate.supersededBy) {
-      lines.push(`superseded_by: #${candidate.supersededBy}`);
+      lines.push(`${text("superseded_by", "muted")} #${candidate.supersededBy}`);
     }
     if (candidate.reason) {
-      lines.push(`reason: ${candidate.reason}`);
+      lines.push(`${text("reason", "muted")} ${candidate.reason}`);
     }
   }
   return lines.join("\n");
@@ -210,27 +242,36 @@ export function formatClusterDetail(
 
 export function formatStatusDetail(status: StatusSnapshot, now = new Date()): string {
   return [
-    section("Index Status"),
-    `repo: ${status.repo}`,
-    `last_sync_at: ${formatTimestamp(status.lastSyncAt)}`,
-    `last_sync_age: ${formatRelativeAge(status.lastSyncAt, now)}`,
-    `issue_last_sync_at: ${formatTimestamp(status.issueLastSyncAt)}`,
-    `issue_last_sync_age: ${formatRelativeAge(status.issueLastSyncAt, now)}`,
+    sectionLabel("Index Status"),
+    accentMeta("repo", status.repo),
+    accentMeta("last_sync_at", formatTimestamp(status.lastSyncAt)),
+    `${text("last_sync_age", "muted")} ${valueTone(
+      formatRelativeAge(status.lastSyncAt, now),
+      freshnessTone(status.lastSyncAt, now),
+    )}`,
+    accentMeta("issue_last_sync_at", formatTimestamp(status.issueLastSyncAt)),
+    `${text("issue_last_sync_age", "muted")} ${valueTone(
+      formatRelativeAge(status.issueLastSyncAt, now),
+      freshnessTone(status.issueLastSyncAt, now),
+    )}`,
     "",
-    section("Counts"),
-    `prs: ${status.prCount}`,
-    `issues: ${status.issueCount}`,
-    `labels: ${status.labelCount}`,
-    `issue_labels: ${status.issueLabelCount}`,
-    `comments: ${status.commentCount}`,
-    `docs: ${status.docCount}`,
+    sectionLabel("Counts"),
+    accentMeta("prs", String(status.prCount)),
+    accentMeta("issues", String(status.issueCount)),
+    accentMeta("labels", String(status.labelCount)),
+    accentMeta("issue_labels", String(status.issueLabelCount)),
+    accentMeta("comments", String(status.commentCount)),
+    accentMeta("docs", String(status.docCount)),
     "",
-    section("Vector"),
-    `vector_available: ${status.vectorAvailable}`,
-    `vector_error: ${status.vectorError ?? "(none)"}`,
-    `embedding_model: ${status.embeddingModel}`,
+    sectionLabel("Vector"),
+    `${text("vector_available", "muted")} ${valueTone(
+      String(status.vectorAvailable),
+      status.vectorAvailable ? "ok" : "warn",
+    )}`,
+    `${text("vector_error", "muted")} ${status.vectorError ?? "(none)"}`,
+    accentMeta("embedding_model", status.embeddingModel),
     "",
-    section("Tips"),
+    sectionLabel("Tips"),
     "Press / to filter the active list.",
     "Use x for cross-reference and c for cluster analysis.",
   ].join("\n");
@@ -244,20 +285,30 @@ export function formatSearchLandingDetail(
   const noun = mode === "pr-search" ? "PR" : "issue";
   const plural = mode === "pr-search" ? "PRs" : "issues";
   const count = status ? (mode === "pr-search" ? status.prCount : status.issueCount) : null;
-  const lines = [section("Desk Brief"), `Active list: recent open ${plural}`];
+  const lines = [sectionLabel("Desk Brief"), `Active list: recent open ${plural}`];
   if (status) {
-    lines.push(`Repo: ${status.repo}`);
-    lines.push(`Local rows: ${count}`);
+    lines.push(accentMeta("Repo", status.repo));
+    lines.push(accentMeta("Local rows", String(count)));
     lines.push(
-      `Freshness: PR ${formatRelativeAge(status.lastSyncAt, now)}  Issue ${formatRelativeAge(status.issueLastSyncAt, now)}`,
+      `${text("Freshness", "muted")} ${valueTone(
+        `PR ${formatRelativeAge(status.lastSyncAt, now)}`,
+        freshnessTone(status.lastSyncAt, now),
+      )}  ${valueTone(
+        `Issue ${formatRelativeAge(status.issueLastSyncAt, now)}`,
+        freshnessTone(status.issueLastSyncAt, now),
+      )}`,
     );
     lines.push(
-      `Vector: ${status.vectorAvailable ? "ready" : (status.vectorError ?? "unavailable")}`,
+      `${text("Vector", "muted")} ${
+        status.vectorAvailable
+          ? valueTone("ready", "ok")
+          : valueTone(status.vectorError ?? "unavailable", "warn")
+      }`,
     );
   }
   lines.push(
     "",
-    section("Next"),
+    sectionLabel("Next"),
     `Press / to refine the ${noun} list without leaving this view.`,
     "Press Enter to inspect the selected row.",
     mode === "pr-search"
@@ -270,66 +321,76 @@ export function formatSearchLandingDetail(
 
 export function buildStatusRows(status: StatusSnapshot): TuiResultRow[] {
   return [
-    { kind: "status", label: "PRs", value: String(status.prCount) },
-    { kind: "status", label: "Issues", value: String(status.issueCount) },
-    { kind: "status", label: "PR Labels", value: String(status.labelCount) },
-    { kind: "status", label: "Issue Labels", value: String(status.issueLabelCount) },
-    { kind: "status", label: "Comments", value: String(status.commentCount) },
-    { kind: "status", label: "Docs", value: String(status.docCount) },
+    { kind: "status", label: text("PRs", "muted"), value: valueTone(String(status.prCount), "ok") },
     {
       kind: "status",
-      label: "Vector",
+      label: text("Issues", "muted"),
+      value: valueTone(String(status.issueCount), "ok"),
+    },
+    {
+      kind: "status",
+      label: text("PR Labels", "muted"),
+      value: text(String(status.labelCount), "primary"),
+    },
+    {
+      kind: "status",
+      label: text("Issue Labels", "muted"),
+      value: text(String(status.issueLabelCount), "primary"),
+    },
+    {
+      kind: "status",
+      label: text("Comments", "muted"),
+      value: text(String(status.commentCount), "primary"),
+    },
+    {
+      kind: "status",
+      label: text("Docs", "muted"),
+      value: text(String(status.docCount), "primary"),
+    },
+    {
+      kind: "status",
+      label: text("Vector", "muted"),
       value: status.vectorAvailable
-        ? "available"
-        : `unavailable (${status.vectorError ?? "unknown"})`,
+        ? valueTone("available", "ok")
+        : valueTone(`unavailable (${status.vectorError ?? "unknown"})`, "warn"),
     },
   ];
-}
-
-function badge(label: string, tone: "neutral" | "ok" | "warn" | "error"): string {
-  switch (tone) {
-    case "ok":
-      return `{black-fg}{green-bg} ${label} {/}`;
-    case "warn":
-      return `{black-fg}{yellow-bg} ${label} {/}`;
-    case "error":
-      return `{white-fg}{red-bg} ${label} {/}`;
-    default:
-      return `{black-fg}{white-bg} ${label} {/}`;
-  }
 }
 
 export function formatHeader(model: TuiHeaderModel, now = new Date()): string {
   const status = model.status;
   const segments = [
-    badge(model.activeModeLabel, "neutral"),
-    badge(`repo ${model.repo}`, "neutral"),
-    badge(`db ${truncate(model.dbPath, 48)}`, "neutral"),
+    badge(`MODE ${model.activeModeLabel}`, "focus"),
+    badge(`REPO ${model.repo}`, "neutral"),
+    badge(`DB ${truncate(model.dbPath, 36)}`, "neutral"),
   ];
   if (status) {
     segments.push(
-      badge(`pr ${formatRelativeAge(status.lastSyncAt, now)}`, status.lastSyncAt ? "ok" : "warn"),
-    );
-    segments.push(
       badge(
-        `issue ${formatRelativeAge(status.issueLastSyncAt, now)}`,
-        status.issueLastSyncAt ? "ok" : "warn",
+        `PR ${formatRelativeAge(status.lastSyncAt, now)}`,
+        freshnessTone(status.lastSyncAt, now),
       ),
     );
     segments.push(
       badge(
-        status.vectorAvailable ? "vector ok" : `vector ${status.vectorError ?? "off"}`,
+        `ISSUE ${formatRelativeAge(status.issueLastSyncAt, now)}`,
+        freshnessTone(status.issueLastSyncAt, now),
+      ),
+    );
+    segments.push(
+      badge(
+        status.vectorAvailable ? "VECTOR READY" : `VECTOR ${status.vectorError ?? "OFF"}`,
         status.vectorAvailable ? "ok" : "warn",
       ),
     );
   }
   if (model.ftsOnly) {
-    segments.push(badge("fts only", "warn"));
+    segments.push(badge("FTS ONLY", "warn"));
   }
   if (model.busyMessage) {
-    segments.push(badge(model.busyMessage, "warn"));
+    segments.push(badge(model.busyMessage.toUpperCase(), "warn"));
   } else if (model.errorMessage) {
-    segments.push(badge("error", "error"));
+    segments.push(badge("ERROR", "error"));
   }
   return segments.join(" ");
 }
@@ -338,33 +399,27 @@ export function formatModeRail(activeMode: string, focus: TuiFocus): string[] {
   return TUI_MODE_ORDER.map((mode) => {
     const selected = mode.id === activeMode;
     const prefix = selected ? ">" : " ";
-    const label = `${prefix} ${mode.label}`.padEnd(16);
+    const label = `${prefix} ${mode.label}`.padEnd(TUI_THEME.layout.navWidth);
     if (!selected) {
-      return label;
+      return text(label, focus === "nav" ? "dim" : "muted");
     }
-    if (focus === "nav") {
-      return `{black-fg}{cyan-bg}${label}{/}`;
-    }
-    return `{cyan-fg}${label}{/}`;
+    return selectedLine(label, focus === "nav");
   });
 }
 
 export function formatResults(model: TuiRenderModel): string[] {
   if (model.rows.length === 0) {
-    return ["No rows.", "Press / to search this view."];
+    return [text("No rows.", "muted"), text("Press / to search this view.", "dim")];
   }
   return model.rows.map((row, index) => {
     const line = formatResultRow(row);
     if (index !== model.selectedIndex) {
-      return `  ${line}`;
+      return `${text("  ", "dim")}${line}`;
     }
-    if (model.focus === "results") {
-      return `{black-fg}{cyan-bg}> ${line}{/}`;
-    }
-    return `{cyan-fg}> ${line}{/}`;
+    return selectedLine(`> ${line}`, model.focus === "results");
   });
 }
 
 export function defaultHintText(): string {
-  return "Tab focus | / query | Enter inspect | x xref | c cluster | s/S sync | r facts | o open | b back | q quit";
+  return `${text("Tab", "dim")} focus | ${text("/", "accent")} query | ${text("Enter", "accent")} inspect | ${text("x", "accent")} xref | ${text("c", "accent")} cluster | ${text("s/S", "accent")} sync | ${text("r", "accent")} facts | ${text("o", "accent")} open | ${text("b", "accent")} back | ${text("q", "accent")} quit`;
 }
