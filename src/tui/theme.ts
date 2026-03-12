@@ -1,7 +1,7 @@
 export const TUI_THEME = {
   layout: {
     headerHeight: 1,
-    footerHeight: 1,
+    footerHeight: 2,
     queryHeight: 1,
     navWidth: 14,
     resultsLeft: 14,
@@ -88,6 +88,18 @@ export function section(textValue: string): string {
 
 export function keyLabel(textValue: string): string {
   return wrap(textValue, fg("accent"), "bold");
+}
+
+export function actionChip(textValue: string, enabled = true): string {
+  if (!enabled) {
+    return wrap(` ${textValue} `, fg("dim"));
+  }
+  return wrap(
+    ` ${textValue} `,
+    `${TUI_THEME.colors.commandText}-fg`,
+    `${TUI_THEME.colors.neutralBadge}-bg`,
+    "bold",
+  );
 }
 
 export function panelLabel(textValue: string, active = false): string {

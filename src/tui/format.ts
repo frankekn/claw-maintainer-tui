@@ -7,6 +7,7 @@ import type {
 } from "../types.js";
 import {
   TUI_THEME,
+  actionChip,
   badge,
   section as sectionLabel,
   selectedLine,
@@ -14,7 +15,14 @@ import {
   valueTone,
 } from "./theme.js";
 import { TUI_MODE_ORDER } from "./types.js";
-import type { TuiFocus, TuiHeaderModel, TuiRenderModel, TuiResultRow } from "./types.js";
+import type {
+  TuiAction,
+  TuiFocus,
+  TuiHeaderModel,
+  TuiListSummary,
+  TuiRenderModel,
+  TuiResultRow,
+} from "./types.js";
 
 function formatTimestamp(value: string | null): string {
   if (!value) {
@@ -185,6 +193,7 @@ export function formatClusterDetail(
     clusterBasis: string;
     clusterIssues: number[];
     mergeSummary: string | null;
+    coverageSummary: string | null;
   },
   candidate: ClusterCandidate | ClusterExcludedCandidate,
 ): string {
@@ -202,6 +211,9 @@ export function formatClusterDetail(
   ];
   if (analysis.mergeSummary) {
     lines.push(`${text("merge_readiness", "muted")} ${valueTone(analysis.mergeSummary, "warn")}`);
+  }
+  if (analysis.coverageSummary) {
+    lines.push(`${text("coverage", "muted")} ${valueTone(analysis.coverageSummary, "ok")}`);
   }
   lines.push("");
   if ("excludedReasonCode" in candidate) {
@@ -237,6 +249,23 @@ export function formatClusterDetail(
       lines.push(`${text("reason", "muted")} ${candidate.reason}`);
     }
   }
+  return lines.join("\n");
+}
+
+export function formatContextCoverageDetail(
+  title: string,
+  yieldLabel: string | null,
+  coverageLabel: string | null,
+  body: string,
+): string {
+  const lines = [sectionLabel(title)];
+  if (yieldLabel) {
+    lines.push(`${text("hits", "muted")} ${valueTone(yieldLabel, "ok")}`);
+  }
+  if (coverageLabel) {
+    lines.push(`${text("coverage", "muted")} ${coverageLabel}`);
+  }
+  lines.push("", body);
   return lines.join("\n");
 }
 
@@ -285,7 +314,8 @@ export function formatSearchLandingDetail(
   const noun = mode === "pr-search" ? "PR" : "issue";
   const plural = mode === "pr-search" ? "PRs" : "issues";
   const count = status ? (mode === "pr-search" ? status.prCount : status.issueCount) : null;
-  const lines = [sectionLabel("Desk Brief"), `Active list: recent open ${plural}`];
+  const inspectNoun = mode === "pr-search" ? "pull request" : "issue";
+  const lines = [sectionLabel("Start Here"), `Active list: recent open ${plural}`];
   if (status) {
     lines.push(accentMeta("Repo", status.repo));
     lines.push(accentMeta("Local rows", String(count)));
@@ -308,13 +338,13 @@ export function formatSearchLandingDetail(
   }
   lines.push(
     "",
-    sectionLabel("Next"),
-    `Press / to refine the ${noun} list without leaving this view.`,
-    "Press Enter to inspect the selected row.",
+    sectionLabel("Workflow"),
+    `1 Search the ${noun} desk or browse the recent open ${plural.toLowerCase()}.`,
+    `2 Inspect the selected ${inspectNoun}.`,
     mode === "pr-search"
-      ? "Press x to jump into linked issues and c to inspect cluster neighbors."
-      : "Press x to jump into linked pull requests.",
-    "Press o to open the selected GitHub page in the browser.",
+      ? "3 Xref for linked issues, 4 Cluster for nearby fixes."
+      : "3 Xref for linked pull requests.",
+    "Use the action bar first. Power keys stay visible as secondary hints.",
   );
   return lines.join("\n");
 }
@@ -395,6 +425,26 @@ export function formatHeader(model: TuiHeaderModel, now = new Date()): string {
   return segments.join(" ");
 }
 
+export function formatActionBar(actions: TuiAction[]): string {
+  return actions
+    .map((action) => actionChip(`${action.slot} ${action.label}`, action.enabled))
+    .join(` ${text("·", "dim")} `);
+}
+
+export function formatListSummary(summary: TuiListSummary | null): string {
+  if (!summary) {
+    return "";
+  }
+  const segments = [valueTone(summary.yieldLabel, "ok")];
+  if (summary.confidenceLabel) {
+    segments.push(`${text("confidence", "muted")} ${summary.confidenceLabel}`);
+  }
+  if (summary.coverageLabel) {
+    segments.push(`${text("coverage", "muted")} ${summary.coverageLabel}`);
+  }
+  return segments.join(` ${text("·", "dim")} `);
+}
+
 export function formatModeRail(activeMode: string, focus: TuiFocus): string[] {
   return TUI_MODE_ORDER.map((mode) => {
     const selected = mode.id === activeMode;
@@ -420,6 +470,6 @@ export function formatResults(model: TuiRenderModel): string[] {
   });
 }
 
-export function defaultHintText(): string {
-  return `${text("Tab", "dim")} focus | ${text("/", "accent")} query | ${text("Enter", "accent")} inspect | ${text("x", "accent")} xref | ${text("c", "accent")} cluster | ${text("s/S", "accent")} sync | ${text("r", "accent")} facts | ${text("o", "accent")} open | ${text("b", "accent")} back | ${text("q", "accent")} quit`;
+export function defaultSecondaryHintText(): string {
+  return `${text("Move", "muted")} j/k ↑↓  ${text("Enter", "muted")} inspect  ${text("b", "muted")} back  ${text("q", "muted")} quit`;
 }

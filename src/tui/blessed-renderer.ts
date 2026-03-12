@@ -1,7 +1,13 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import blessed from "blessed";
-import { formatHeader, formatModeRail, formatResults } from "./format.js";
+import {
+  formatActionBar,
+  formatHeader,
+  formatListSummary,
+  formatModeRail,
+  formatResults,
+} from "./format.js";
 import { TUI_THEME, keyLabel, panelLabel, text, valueTone } from "./theme.js";
 import { TUI_MODE_ORDER } from "./types.js";
 import type { TuiController } from "./controller.js";
@@ -163,7 +169,7 @@ export class BlessedTuiRenderer {
     this.navBox.setContent(formatModeRail(model.mode, model.focus).join("\n"));
     this.resultsBox.setLabel(
       panelLabel(
-        `${model.resultTitle.toUpperCase()} · ${model.rows.length}`,
+        `${model.resultTitle.toUpperCase()}${model.listSummary ? ` · ${model.listSummary.yieldLabel}` : ""}`,
         model.focus === "results",
       ),
     );
@@ -175,8 +181,13 @@ export class BlessedTuiRenderer {
       : model.busy
         ? valueTone(model.footer.message, "warn")
         : text(model.footer.message, "muted");
+    const listSummary = model.listSummary
+      ? `${keyLabel("HITS")} ${formatListSummary(model.listSummary)}`
+      : "";
     this.messageBox.setContent(
-      `${keyLabel("STATUS")} ${statusTone}  ${keyLabel("KEYS")} ${model.footer.hintText}`,
+      `${keyLabel("STATUS")} ${statusTone}${listSummary ? `  ${listSummary}` : ""}\n${keyLabel("ACTIONS")} ${formatActionBar(
+        model.footer.actions,
+      )}  ${keyLabel("KEYS")} ${model.footer.hintText}`,
     );
     const promptPrefix = `${keyLabel("QUERY")} ${text(model.footer.queryPrompt.toUpperCase(), "dim")} >`;
     const queryValue =
@@ -269,6 +280,11 @@ export class BlessedTuiRenderer {
       return;
     }
 
+    if (ch && /^[1-9]$/.test(ch)) {
+      await this.controller.triggerAction(Number(ch));
+      return;
+    }
+
     if (key.name === "q") {
       this.screen.destroy();
       return;
@@ -289,7 +305,10 @@ export class BlessedTuiRenderer {
       await this.controller.openSelected();
       return;
     }
-    if (ch === "/" || key.full === "/" || key.name === "slash") {
+    if (
+      (ch === "/" || key.full === "/" || key.name === "slash") &&
+      this.controller.canStartSlashQuery()
+    ) {
       this.controller.startQueryEntry();
       return;
     }

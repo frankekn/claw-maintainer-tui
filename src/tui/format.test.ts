@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatActionBar,
   buildStatusRows,
   formatClusterDetail,
   formatHeader,
+  formatListSummary,
   formatSearchLandingDetail,
   formatResultRow,
   formatStatusDetail,
@@ -95,6 +97,7 @@ describe("tui formatting", () => {
           clusterBasis: "linked_issue",
           clusterIssues: [41789],
           mergeSummary: "needs_work via review_fact",
+          coverageSummary: "1 candidates · 0 excluded",
         },
         candidate,
       ),
@@ -108,8 +111,24 @@ describe("tui formatting", () => {
       new Date("2026-03-11T08:28:13.832Z"),
     );
 
-    expect(detail).toContain("DESK BRIEF");
+    expect(detail).toContain("START HERE");
     expect(detail).toContain("Local rows{/} 23935");
-    expect(detail).toContain("Press / to refine the PR list");
+    expect(detail).toContain("1 Search the PR desk");
+  });
+
+  it("formats action bar chips and list summaries", () => {
+    expect(
+      formatActionBar([
+        { id: "query", slot: 1, label: "Search", shortcut: "/", enabled: true },
+        { id: "cluster", slot: 4, label: "Cluster", shortcut: "c", enabled: false },
+      ]),
+    ).toContain("1 Search");
+    expect(
+      formatListSummary({
+        yieldLabel: "20 hits",
+        confidenceLabel: "score avg 0.910",
+        coverageLabel: null,
+      }),
+    ).toContain("20 hits");
   });
 });

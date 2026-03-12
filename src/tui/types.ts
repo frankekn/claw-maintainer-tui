@@ -20,12 +20,37 @@ export type TuiFocus = "nav" | "results" | "query";
 
 export const TUI_MODE_ORDER: Array<{ id: TuiMode; label: string; queryPrompt: string }> = [
   { id: "pr-search", label: "PR Search", queryPrompt: "Search PRs" },
-  { id: "issue-search", label: "Issue Search", queryPrompt: "Search issues" },
-  { id: "pr-xref", label: "PR Xref", queryPrompt: "PR number" },
-  { id: "issue-xref", label: "Issue Xref", queryPrompt: "Issue number" },
-  { id: "cluster", label: "Cluster", queryPrompt: "PR number" },
+  { id: "issue-search", label: "Issue Search", queryPrompt: "Search Issues" },
+  { id: "pr-xref", label: "PR Xref", queryPrompt: "Enter PR Number" },
+  { id: "issue-xref", label: "Issue Xref", queryPrompt: "Enter Issue Number" },
+  { id: "cluster", label: "Cluster", queryPrompt: "Enter PR Number" },
   { id: "status", label: "Status", queryPrompt: "Status view" },
 ];
+
+export type TuiActionId =
+  | "query"
+  | "inspect"
+  | "xref"
+  | "cluster"
+  | "sync-prs"
+  | "sync-issues"
+  | "refresh-facts"
+  | "open-url"
+  | "back";
+
+export type TuiAction = {
+  id: TuiActionId;
+  slot: number;
+  label: string;
+  shortcut: string;
+  enabled: boolean;
+};
+
+export type TuiListSummary = {
+  yieldLabel: string;
+  confidenceLabel: string | null;
+  coverageLabel: string | null;
+};
 
 export type TuiResultRow =
   | { kind: "pr"; pr: SearchResult }
@@ -55,6 +80,7 @@ export type TuiFooterModel = {
   message: string;
   queryPrompt: string;
   queryValue: string;
+  actions: TuiAction[];
 };
 
 export type TuiRenderModel = {
@@ -72,6 +98,7 @@ export type TuiRenderModel = {
   context: TuiContext;
   queryPlaceholder: string;
   busy: boolean;
+  listSummary: TuiListSummary | null;
 };
 
 export interface TuiDataService {
@@ -113,4 +140,5 @@ export type TuiViewSnapshot = {
   detailTitle: string;
   resultTitle: string;
   context: TuiContext;
+  isLandingView: boolean;
 };

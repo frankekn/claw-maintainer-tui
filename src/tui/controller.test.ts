@@ -198,6 +198,16 @@ describe("TuiController", () => {
     expect(service.searchCalls).toEqual(["state:open"]);
     expect(controller.getRenderModel().resultTitle).toBe("Recent Open PRs");
     expect(controller.getRenderModel().rows).toHaveLength(2);
+    expect(controller.getRenderModel().detailTitle).toBe("Start Here");
+    expect(controller.getRenderModel().detailText).toContain("START HERE");
+    expect(controller.getRenderModel().footer.actions.map((action) => action.label)).toEqual([
+      "Search",
+      "Inspect",
+      "Xref",
+      "Cluster",
+      "Sync PRs",
+      "Back",
+    ]);
   });
 
   it("runs PR search and opens the selected PR detail", async () => {
@@ -216,6 +226,8 @@ describe("TuiController", () => {
     expect(model.rows).toHaveLength(2);
     expect(model.detailText).toContain("PR #41793");
     expect(model.activeUrl).toBe("https://github.com/openclaw/openclaw/pull/41793");
+    expect(model.listSummary?.yieldLabel).toBe("2 hits");
+    expect(model.listSummary?.confidenceLabel).toContain("score avg");
   });
 
   it("edits the query inline before submitting", async () => {
@@ -237,6 +249,20 @@ describe("TuiController", () => {
     expect(controller.getRenderModel().query).toBe("mar");
   });
 
+  it("can enter guided actions by number instead of memorizing shortcuts", async () => {
+    const controller = new TuiController(new FakeTuiDataService(), {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.triggerAction(1);
+
+    expect(controller.getRenderModel().focus).toBe("query");
+    expect(controller.getRenderModel().footer.actions[0]?.label).toBe("Search");
+  });
+
   it("navigates into PR xref and back out", async () => {
     const controller = new TuiController(new FakeTuiDataService(), {
       repo: "openclaw/openclaw",
@@ -250,6 +276,8 @@ describe("TuiController", () => {
 
     expect(controller.getRenderModel().mode).toBe("pr-xref");
     expect(controller.getRenderModel().query).toBe("41793");
+    expect(controller.getRenderModel().listSummary?.yieldLabel).toBe("1 related issue");
+    expect(controller.getRenderModel().listSummary?.coverageLabel).toBe("source PR #41793");
     controller.goBack();
     expect(controller.getRenderModel().mode).toBe("pr-search");
     expect(controller.getRenderModel().query).toBe("marker spoofing");

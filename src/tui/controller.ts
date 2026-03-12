@@ -1,6 +1,7 @@
 import {
   buildStatusRows,
-  defaultHintText,
+  defaultSecondaryHintText,
+  formatContextCoverageDetail,
   formatClusterDetail,
   formatIssueDetail,
   formatPrDetail,
@@ -18,6 +19,9 @@ import type {
   TuiContext,
   TuiDataService,
   TuiFocus,
+  TuiAction,
+  TuiActionId,
+  TuiListSummary,
   TuiMode,
   TuiRenderModel,
   TuiResultRow,
@@ -57,6 +61,7 @@ export class TuiController {
   private detailRequestId = 0;
   private listRequestId = 0;
   private clusterContext: ClusterContextState | null = null;
+  private isLandingView = false;
 
   constructor(
     private readonly service: TuiDataService,
@@ -74,6 +79,7 @@ export class TuiController {
 
   getRenderModel(): TuiRenderModel {
     const modeInfo = TUI_MODE_ORDER.find((mode) => mode.id === this.mode)!;
+    const actions = this.buildActions();
     return {
       header: {
         repo: this.options.repo,
@@ -85,10 +91,11 @@ export class TuiController {
         errorMessage: this.errorMessage,
       },
       footer: {
-        hintText: defaultHintText(),
+        hintText: defaultSecondaryHintText(),
         message: this.errorMessage ?? this.message,
         queryPrompt: modeInfo.queryPrompt,
         queryValue: this.query,
+        actions,
       },
       mode: this.mode,
       focus: this.focus,
@@ -102,6 +109,7 @@ export class TuiController {
       context: this.context,
       queryPlaceholder: modeInfo.queryPrompt,
       busy: this.busyMessage !== null,
+      listSummary: this.buildListSummary(),
     };
   }
 
@@ -134,11 +142,13 @@ export class TuiController {
       this.detailTitle = "Repository Status";
       this.detailText = formatStatusDetail(this.statusSnapshot);
       this.query = "";
+      this.isLandingView = false;
     } else {
       this.detailTitle = "Detail";
       this.detailText = `Use / to ${TUI_MODE_ORDER.find((item) => item.id === mode)?.queryPrompt.toLowerCase()}.`;
       this.resultTitle = TUI_MODE_ORDER.find((item) => item.id === mode)?.label ?? "Results";
       this.query = "";
+      this.isLandingView = false;
     }
     this.emit();
     if (mode === "pr-search" || mode === "issue-search") {
@@ -156,6 +166,10 @@ export class TuiController {
     }
     this.focus = "query";
     this.emit();
+  }
+
+  canStartSlashQuery(): boolean {
+    return this.mode === "pr-search" || this.mode === "issue-search";
   }
 
   stopQueryEntry(): void {
@@ -200,12 +214,16 @@ export class TuiController {
     }
     this.selectedIndex = Math.max(0, Math.min(this.rows.length - 1, this.selectedIndex + delta));
     this.emit();
+    if (this.isLandingView) {
+      return;
+    }
     void this.refreshDetailForSelection();
   }
 
   async submitQuery(value: string): Promise<void> {
     this.query = value.trim();
     this.errorMessage = null;
+    this.isLandingView = false;
     const requestId = ++this.listRequestId;
     switch (this.mode) {
       case "pr-search":
@@ -259,7 +277,45 @@ export class TuiController {
   }
 
   async openSelected(): Promise<void> {
+    this.isLandingView = false;
     await this.refreshDetailForSelection(true);
+  }
+
+  async triggerAction(slot: number): Promise<void> {
+    const action = this.buildActions().find((item) => item.slot === slot && item.enabled);
+    if (!action) {
+      return;
+    }
+    switch (action.id) {
+      case "query":
+        this.startQueryEntry();
+        return;
+      case "inspect":
+        await this.openSelected();
+        return;
+      case "xref":
+        await this.crossReferenceSelected();
+        return;
+      case "cluster":
+        await this.clusterSelected();
+        return;
+      case "sync-prs":
+        await this.syncPrs();
+        return;
+      case "sync-issues":
+        await this.syncIssues();
+        return;
+      case "refresh-facts":
+        await this.refreshFacts();
+        return;
+      case "open-url":
+        return;
+      case "back":
+        this.goBack();
+        return;
+      default:
+        return;
+    }
   }
 
   async crossReferenceSelected(): Promise<void> {
@@ -294,8 +350,9 @@ export class TuiController {
     await this.runBusy("Syncing PRs", async () => {
       const summary = await this.service.syncPrs();
       await this.refreshStatus();
-      this.message = `Synced PRs: processed ${summary.processedPrs}, skipped ${summary.skippedPrs}.`;
+      const successMessage = `Synced PRs: processed ${summary.processedPrs}, skipped ${summary.skippedPrs}.`;
       await this.replayActiveView();
+      this.message = successMessage;
     });
   }
 
@@ -303,8 +360,9 @@ export class TuiController {
     await this.runBusy("Syncing issues", async () => {
       const summary = await this.service.syncIssues();
       await this.refreshStatus();
-      this.message = `Synced issues: processed ${summary.processedIssues}, skipped ${summary.skippedIssues}.`;
+      const successMessage = `Synced issues: processed ${summary.processedIssues}, skipped ${summary.skippedIssues}.`;
       await this.replayActiveView();
+      this.message = successMessage;
     });
   }
 
@@ -318,8 +376,9 @@ export class TuiController {
     await this.runBusy(`Refreshing PR #${prNumber} facts`, async () => {
       await this.service.refreshPrFacts(prNumber);
       await this.refreshStatus();
-      this.message = `Refreshed PR #${prNumber} facts.`;
+      const successMessage = `Refreshed PR #${prNumber} facts.`;
       await this.replayActiveView();
+      this.message = successMessage;
     });
   }
 
@@ -340,6 +399,7 @@ export class TuiController {
     this.resultTitle = snapshot.resultTitle;
     this.context = snapshot.context;
     this.clusterContext = null;
+    this.isLandingView = snapshot.isLandingView;
     this.errorMessage = null;
     this.message = "Returned to previous view.";
     this.emit();
@@ -347,6 +407,135 @@ export class TuiController {
 
   getActiveUrl(): string | null {
     return this.activeUrl;
+  }
+
+  private buildActions(): TuiAction[] {
+    const hasRow = Boolean(this.rows[this.selectedIndex]);
+    const hasHistory = this.history.length > 0;
+    const canXref = hasRow && ["pr", "issue"].includes(this.rows[this.selectedIndex]!.kind);
+    const canCluster =
+      hasRow &&
+      (this.rows[this.selectedIndex]!.kind === "pr" ||
+        this.rows[this.selectedIndex]!.kind === "cluster-candidate");
+    const canRefresh = this.currentPrNumber() !== null;
+
+    switch (this.mode) {
+      case "pr-search":
+        return [
+          this.action(1, "query", "Search", "/"),
+          this.action(2, "inspect", "Inspect", "Enter", hasRow),
+          this.action(3, "xref", "Xref", "x", canXref),
+          this.action(4, "cluster", "Cluster", "c", canCluster),
+          this.action(5, "sync-prs", "Sync PRs", "s"),
+          this.action(6, "back", "Back", "b", hasHistory),
+        ];
+      case "issue-search":
+        return [
+          this.action(1, "query", "Search", "/"),
+          this.action(2, "inspect", "Inspect", "Enter", hasRow),
+          this.action(3, "xref", "Xref", "x", canXref),
+          this.action(4, "sync-issues", "Sync Issues", "S"),
+          this.action(5, "back", "Back", "b", hasHistory),
+        ];
+      case "pr-xref":
+        return [
+          this.action(1, "query", "Find PR", "1"),
+          this.action(2, "inspect", "Inspect", "Enter", hasRow),
+          this.action(3, "back", "Back", "b", hasHistory),
+          this.action(4, "sync-issues", "Sync Issues", "S"),
+        ];
+      case "issue-xref":
+        return [
+          this.action(1, "query", "Find Issue", "1"),
+          this.action(2, "inspect", "Inspect", "Enter", hasRow),
+          this.action(3, "back", "Back", "b", hasHistory),
+          this.action(4, "sync-prs", "Sync PRs", "s"),
+        ];
+      case "cluster":
+        return [
+          this.action(1, "query", "Find PR", "1"),
+          this.action(2, "inspect", "Inspect", "Enter", hasRow),
+          this.action(3, "refresh-facts", "Refresh", "r", canRefresh),
+          this.action(4, "back", "Back", "b", hasHistory),
+          this.action(5, "sync-prs", "Sync PRs", "s"),
+        ];
+      case "status":
+        return [
+          this.action(1, "sync-prs", "Sync PRs", "s"),
+          this.action(2, "sync-issues", "Sync Issues", "S"),
+          this.action(3, "back", "Back", "b", hasHistory),
+        ];
+      default:
+        return [];
+    }
+  }
+
+  private buildListSummary(): TuiListSummary | null {
+    const rows = this.rows;
+    const count = rows.length;
+    if (this.mode === "status") {
+      return {
+        yieldLabel: `${count} metrics`,
+        confidenceLabel: null,
+        coverageLabel: null,
+      };
+    }
+
+    const searchRows = rows.filter(
+      (
+        row,
+      ): row is Extract<TuiResultRow, { kind: "pr" }> | Extract<TuiResultRow, { kind: "issue" }> =>
+        row.kind === "pr" || row.kind === "issue",
+    );
+    const scores = searchRows.map((row) => (row.kind === "pr" ? row.pr.score : row.issue.score));
+    const confidenceLabel =
+      scores.length > 0
+        ? `score avg ${(scores.reduce((sum, score) => sum + score, 0) / scores.length).toFixed(3)} · top ${Math.max(...scores).toFixed(3)}`
+        : null;
+
+    switch (this.mode) {
+      case "pr-search":
+      case "issue-search":
+        return {
+          yieldLabel: `${count} hits${count >= this.resultLimit ? ` · top ${this.resultLimit} shown` : ""}`,
+          confidenceLabel,
+          coverageLabel: null,
+        };
+      case "pr-xref":
+        return {
+          yieldLabel: `${count} related issue${count === 1 ? "" : "s"}`,
+          confidenceLabel: null,
+          coverageLabel: this.context?.kind === "pr" ? `source PR #${this.context.prNumber}` : null,
+        };
+      case "issue-xref":
+        return {
+          yieldLabel: `${count} related PR${count === 1 ? "" : "s"}`,
+          confidenceLabel: null,
+          coverageLabel:
+            this.context?.kind === "issue" ? `source issue #${this.context.issueNumber}` : null,
+        };
+      case "cluster": {
+        const included = rows.filter((row) => row.kind === "cluster-candidate").length;
+        const excluded = rows.filter((row) => row.kind === "cluster-excluded").length;
+        return {
+          yieldLabel: `${count} cluster rows`,
+          confidenceLabel: null,
+          coverageLabel: `${included} candidates · ${excluded} excluded`,
+        };
+      }
+      default:
+        return null;
+    }
+  }
+
+  private action(
+    slot: number,
+    id: TuiActionId,
+    label: string,
+    shortcut: string,
+    enabled = true,
+  ): TuiAction {
+    return { slot, id, label, shortcut, enabled };
   }
 
   private parseNumericQuery(label: string): number {
@@ -368,6 +557,7 @@ export class TuiController {
       detailTitle: this.detailTitle,
       resultTitle: this.resultTitle,
       context: this.context,
+      isLandingView: this.isLandingView,
     });
   }
 
@@ -393,6 +583,7 @@ export class TuiController {
       if (pushHistory) {
         this.pushHistory();
       }
+      this.isLandingView = false;
       const result = await this.service.xrefPr(prNumber, this.resultLimit);
       this.mode = "pr-xref";
       this.query = String(prNumber);
@@ -421,6 +612,7 @@ export class TuiController {
       if (pushHistory) {
         this.pushHistory();
       }
+      this.isLandingView = false;
       const result = await this.service.xrefIssue(issueNumber, this.resultLimit);
       this.mode = "issue-xref";
       this.query = String(issueNumber);
@@ -449,6 +641,7 @@ export class TuiController {
       if (pushHistory) {
         this.pushHistory();
       }
+      this.isLandingView = false;
       const result = await this.service.clusterPr(prNumber, this.resultLimit);
       this.mode = "cluster";
       this.query = String(prNumber);
@@ -501,6 +694,7 @@ export class TuiController {
 
   private async loadLandingRows(mode: "pr-search" | "issue-search"): Promise<void> {
     const requestId = ++this.listRequestId;
+    this.isLandingView = true;
     this.message =
       mode === "pr-search" ? "Loading recent open PRs..." : "Loading recent open issues...";
     this.emit();
@@ -513,13 +707,14 @@ export class TuiController {
         this.rows = results.map((pr) => ({ kind: "pr", pr }));
         this.selectedIndex = 0;
         this.resultTitle = "Recent Open PRs";
-        this.detailTitle = "PR Detail";
+        this.detailTitle = "Start Here";
         this.detailText = formatSearchLandingDetail("pr-search", this.statusSnapshot);
         this.message =
           results.length > 0
             ? `Loaded ${results.length} recent open PR(s). Press / to refine the list.`
             : "No open PRs found in the local index.";
-        await this.refreshDetailForSelection();
+        this.activeUrl = null;
+        this.emit();
         return;
       }
       const issues = await this.service.searchIssues("state:open", this.resultLimit);
@@ -529,13 +724,14 @@ export class TuiController {
       this.rows = issues.map((issue) => ({ kind: "issue", issue }));
       this.selectedIndex = 0;
       this.resultTitle = "Recent Open Issues";
-      this.detailTitle = "Issue Detail";
+      this.detailTitle = "Start Here";
       this.detailText = formatSearchLandingDetail("issue-search", this.statusSnapshot);
       this.message =
         issues.length > 0
           ? `Loaded ${issues.length} recent open issue(s). Press / to refine the list.`
           : "No open issues found in the local index.";
-      await this.refreshDetailForSelection();
+      this.activeUrl = null;
+      this.emit();
     } catch (error) {
       if (requestId !== this.listRequestId || this.mode !== mode) {
         return;
@@ -550,6 +746,8 @@ export class TuiController {
     if (this.mode === "pr-search" || this.mode === "issue-search") {
       if (this.query) {
         await this.submitQuery(this.query);
+      } else {
+        await this.loadLandingRows(this.mode);
       }
       return;
     }
@@ -573,11 +771,18 @@ export class TuiController {
   }
 
   private async refreshDetailForSelection(force = false): Promise<void> {
+    if (this.isLandingView && !force) {
+      this.emit();
+      return;
+    }
     const row = this.rows[this.selectedIndex];
     if (!row) {
       if (this.mode === "status" && this.statusSnapshot) {
         this.detailTitle = "Repository Status";
         this.detailText = formatStatusDetail(this.statusSnapshot);
+      } else if (this.mode === "pr-search" || this.mode === "issue-search") {
+        this.detailTitle = "Start Here";
+        this.detailText = formatSearchLandingDetail(this.mode, this.statusSnapshot);
       }
       this.emit();
       return;
@@ -589,7 +794,17 @@ export class TuiController {
         return;
       }
       this.detailTitle = force ? `PR #${payload.pr.prNumber}` : "PR Detail";
-      this.detailText = formatPrDetail(payload.pr, payload.comments);
+      const detailBody = formatPrDetail(payload.pr, payload.comments);
+      if (this.context?.kind === "issue") {
+        this.detailText = formatContextCoverageDetail(
+          "Related PRs",
+          this.buildListSummary()?.yieldLabel ?? null,
+          this.buildListSummary()?.coverageLabel ?? null,
+          detailBody,
+        );
+      } else {
+        this.detailText = detailBody;
+      }
       this.activeUrl = payload.pr.url;
       this.emit();
       return;
@@ -600,7 +815,17 @@ export class TuiController {
         return;
       }
       this.detailTitle = force ? `Issue #${issue.issueNumber}` : "Issue Detail";
-      this.detailText = formatIssueDetail(issue);
+      const detailBody = formatIssueDetail(issue);
+      if (this.context?.kind === "pr") {
+        this.detailText = formatContextCoverageDetail(
+          "Related Issues",
+          this.buildListSummary()?.yieldLabel ?? null,
+          this.buildListSummary()?.coverageLabel ?? null,
+          detailBody,
+        );
+      } else {
+        this.detailText = detailBody;
+      }
       this.activeUrl = issue.url;
       this.emit();
       return;
@@ -621,6 +846,7 @@ export class TuiController {
           mergeSummary: this.clusterContext.analysis.mergeReadiness
             ? `${this.clusterContext.analysis.mergeReadiness.state} via ${this.clusterContext.analysis.mergeReadiness.source}`
             : null,
+          coverageSummary: this.buildListSummary()?.coverageLabel ?? null,
         },
         row.candidate,
       );
