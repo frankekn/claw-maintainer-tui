@@ -10,7 +10,9 @@ import type {
   IssueRecord,
   PullRequestCommentRecord,
   PullRequestDataSource,
+  PullRequestFactRecord,
   PullRequestRecord,
+  PullRequestReviewFact,
   RepoRef,
 } from "./types.js";
 
@@ -19,6 +21,8 @@ const MISSING_MODEL = "/tmp/clawlens-missing-model.gguf";
 
 class FakePullRequestDataSource implements PullRequestDataSource {
   private readonly hydrated = new Map<number, HydratedPullRequest>();
+  private readonly facts = new Map<number, PullRequestFactRecord>();
+  private readonly searchResults = new Map<string, number[]>();
   changedPrNumbers: number[] = [];
   hydrateCalls: number[] = [];
 
@@ -30,6 +34,14 @@ class FakePullRequestDataSource implements PullRequestDataSource {
 
   setPullRequest(item: HydratedPullRequest): void {
     this.hydrated.set(item.pr.number, item);
+  }
+
+  setFacts(item: PullRequestFactRecord): void {
+    this.facts.set(item.prNumber, item);
+  }
+
+  setSearchResults(query: string, state: "open" | "closed", prNumbers: number[]): void {
+    this.searchResults.set(`${state}:${query}`, [...prNumbers]);
   }
 
   async *listAllPullRequests(_repo: RepoRef): AsyncGenerator<PullRequestRecord> {
@@ -50,6 +62,22 @@ class FakePullRequestDataSource implements PullRequestDataSource {
       throw new Error(`missing PR ${prNumber}`);
     }
     return payload;
+  }
+
+  async fetchPullRequestFacts(_repo: RepoRef, prNumber: number): Promise<PullRequestFactRecord> {
+    const payload = this.facts.get(prNumber);
+    if (!payload) {
+      throw new Error(`missing facts for PR ${prNumber}`);
+    }
+    return payload;
+  }
+
+  async searchPullRequestNumbers(
+    _repo: RepoRef,
+    query: string,
+    options: { state: "open" | "closed"; limit: number },
+  ): Promise<number[]> {
+    return [...(this.searchResults.get(`${options.state}:${query}`) ?? [])].slice(0, options.limit);
   }
 }
 
@@ -145,6 +173,42 @@ function makeIssue(number: number, overrides: Partial<IssueRecord> = {}): IssueR
     updatedAt: "2026-03-10T00:00:00.000Z",
     closedAt: null,
     labels: [],
+    ...overrides,
+  };
+}
+
+function makePullRequestFacts(
+  prNumber: number,
+  overrides: Partial<PullRequestFactRecord> = {},
+): PullRequestFactRecord {
+  return {
+    prNumber,
+    headSha: `head-${prNumber}`,
+    reviewDecision: null,
+    mergeStateStatus: "CLEAN",
+    mergeable: "MERGEABLE",
+    statusChecks: [],
+    linkedIssues: [],
+    changedFiles: [],
+    fetchedAt: "2026-03-11T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function makeReviewFact(
+  prNumber: number,
+  overrides: Partial<PullRequestReviewFact> = {},
+): PullRequestReviewFact {
+  return {
+    repo: "openclaw/openclaw",
+    prNumber,
+    headSha: `head-${prNumber}`,
+    decision: "needs_work",
+    summary: "Existing contract test still fails.",
+    commands: [],
+    failingTests: [],
+    source: "manual",
+    recordedAt: "2026-03-11T00:00:00.000Z",
     ...overrides,
   };
 }
@@ -341,5 +405,402 @@ describe("PrIndexStore", () => {
     const status = await store.status();
     expect(status.issueCount).toBe(1);
     expect(status.issueLabelCount).toBe(2);
+  });
+
+  it("clusters linked-issue PRs by best base coverage and keeps merge readiness separate", async () => {
+    const store = await createStore();
+    const seed = makePullRequest(41793, {
+      title: "fix: prune image-containing tool results during context pruning",
+      body: "Source Issue #41789\nPrune image-containing tool results during context pruning.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+      labels: ["size: XS"],
+    });
+    const best = makePullRequest(42212, {
+      title: "fix: prune image-containing tool results across context pruning paths",
+      body: "Source Issue #41789\nHandle image-containing tool results in pruner and history image pruning paths.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+      labels: ["size: XS"],
+    });
+    const partial = makePullRequest(41863, {
+      title: "fix: prune image-containing tool results in pruner",
+      body: "Source Issue #41789\nHandle image-containing tool results in pruner only.",
+      updatedAt: "2026-03-08T00:00:00.000Z",
+      labels: ["size: XS"],
+    });
+    const excluded = makePullRequest(42946, {
+      title: "fix: historical image-containing tool results in transcript replay",
+      body: "Source Issue #42171\nHistorical image-containing tool results still affect context pruning during transcript replay.",
+      updatedAt: "2026-03-11T00:00:00.000Z",
+      labels: ["size: XS"],
+    });
+
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([seed, best, partial, excluded]),
+      full: true,
+    });
+
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(41793, {
+        headSha: "head-41793",
+        linkedIssues: [{ issueNumber: 41789, linkSource: "source_issue_marker" }],
+        changedFiles: [
+          { path: "src/agents/pi-extensions/context-pruning/pruner.ts", kind: "prod" },
+        ],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(42212, {
+        headSha: "ccbd07d3a",
+        linkedIssues: [{ issueNumber: 41789, linkSource: "source_issue_marker" }],
+        changedFiles: [
+          { path: ".github/workflows/auto-response.yml", kind: "other" },
+          { path: "src/agents/pi-extensions/context-pruning/pruner.ts", kind: "prod" },
+          {
+            path: "src/agents/pi-embedded-runner/run/history-image-prune.ts",
+            kind: "prod",
+          },
+          {
+            path: "src/agents/pi-extensions/context-pruning/pruner.test.ts",
+            kind: "test",
+          },
+          {
+            path: "src/agents/pi-embedded-runner/run/history-image-prune.test.ts",
+            kind: "test",
+          },
+          { path: "docs/help/troubleshooting.md", kind: "other" },
+        ],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(41863, {
+        headSha: "head-41863",
+        linkedIssues: [{ issueNumber: 41789, linkSource: "source_issue_marker" }],
+        changedFiles: [
+          { path: "src/agents/pi-extensions/context-pruning/pruner.ts", kind: "prod" },
+        ],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(42946, {
+        headSha: "head-42946",
+        linkedIssues: [{ issueNumber: 42171, linkSource: "source_issue_marker" }],
+        changedFiles: [
+          {
+            path: "src/agents/pi-embedded-runner/run/history-image-prune.ts",
+            kind: "prod",
+          },
+          {
+            path: "src/agents/pi-embedded-runner/run/history-image-prune.test.ts",
+            kind: "test",
+          },
+        ],
+      }),
+    );
+    await store.recordReviewFact(
+      makeReviewFact(42212, {
+        headSha: "ccbd07d3a",
+        summary: "Existing integration-style contract test still fails.",
+        commands: [
+          "scripts/pr review-checkout-pr 42212",
+          "scripts/pr review-tests 42212 src/agents/pi-extensions/context-pruning.test.ts",
+        ],
+        failingTests: [
+          "src/agents/pi-extensions/context-pruning.test.ts > skips tool results that contain images (no soft trim, no hard clear)",
+        ],
+      }),
+    );
+
+    const analysis = await store.clusterPullRequest({
+      prNumber: 41793,
+      limit: 10,
+      ftsOnly: true,
+    });
+
+    expect(analysis?.clusterBasis).toBe("linked_issue");
+    expect(analysis?.clusterIssueNumbers).toEqual([41789]);
+    expect(analysis?.bestBase?.prNumber).toBe(42212);
+    expect(analysis?.bestBase?.status).toBe("best_base");
+    expect(analysis?.bestBase?.matchedBy).toBe("linked_issue");
+    expect(analysis?.bestBase?.relevantProdFiles).toEqual([
+      "src/agents/pi-embedded-runner/run/history-image-prune.ts",
+      "src/agents/pi-extensions/context-pruning/pruner.ts",
+    ]);
+    expect(analysis?.bestBase?.relevantTestFiles).toEqual([
+      "src/agents/pi-embedded-runner/run/history-image-prune.test.ts",
+      "src/agents/pi-extensions/context-pruning/pruner.test.ts",
+    ]);
+    expect(analysis?.bestBase?.noiseFilesCount).toBe(2);
+    expect(analysis?.bestBase?.reason).toContain("broader relevant production coverage");
+    expect(analysis?.bestBase?.reason).toContain("adds companion tests");
+    expect(analysis?.mergeReadiness).toEqual({
+      state: "needs_work",
+      source: "review_fact",
+      summary: "Existing integration-style contract test still fails.",
+      commands: [
+        "scripts/pr review-checkout-pr 42212",
+        "scripts/pr review-tests 42212 src/agents/pi-extensions/context-pruning.test.ts",
+      ],
+      failingTests: [
+        "src/agents/pi-extensions/context-pruning.test.ts > skips tool results that contain images (no soft trim, no hard clear)",
+      ],
+      headSha: "ccbd07d3a",
+    });
+
+    expect(analysis?.sameClusterCandidates.map((candidate) => candidate.prNumber)).toEqual([
+      42212, 41793, 41863,
+    ]);
+    expect(analysis?.sameClusterCandidates[1]).toMatchObject({
+      prNumber: 41793,
+      status: "superseded_candidate",
+      supersededBy: 42212,
+    });
+    expect(analysis?.sameClusterCandidates[1]?.relevantProdFiles).toEqual([
+      "src/agents/pi-extensions/context-pruning/pruner.ts",
+    ]);
+    expect(analysis?.sameClusterCandidates[1]?.reason).toContain(
+      "narrower relevant production coverage",
+    );
+    expect(analysis?.sameClusterCandidates[1]?.reason).toContain("fewer companion tests");
+    expect(analysis?.sameClusterCandidates[2]).toMatchObject({
+      prNumber: 41863,
+      status: "superseded_candidate",
+      supersededBy: 42212,
+    });
+    expect(analysis?.nearbyButExcluded).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          prNumber: 42946,
+          matchedBy: "local_semantic",
+          linkedIssues: [42171],
+          excludedReasonCode: "different_linked_issue",
+          reason: "different_linked_issue: #42171",
+        }),
+      ]),
+    );
+  });
+
+  it("falls back to semantic-only candidates when exact issue links are absent", async () => {
+    const store = await createStore();
+    const seed = makePullRequest(34019, {
+      title: "fix: detect ollama prompt too long as context overflow error",
+      body: "Detect prompt too long failures as context overflow errors.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const neighbor = makePullRequest(34020, {
+      title: "fix: detect prompt too long failures as context overflow details",
+      body: "Detect prompt too long failures as context overflow errors and show more details to the user.",
+      updatedAt: "2026-03-11T00:00:00.000Z",
+    });
+
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([seed, neighbor]),
+      full: true,
+    });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(34019, {
+        changedFiles: [{ path: "src/providers/ollama.ts", kind: "prod" }],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(34020, {
+        changedFiles: [{ path: "src/providers/ollama.ts", kind: "prod" }],
+      }),
+    );
+
+    const analysis = await store.clusterPullRequest({
+      prNumber: 34019,
+      limit: 10,
+      ftsOnly: true,
+    });
+
+    expect(analysis?.clusterBasis).toBe("semantic_only");
+    expect(analysis?.clusterIssueNumbers).toEqual([]);
+    expect(analysis?.bestBase).toBeNull();
+    expect(analysis?.mergeReadiness).toBeNull();
+    expect(analysis?.sameClusterCandidates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          prNumber: 34020,
+          matchedBy: "local_semantic",
+          status: "possible_same_cluster",
+          reason: "semantic-only candidate",
+        }),
+      ]),
+    );
+  });
+
+  it("discovers same-issue siblings via live issue search and dedupes repeated failing checks", async () => {
+    const store = await createStore();
+    const seed = makePullRequest(34019, {
+      title: 'fix: detect Ollama "prompt too long" as context overflow error',
+      body: "Closes #34005\nDetect prompt too long failures as context overflow errors.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const sibling = makePullRequest(36074, {
+      title: "fix(agents): recognize Ollama context overflow error for auto-compaction",
+      body: "Closes #34005\nRecognize Ollama context overflow and trigger auto-compaction.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+      state: "closed",
+      closedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([seed, sibling]);
+    source.setFacts(
+      makePullRequestFacts(34019, {
+        linkedIssues: [{ issueNumber: 34005, linkSource: "closing_reference" }],
+        changedFiles: [
+          { path: "src/agents/pi-embedded-helpers/errors.ts", kind: "prod" },
+          {
+            path: "src/agents/pi-embedded-helpers.formatassistanterrortext.test.ts",
+            kind: "test",
+          },
+        ],
+        statusChecks: [
+          {
+            name: "checks (bun, test, pnpm canvas:a2ui:bundle && bunx vitest run --config vitest.unit.config.ts)",
+            status: "COMPLETED",
+            conclusion: "FAILURE",
+            workflowName: "CI",
+            detailsUrl: null,
+          },
+          {
+            name: "checks-windows (node, test, 3, 6, pnpm test)",
+            status: "COMPLETED",
+            conclusion: "FAILURE",
+            workflowName: "CI",
+            detailsUrl: null,
+          },
+          {
+            name: "checks-windows (node, test, 3, 6, pnpm test)",
+            status: "COMPLETED",
+            conclusion: "FAILURE",
+            workflowName: "CI",
+            detailsUrl: null,
+          },
+        ],
+      }),
+    );
+    source.setFacts(
+      makePullRequestFacts(36074, {
+        linkedIssues: [{ issueNumber: 34005, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/agents/pi-embedded-helpers/errors.ts", kind: "prod" }],
+      }),
+    );
+    source.setSearchResults("34005", "closed", [36074]);
+
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([seed]),
+      full: true,
+    });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(34019, {
+        linkedIssues: [{ issueNumber: 34005, linkSource: "closing_reference" }],
+        changedFiles: [
+          { path: "src/agents/pi-embedded-helpers/errors.ts", kind: "prod" },
+          {
+            path: "src/agents/pi-embedded-helpers.formatassistanterrortext.test.ts",
+            kind: "test",
+          },
+        ],
+        statusChecks: [
+          {
+            name: "checks-windows (node, test, 3, 6, pnpm test)",
+            status: "COMPLETED",
+            conclusion: "FAILURE",
+            workflowName: "CI",
+            detailsUrl: null,
+          },
+          {
+            name: "checks-windows (node, test, 3, 6, pnpm test)",
+            status: "COMPLETED",
+            conclusion: "FAILURE",
+            workflowName: "CI",
+            detailsUrl: null,
+          },
+        ],
+      }),
+    );
+
+    const analysis = await store.clusterPullRequest({
+      prNumber: 34019,
+      limit: 10,
+      ftsOnly: true,
+      repo,
+      source,
+    });
+
+    expect(analysis?.bestBase?.prNumber).toBe(34019);
+    expect(analysis?.sameClusterCandidates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          prNumber: 36074,
+          matchedBy: "live_issue_search",
+          status: "superseded_candidate",
+          supersededBy: 34019,
+        }),
+      ]),
+    );
+    expect(analysis?.mergeReadiness).toMatchObject({
+      state: "needs_work",
+      source: "github",
+      failingChecks: ["checks-windows (node, test, 3, 6, pnpm test) (x2)"],
+    });
+  });
+
+  it("recovers semantic-only candidates via live search when local recall is empty", async () => {
+    const store = await createStore();
+    const seed = makePullRequest(39670, {
+      title: "feat(agents): auto-show context usage warning when nearing token limit",
+      body: "Auto-show a context usage warning before compaction issues become user-visible.",
+      updatedAt: "2026-03-08T00:00:00.000Z",
+    });
+    const liveNeighbor = makePullRequest(39671, {
+      title: "feat: show context usage warning before silent compaction",
+      body: "Show a warning before silent compaction and token limit issues derail long sessions.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([seed, liveNeighbor]);
+    source.setFacts(
+      makePullRequestFacts(39671, {
+        changedFiles: [{ path: "src/auto-reply/reply/agent-runner.ts", kind: "prod" }],
+      }),
+    );
+    source.setSearchResults(
+      "auto-show context usage warning when nearing token limit",
+      "open",
+      [39671],
+    );
+
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([seed]),
+      full: true,
+    });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39670, {
+        changedFiles: [{ path: "src/auto-reply/reply/agent-runner.ts", kind: "prod" }],
+      }),
+    );
+
+    const analysis = await store.clusterPullRequest({
+      prNumber: 39670,
+      limit: 10,
+      ftsOnly: true,
+      repo,
+      source,
+    });
+
+    expect(analysis?.clusterBasis).toBe("semantic_only");
+    expect(analysis?.sameClusterCandidates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          prNumber: 39671,
+          matchedBy: "live_semantic",
+          status: "possible_same_cluster",
+        }),
+      ]),
+    );
   });
 });

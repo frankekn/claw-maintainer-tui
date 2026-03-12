@@ -4,9 +4,15 @@ import type {
   HydratedPullRequest,
   IssueDataSource,
   IssueRecord,
+  PullRequestChangedFile,
+  PullRequestChangedFileKind,
   PullRequestCommentRecord,
   PullRequestDataSource,
+  PullRequestFactRecord,
+  PullRequestLinkedIssue,
+  PullRequestLinkSource,
   PullRequestRecord,
+  PullRequestStatusCheck,
   RepoRef,
 } from "./types.js";
 
@@ -72,6 +78,27 @@ type RestReviewComment = {
   path?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
+};
+
+type RestPullRequestView = {
+  number: number;
+  body?: string | null;
+  title?: string | null;
+  state?: string | null;
+  isDraft?: boolean | null;
+  headRefOid?: string | null;
+  reviewDecision?: string | null;
+  mergeStateStatus?: string | null;
+  mergeable?: string | null;
+  updatedAt?: string | null;
+  url?: string | null;
+  closingIssuesReferences?: Array<{ number?: number | null }> | null;
+  files?: Array<{ path?: string | null }> | null;
+  statusCheckRollup?: unknown;
+};
+
+type SearchPullRequestResult = {
+  number: number;
 };
 
 type GhApiRunner = (path: string) => Promise<string>;
@@ -181,6 +208,134 @@ function toReviewCommentRecord(value: RestReviewComment): PullRequestCommentReco
     url: value.html_url?.trim() ?? "",
     createdAt: value.created_at ?? new Date(0).toISOString(),
     updatedAt: value.updated_at ?? value.created_at ?? new Date(0).toISOString(),
+  };
+}
+
+function addLinkedIssue(
+  out: Map<number, PullRequestLinkedIssue>,
+  issueNumber: number,
+  linkSource: PullRequestLinkSource,
+): void {
+  if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+    return;
+  }
+  const existing = out.get(issueNumber);
+  if (!existing || linkSource === "closing_reference") {
+    out.set(issueNumber, { issueNumber, linkSource });
+  }
+}
+
+function collectLinkedIssues(title: string, body: string): PullRequestLinkedIssue[] {
+  const out = new Map<number, PullRequestLinkedIssue>();
+  for (const match of title.matchAll(/\[issue\s+#(\d+)\]/gi)) {
+    addLinkedIssue(out, Number(match[1]), "title_reference");
+  }
+  for (const match of body.matchAll(/\bsource issue\s*#(\d+)\b/gi)) {
+    addLinkedIssue(out, Number(match[1]), "source_issue_marker");
+  }
+  for (const match of body.matchAll(/\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s+#(\d+)\b/gi)) {
+    addLinkedIssue(out, Number(match[1]), "body_reference");
+  }
+  return Array.from(out.values()).sort((a, b) => a.issueNumber - b.issueNumber);
+}
+
+function classifyChangedFileKind(filePath: string): PullRequestChangedFileKind {
+  const normalized = filePath.trim();
+  if (
+    /(^|\/)(test|tests|__tests__)\//i.test(normalized) ||
+    /\.(test|spec)\.[^/.]+$/i.test(normalized)
+  ) {
+    return "test";
+  }
+  if (
+    !normalized ||
+    /(^|\/)(docs|doc|fixtures|examples|scripts|\.github)\//i.test(normalized) ||
+    /(^|\/)(readme|changelog|license)(\.[^/]+)?$/i.test(normalized) ||
+    /\.(md|mdx|txt|json|ya?ml|toml|lock)$/i.test(normalized)
+  ) {
+    return "other";
+  }
+  return "prod";
+}
+
+function collectStatusCheckCandidates(value: unknown): unknown[] {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  if (!value || typeof value !== "object") {
+    return [];
+  }
+  const item = value as Record<string, unknown>;
+  const directNodes = item.nodes;
+  if (Array.isArray(directNodes)) {
+    return directNodes;
+  }
+  const contexts = item.contexts;
+  if (Array.isArray(contexts)) {
+    return contexts;
+  }
+  return Object.values(item).flatMap((child) => collectStatusCheckCandidates(child));
+}
+
+function normalizeStatusCheck(value: unknown): PullRequestStatusCheck | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const item = value as Record<string, unknown>;
+  const name =
+    (typeof item.name === "string" && item.name) ||
+    (typeof item.context === "string" && item.context) ||
+    (typeof item.workflowName === "string" && item.workflowName) ||
+    (typeof item.__typename === "string" && item.__typename) ||
+    "";
+  if (!name) {
+    return null;
+  }
+  return {
+    name,
+    status: typeof item.status === "string" ? item.status : "UNKNOWN",
+    conclusion: typeof item.conclusion === "string" ? item.conclusion : null,
+    workflowName: typeof item.workflowName === "string" ? item.workflowName : null,
+    detailsUrl: typeof item.detailsUrl === "string" ? item.detailsUrl : null,
+  };
+}
+
+export function normalizePullRequestFactRecord(value: RestPullRequestView): PullRequestFactRecord {
+  const title = value.title?.trim() ?? "";
+  const body = value.body ?? "";
+  const linkedIssues = new Map<number, PullRequestLinkedIssue>();
+  for (const issue of collectLinkedIssues(title, body)) {
+    linkedIssues.set(issue.issueNumber, issue);
+  }
+  for (const issue of value.closingIssuesReferences ?? []) {
+    const issueNumber = issue?.number;
+    if (typeof issueNumber === "number") {
+      linkedIssues.set(issueNumber, {
+        issueNumber,
+        linkSource: "closing_reference",
+      });
+    }
+  }
+  const changedFiles: PullRequestChangedFile[] = (value.files ?? [])
+    .map((item) => item?.path?.trim() ?? "")
+    .filter(Boolean)
+    .map((filePath) => ({
+      path: filePath,
+      kind: classifyChangedFileKind(filePath),
+    }));
+  const statusChecksRaw = collectStatusCheckCandidates(value.statusCheckRollup);
+  return {
+    prNumber: value.number,
+    headSha: value.headRefOid?.trim() ?? "",
+    reviewDecision: value.reviewDecision?.trim() || null,
+    mergeStateStatus: value.mergeStateStatus?.trim() || null,
+    mergeable: value.mergeable?.trim() || null,
+    statusChecks: statusChecksRaw
+      .map(normalizeStatusCheck)
+      .filter((item): item is PullRequestStatusCheck => Boolean(item)),
+    linkedIssues: Array.from(linkedIssues.values()).sort((a, b) => a.issueNumber - b.issueNumber),
+    changedFiles,
+    fetchedAt: new Date().toISOString(),
   };
 }
 
@@ -376,6 +531,71 @@ export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueD
       pr: toPullRequestRecord(pr),
       comments,
     };
+  }
+
+  async fetchPullRequestFacts(repo: RepoRef, prNumber: number): Promise<PullRequestFactRecord> {
+    const repoRef = `${repo.owner}/${repo.name}`;
+    const { stdout } = await execFileAsync(
+      "gh",
+      [
+        "pr",
+        "view",
+        String(prNumber),
+        "-R",
+        repoRef,
+        "--json",
+        [
+          "number",
+          "title",
+          "body",
+          "state",
+          "isDraft",
+          "headRefOid",
+          "reviewDecision",
+          "mergeStateStatus",
+          "mergeable",
+          "statusCheckRollup",
+          "closingIssuesReferences",
+          "files",
+          "updatedAt",
+          "url",
+        ].join(","),
+      ],
+      {
+        maxBuffer: GH_MAX_BUFFER,
+      },
+    );
+    return normalizePullRequestFactRecord(JSON.parse(stdout) as RestPullRequestView);
+  }
+
+  async searchPullRequestNumbers(
+    repo: RepoRef,
+    query: string,
+    options: { state: "open" | "closed"; limit: number },
+  ): Promise<number[]> {
+    const repoRef = `${repo.owner}/${repo.name}`;
+    const { stdout } = await execFileAsync(
+      "gh",
+      [
+        "search",
+        "prs",
+        query,
+        "-R",
+        repoRef,
+        "--state",
+        options.state,
+        "--limit",
+        String(options.limit),
+        "--json",
+        "number",
+      ],
+      {
+        maxBuffer: GH_MAX_BUFFER,
+      },
+    );
+    return (JSON.parse(stdout) as SearchPullRequestResult[])
+      .map((item) => item.number)
+      .filter((number) => Number.isInteger(number));
   }
 }
 

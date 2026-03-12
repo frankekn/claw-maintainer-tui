@@ -1,0 +1,116 @@
+import type {
+  ClusterCandidate,
+  ClusterExcludedCandidate,
+  ClusterPullRequestAnalysis,
+  IssueSearchResult,
+  SearchResult,
+  StatusSnapshot,
+  SyncSummary,
+} from "../types.js";
+
+export type TuiMode =
+  | "pr-search"
+  | "issue-search"
+  | "pr-xref"
+  | "issue-xref"
+  | "cluster"
+  | "status";
+
+export type TuiFocus = "nav" | "results" | "query";
+
+export const TUI_MODE_ORDER: Array<{ id: TuiMode; label: string; queryPrompt: string }> = [
+  { id: "pr-search", label: "PR Search", queryPrompt: "Search PRs" },
+  { id: "issue-search", label: "Issue Search", queryPrompt: "Search issues" },
+  { id: "pr-xref", label: "PR Xref", queryPrompt: "PR number" },
+  { id: "issue-xref", label: "Issue Xref", queryPrompt: "Issue number" },
+  { id: "cluster", label: "Cluster", queryPrompt: "PR number" },
+  { id: "status", label: "Status", queryPrompt: "Status view" },
+];
+
+export type TuiResultRow =
+  | { kind: "pr"; pr: SearchResult }
+  | { kind: "issue"; issue: IssueSearchResult }
+  | { kind: "cluster-candidate"; candidate: ClusterCandidate }
+  | { kind: "cluster-excluded"; candidate: ClusterExcludedCandidate }
+  | { kind: "status"; label: string; value: string };
+
+export type TuiContext =
+  | { kind: "pr"; prNumber: number }
+  | { kind: "issue"; issueNumber: number }
+  | { kind: "cluster"; prNumber: number }
+  | null;
+
+export type TuiHeaderModel = {
+  repo: string;
+  dbPath: string;
+  activeModeLabel: string;
+  ftsOnly: boolean;
+  status: StatusSnapshot | null;
+  busyMessage: string | null;
+  errorMessage: string | null;
+};
+
+export type TuiFooterModel = {
+  hintText: string;
+  message: string;
+  queryPrompt: string;
+  queryValue: string;
+};
+
+export type TuiRenderModel = {
+  header: TuiHeaderModel;
+  footer: TuiFooterModel;
+  mode: TuiMode;
+  focus: TuiFocus;
+  rows: TuiResultRow[];
+  selectedIndex: number;
+  detailText: string;
+  activeUrl: string | null;
+  query: string;
+  resultTitle: string;
+  detailTitle: string;
+  context: TuiContext;
+  queryPlaceholder: string;
+  busy: boolean;
+};
+
+export interface TuiDataService {
+  status(): Promise<StatusSnapshot>;
+  search(query: string, limit: number): Promise<SearchResult[]>;
+  searchIssues(query: string, limit: number): Promise<IssueSearchResult[]>;
+  show(prNumber: number): Promise<{
+    pr: SearchResult | null;
+    comments: Array<{
+      kind: string;
+      author: string;
+      createdAt: string;
+      url: string;
+      excerpt: string;
+    }>;
+  }>;
+  showIssue(issueNumber: number): Promise<IssueSearchResult | null>;
+  xrefIssue(
+    issueNumber: number,
+    limit: number,
+  ): Promise<{ issue: IssueSearchResult | null; pullRequests: SearchResult[] }>;
+  xrefPr(
+    prNumber: number,
+    limit: number,
+  ): Promise<{ pullRequest: SearchResult | null; issues: IssueSearchResult[] }>;
+  clusterPr(prNumber: number, limit: number): Promise<ClusterPullRequestAnalysis | null>;
+  syncPrs(): Promise<SyncSummary>;
+  syncIssues(): Promise<SyncSummary>;
+  refreshPrFacts(prNumber: number): Promise<void>;
+}
+
+export type TuiViewSnapshot = {
+  mode: TuiMode;
+  query: string;
+  rows: TuiResultRow[];
+  selectedIndex: number;
+  detailText: string;
+  activeUrl: string | null;
+  detailTitle: string;
+  resultTitle: string;
+  context: TuiContext;
+};
