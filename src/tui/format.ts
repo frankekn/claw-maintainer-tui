@@ -355,7 +355,7 @@ export function formatCrossSearchLandingDetail(
   status: StatusSnapshot | null,
   now = new Date(),
 ): string {
-  const lines = [sectionLabel("Start Here"), "Cross Search is the default investigation desk."];
+  const lines = [sectionLabel("Start Here"), "Explore shows cached PRs and issues in one list."];
   if (status) {
     lines.push(accentMeta("repo", status.repo));
     lines.push(
@@ -371,9 +371,9 @@ export function formatCrossSearchLandingDetail(
   lines.push(
     "",
     sectionLabel("Workflow"),
-    "1 Search once to scan PRs, issues, and cluster signals together.",
+    "1 Browse the cached list or press / to refine it.",
     "2 Press Enter to open the selected detail drawer.",
-    "3 Detail auto-refreshes in the background when you inspect a PR or issue.",
+    "3 Press m to load 20 more rows.",
     "4 Use Refresh only when you want full cluster verification.",
   );
   return lines.join("\n");
@@ -387,7 +387,7 @@ export function formatSearchLandingDetail(
   const noun = mode === "pr-search" ? "PR" : "issue";
   const plural = mode === "pr-search" ? "PRs" : "issues";
   const count = status ? (mode === "pr-search" ? status.prCount : status.issueCount) : null;
-  const lines = [sectionLabel("Start Here"), `Active list: recent open ${plural}`];
+  const lines = [sectionLabel("Start Here"), `Showing cached open ${plural}`];
   if (status) {
     lines.push(accentMeta("repo", status.repo));
     lines.push(accentMeta("local_rows", String(count)));
@@ -405,11 +405,9 @@ export function formatSearchLandingDetail(
   lines.push(
     "",
     sectionLabel("Workflow"),
-    `1 Search the ${noun} desk or browse recent open ${plural.toLowerCase()}.`,
+    `1 Browse open ${plural.toLowerCase()} or press / to search.`,
     `2 Press Enter to inspect the selected ${noun.toLowerCase()}.`,
-    mode === "pr-search"
-      ? "3 Use Xref for linked issues and Cluster for nearby fixes."
-      : "3 Use Xref for related pull requests.",
+    "3 Press m to load 20 more rows.",
   );
   return lines.join("\n");
 }
@@ -554,8 +552,8 @@ export function formatResults(model: TuiRenderModel): string[] {
   return lines;
 }
 
-export function defaultSecondaryHintText(): string {
-  return `${text("Move", "muted")} j/k ↑↓  ${text("Enter", "muted")} detail  ${text("Tab", "muted")} focus  ${text("q", "muted")} quit`;
+export function defaultSecondaryHintText(canLoadMore = false): string {
+  return `${text("Move/Scroll", "muted")} j/k ↑↓  ${text("Enter", "muted")} detail  ${text("Tab", "muted")} focus  ${text("/", "muted")} query${canLoadMore ? `  ${text("m", "muted")} more` : ""}  ${text("q", "muted")} quit`;
 }
 
 export function formatDetailStatus(status: string | null): string {

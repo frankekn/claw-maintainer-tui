@@ -47,26 +47,31 @@ type ClusterContextState = {
 };
 
 type DetailRefreshTarget = { kind: "pr"; id: number } | { kind: "issue"; id: number } | null;
+type BrowseMode = "cross-search" | "pr-search" | "issue-search";
 
-const CROSS_SEARCH_LIMITS = {
+const DEFAULT_PAGE_SIZE = 20;
+const CROSS_SEARCH_PAGE_SIZE = {
   pr: 8,
   issue: 6,
   cluster: 6,
 } as const;
+const AUTO_SYNC_STALE_MS = 15 * 60 * 1000;
 
 export class TuiController {
   private readonly listeners = new Set<() => void>();
   private readonly resultLimit: number;
+  private browseLimit: number;
   private statusSnapshot: StatusSnapshot | null = null;
   private mode: TuiMode = "cross-search";
   private focus: TuiFocus = "results";
   private rows: TuiResultRow[] = [];
   private selectedIndex = 0;
-  private detailText = "Search once to scan PRs, issues, and cluster signals together.";
+  private detailText = "Browse cached PRs and issues, then refine with / when needed.";
   private detailTitle = "Start Here";
   private detailStatus: string | null = null;
+  private detailIdentity: string | null = null;
   private showDetail = false;
-  private resultTitle = "Cross Search";
+  private resultTitle = "Explore";
   private activeUrl: string | null = null;
   private query = "";
   private context: TuiContext = null;
@@ -84,12 +89,14 @@ export class TuiController {
   private readonly detailFreshness = new Map<string, TuiFreshness>();
   private readonly clusterVerification = new Map<number, TuiClusterVerificationSummary>();
   private rateLimitSnapshot: Awaited<ReturnType<TuiDataService["rateLimit"]>> = null;
+  private autoSyncPromise: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly service: TuiDataService,
     private readonly options: ControllerOptions,
   ) {
-    this.resultLimit = options.resultLimit ?? 20;
+    this.resultLimit = options.resultLimit ?? DEFAULT_PAGE_SIZE;
+    this.browseLimit = this.resultLimit;
   }
 
   subscribe(listener: () => void): () => void {
@@ -115,7 +122,7 @@ export class TuiController {
         errorMessage: this.errorMessage,
       },
       footer: {
-        hintText: defaultSecondaryHintText(),
+        hintText: defaultSecondaryHintText(this.canLoadMore()),
         message: this.errorMessage ?? this.message,
         queryPrompt: modeInfo.queryPrompt,
         queryValue: this.query,
@@ -127,6 +134,7 @@ export class TuiController {
       selectedIndex: this.selectedIndex,
       detailText: this.detailText,
       detailStatus: this.detailStatus,
+      detailIdentity: this.detailIdentity,
       showDetail: this.showDetail,
       activeUrl: this.getActiveUrl(),
       query: this.query,
@@ -146,9 +154,9 @@ export class TuiController {
   }
 
   focusNext(): void {
-    const order: TuiFocus[] = ["nav", "results", "query"];
-    const nextIndex = (order.indexOf(this.focus) + 1) % order.length;
-    this.focus = order[nextIndex]!;
+    const order = this.availableFocuses();
+    const currentIndex = order.indexOf(this.focus);
+    this.focus = order[(currentIndex + 1) % order.length] ?? "results";
     this.emit();
   }
 
@@ -159,16 +167,19 @@ export class TuiController {
       return;
     }
     this.mode = mode;
+    this.focus = "results";
     this.rows = [];
     this.selectedIndex = 0;
     this.showDetail = false;
     this.detailStatus = null;
+    this.detailIdentity = null;
     this.detailAutoRefreshInFlight = false;
     this.detailRefreshTarget = null;
     this.clusterContext = null;
     this.context = null;
     this.activeUrl = null;
     this.query = "";
+    this.browseLimit = this.resultLimit;
     this.errorMessage = null;
     this.isLandingView = false;
     this.resultTitle = this.modeLabel(mode);
@@ -183,6 +194,7 @@ export class TuiController {
     this.emit();
     if (mode === "cross-search" || mode === "pr-search" || mode === "issue-search") {
       void this.loadLandingRows(mode);
+      this.scheduleAutoSync(mode);
       return;
     }
     if (mode === "status" && this.statusSnapshot) {
@@ -202,6 +214,15 @@ export class TuiController {
     return this.focus === "nav";
   }
 
+  isDetailFocus(): boolean {
+    return this.focus === "detail";
+  }
+
+  focusResults(): void {
+    this.focus = "results";
+    this.emit();
+  }
+
   startQueryEntry(): void {
     if (this.mode === "status") {
       return;
@@ -211,9 +232,7 @@ export class TuiController {
   }
 
   canStartSlashQuery(): boolean {
-    return (
-      this.mode === "cross-search" || this.mode === "pr-search" || this.mode === "issue-search"
-    );
+    return this.mode !== "status";
   }
 
   stopQueryEntry(): void {
@@ -241,6 +260,9 @@ export class TuiController {
   }
 
   async submitCurrentQuery(): Promise<void> {
+    if (this.isBrowseMode(this.mode)) {
+      this.browseLimit = this.resultLimit;
+    }
     await this.submitQuery(this.query);
     this.focus = "results";
     this.emit();
@@ -270,19 +292,25 @@ export class TuiController {
     this.isLandingView = false;
     this.showDetail = false;
     this.detailStatus = null;
+    this.detailIdentity = null;
     this.activeUrl = null;
     const requestId = ++this.listRequestId;
     switch (this.mode) {
       case "cross-search":
+        if (!this.query) {
+          await this.loadLandingRows("cross-search");
+          return;
+        }
         await this.runBusy("Searching cross desk", async () => {
+          const limits = this.crossSearchLimits();
           const [pullRequests, issues] = await Promise.all([
-            this.query ? this.service.search(this.query, CROSS_SEARCH_LIMITS.pr) : [],
-            this.query ? this.service.searchIssues(this.query, CROSS_SEARCH_LIMITS.issue) : [],
+            this.service.search(this.query, limits.pr),
+            this.service.searchIssues(this.query, limits.issue),
           ]);
           const seedPr = pullRequests[0]?.prNumber ?? null;
           const cluster =
             seedPr !== null
-              ? await this.service.clusterPr(seedPr, CROSS_SEARCH_LIMITS.cluster)
+              ? await this.service.clusterPr(seedPr, limits.cluster)
               : null;
           if (requestId !== this.listRequestId || this.mode !== "cross-search") {
             return;
@@ -293,7 +321,7 @@ export class TuiController {
             ...this.clusterRowsFromAnalysis(cluster),
           ];
           this.selectedIndex = 0;
-          this.resultTitle = `Cross Search${this.query ? ` · ${this.query}` : ""}`;
+          this.resultTitle = `Explore${this.query ? ` · ${this.query}` : ""}`;
           this.context = null;
           this.clusterContext = cluster
             ? {
@@ -315,14 +343,18 @@ export class TuiController {
         });
         return;
       case "pr-search":
+        if (!this.query) {
+          await this.loadLandingRows("pr-search");
+          return;
+        }
         await this.runBusy("Searching PRs", async () => {
-          const results = this.query ? await this.service.search(this.query, this.resultLimit) : [];
+          const results = await this.service.search(this.query, this.browseLimit);
           if (requestId !== this.listRequestId || this.mode !== "pr-search") {
             return;
           }
           this.rows = results.map((pr) => this.toPrRow(pr));
           this.selectedIndex = 0;
-          this.resultTitle = `PR Search${this.query ? ` · ${this.query}` : ""}`;
+          this.resultTitle = `PRs${this.query ? ` · ${this.query}` : ""}`;
           this.detailTitle = "PR Desk";
           this.detailText =
             results.length > 0
@@ -336,16 +368,18 @@ export class TuiController {
         });
         return;
       case "issue-search":
+        if (!this.query) {
+          await this.loadLandingRows("issue-search");
+          return;
+        }
         await this.runBusy("Searching issues", async () => {
-          const results = this.query
-            ? await this.service.searchIssues(this.query, this.resultLimit)
-            : [];
+          const results = await this.service.searchIssues(this.query, this.browseLimit);
           if (requestId !== this.listRequestId || this.mode !== "issue-search") {
             return;
           }
           this.rows = results.map((issue) => this.toIssueRow(issue));
           this.selectedIndex = 0;
-          this.resultTitle = `Issue Search${this.query ? ` · ${this.query}` : ""}`;
+          this.resultTitle = `Issues${this.query ? ` · ${this.query}` : ""}`;
           this.detailTitle = "Issue Desk";
           this.detailText =
             results.length > 0
@@ -359,13 +393,31 @@ export class TuiController {
         });
         return;
       case "pr-xref":
-        await this.openPrXref(this.parseNumericQuery("PR Xref"));
+        {
+          const prNumber = this.parseNumericQuery("PR Links");
+          if (prNumber === null) {
+            return;
+          }
+          await this.openPrXref(prNumber);
+        }
         return;
       case "issue-xref":
-        await this.openIssueXref(this.parseNumericQuery("Issue Xref"));
+        {
+          const issueNumber = this.parseNumericQuery("Issue Links");
+          if (issueNumber === null) {
+            return;
+          }
+          await this.openIssueXref(issueNumber);
+        }
         return;
       case "cluster":
-        await this.openCluster(this.parseNumericQuery("Cluster"));
+        {
+          const prNumber = this.parseNumericQuery("Cluster");
+          if (prNumber === null) {
+            return;
+          }
+          await this.openCluster(prNumber);
+        }
         return;
       case "status":
         return;
@@ -382,6 +434,8 @@ export class TuiController {
     if (this.showDetail) {
       this.showDetail = false;
       this.detailStatus = null;
+      this.detailIdentity = null;
+      this.focus = "results";
       this.message = "Closed detail drawer.";
       this.emit();
       return;
@@ -420,6 +474,9 @@ export class TuiController {
         return;
       case "refresh":
         await this.refreshSelected();
+        return;
+      case "load-more":
+        await this.loadMore();
         return;
       case "open-url":
         return;
@@ -496,6 +553,7 @@ export class TuiController {
     this.selectedIndex = snapshot.selectedIndex;
     this.detailText = snapshot.detailText;
     this.detailStatus = snapshot.detailStatus;
+    this.detailIdentity = snapshot.detailIdentity;
     this.showDetail = snapshot.showDetail;
     this.activeUrl = snapshot.activeUrl;
     this.detailTitle = snapshot.detailTitle;
@@ -504,6 +562,7 @@ export class TuiController {
     this.clusterContext = null;
     this.isLandingView = snapshot.isLandingView;
     this.errorMessage = null;
+    this.focus = "results";
     this.message = "Returned to previous view.";
     this.emit();
   }
@@ -536,6 +595,7 @@ export class TuiController {
           this.action(5, "sync-prs", "Sync PRs", "s"),
           this.action(6, "sync-issues", "Sync Issues", "S"),
           this.action(7, "refresh", "Refresh", "r", canRefresh),
+          this.action(8, "load-more", "More", "m", this.canLoadMore()),
         ];
       case "pr-search":
         return [
@@ -545,6 +605,7 @@ export class TuiController {
           this.action(4, "cluster", "Cluster", "c", canCluster),
           this.action(5, "sync-prs", "Sync PRs", "s"),
           this.action(6, "refresh", "Refresh", "r", canRefresh),
+          this.action(7, "load-more", "More", "m", this.canLoadMore()),
         ];
       case "issue-search":
         return [
@@ -553,6 +614,7 @@ export class TuiController {
           this.action(3, "xref", "Xref", "x", canXref),
           this.action(4, "sync-issues", "Sync Issues", "S"),
           this.action(5, "refresh", "Refresh", "r", canRefresh),
+          this.action(6, "load-more", "More", "m", this.canLoadMore()),
         ];
       case "pr-xref":
       case "issue-xref":
@@ -625,7 +687,7 @@ export class TuiController {
     }
     if (this.mode === "pr-search" || this.mode === "issue-search") {
       return {
-        yieldLabel: `${count} hits${count >= this.resultLimit ? ` · top ${this.resultLimit} shown` : ""}`,
+        yieldLabel: `${count} hits${count >= this.browseLimit ? ` · ${this.browseLimit} shown` : ""}`,
         confidenceLabel,
         coverageLabel: null,
       };
@@ -669,10 +731,13 @@ export class TuiController {
     return { slot, id, label, shortcut, enabled };
   }
 
-  private parseNumericQuery(label: string): number {
+  private parseNumericQuery(label: string): number | null {
     const match = this.query.match(/\d+/);
     if (!match) {
-      throw new Error(`${label} requires a numeric identifier.`);
+      this.message = `${label} requires a numeric identifier.`;
+      this.errorMessage = null;
+      this.emit();
+      return null;
     }
     return Number(match[0]);
   }
@@ -691,6 +756,7 @@ export class TuiController {
       resultTitle: this.resultTitle,
       context: this.context,
       isLandingView: this.isLandingView,
+      detailIdentity: this.detailIdentity,
     });
   }
 
@@ -740,13 +806,14 @@ export class TuiController {
       }
       this.showDetail = false;
       this.detailStatus = null;
+      this.detailIdentity = null;
       const result = await this.service.xrefPr(prNumber, this.resultLimit);
       this.mode = "pr-xref";
       this.query = String(prNumber);
       this.rows = result.issues.map((issue) => this.toIssueRow(issue));
       this.selectedIndex = 0;
-      this.resultTitle = `PR Xref · #${prNumber}`;
-      this.detailTitle = "PR Cross Reference";
+      this.resultTitle = `PR Links · #${prNumber}`;
+      this.detailTitle = "PR Links";
       this.context = { kind: "pr", prNumber };
       this.clusterContext = null;
       this.detailText = result.pullRequest
@@ -768,13 +835,14 @@ export class TuiController {
       }
       this.showDetail = false;
       this.detailStatus = null;
+      this.detailIdentity = null;
       const result = await this.service.xrefIssue(issueNumber, this.resultLimit);
       this.mode = "issue-xref";
       this.query = String(issueNumber);
       this.rows = result.pullRequests.map((pr) => this.toPrRow(pr));
       this.selectedIndex = 0;
-      this.resultTitle = `Issue Xref · #${issueNumber}`;
-      this.detailTitle = "Issue Cross Reference";
+      this.resultTitle = `Issue Links · #${issueNumber}`;
+      this.detailTitle = "Issue Links";
       this.context = { kind: "issue", issueNumber };
       this.clusterContext = null;
       this.detailText = result.issue
@@ -796,6 +864,7 @@ export class TuiController {
       }
       this.showDetail = false;
       this.detailStatus = null;
+      this.detailIdentity = null;
       const result = await this.service.clusterPr(prNumber, this.resultLimit);
       this.mode = "cluster";
       this.query = String(prNumber);
@@ -843,12 +912,14 @@ export class TuiController {
     this.isLandingView = true;
     this.showDetail = false;
     this.detailStatus = null;
+    this.detailIdentity = null;
     this.emit();
     try {
       if (mode === "cross-search") {
+        const limits = this.crossSearchLimits();
         const [pullRequests, issues] = await Promise.all([
-          this.service.search("state:open", CROSS_SEARCH_LIMITS.pr),
-          this.service.searchIssues("state:open", CROSS_SEARCH_LIMITS.issue),
+          this.service.search("state:open", limits.pr),
+          this.service.searchIssues("state:open", limits.issue),
         ]);
         if (requestId !== this.listRequestId || this.mode !== "cross-search") {
           return;
@@ -858,7 +929,7 @@ export class TuiController {
           ...issues.map((issue) => this.toIssueRow(issue)),
         ];
         this.selectedIndex = 0;
-        this.resultTitle = "Cross Search";
+        this.resultTitle = "Explore";
         this.detailTitle = "Start Here";
         this.detailText = formatCrossSearchLandingDetail(this.statusSnapshot);
         this.message =
@@ -870,13 +941,13 @@ export class TuiController {
         return;
       }
       if (mode === "pr-search") {
-        const results = await this.service.search("state:open", this.resultLimit);
+        const results = await this.service.search("state:open", this.browseLimit);
         if (requestId !== this.listRequestId || this.mode !== "pr-search") {
           return;
         }
         this.rows = results.map((pr) => this.toPrRow(pr));
         this.selectedIndex = 0;
-        this.resultTitle = "Recent Open PRs";
+        this.resultTitle = "PRs";
         this.detailTitle = "Start Here";
         this.detailText = formatSearchLandingDetail("pr-search", this.statusSnapshot);
         this.message =
@@ -885,13 +956,13 @@ export class TuiController {
         this.emit();
         return;
       }
-      const issues = await this.service.searchIssues("state:open", this.resultLimit);
+      const issues = await this.service.searchIssues("state:open", this.browseLimit);
       if (requestId !== this.listRequestId || this.mode !== "issue-search") {
         return;
       }
       this.rows = issues.map((issue) => this.toIssueRow(issue));
       this.selectedIndex = 0;
-      this.resultTitle = "Recent Open Issues";
+      this.resultTitle = "Issues";
       this.detailTitle = "Start Here";
       this.detailText = formatSearchLandingDetail("issue-search", this.statusSnapshot);
       this.message =
@@ -912,11 +983,13 @@ export class TuiController {
 
   private async replayActiveView(): Promise<void> {
     if (this.mode === "cross-search" || this.mode === "pr-search" || this.mode === "issue-search") {
+      const selectionIdentity = this.selectedRowIdentity();
       if (this.query) {
         await this.submitQuery(this.query);
       } else {
         await this.loadLandingRows(this.mode);
       }
+      this.restoreSelection(selectionIdentity);
       return;
     }
     if (this.mode === "pr-xref" && this.context?.kind === "pr") {
@@ -955,6 +1028,7 @@ export class TuiController {
         this.detailTitle = "Repository Status";
         this.detailText = formatStatusDetail(this.statusSnapshot);
       }
+      this.detailIdentity = null;
       this.emit();
       return;
     }
@@ -966,6 +1040,7 @@ export class TuiController {
       }
       this.detailTitle = `PR #${payload.pr.prNumber}`;
       this.detailText = formatPrDetail(payload.pr, payload.comments);
+      this.detailIdentity = `pr:${payload.pr.prNumber}`;
       this.detailStatus =
         this.detailAutoRefreshInFlight &&
         this.detailRefreshTarget?.kind === "pr" &&
@@ -983,6 +1058,7 @@ export class TuiController {
       }
       this.detailTitle = `Issue #${issue.issueNumber}`;
       this.detailText = formatIssueDetail(issue);
+      this.detailIdentity = `issue:${issue.issueNumber}`;
       this.detailStatus =
         this.detailAutoRefreshInFlight &&
         this.detailRefreshTarget?.kind === "issue" &&
@@ -998,6 +1074,7 @@ export class TuiController {
       this.clusterContext
     ) {
       this.detailTitle = `Cluster #${row.candidate.prNumber}`;
+      this.detailIdentity = `cluster:${row.candidate.prNumber}`;
       this.detailText = formatClusterDetail(
         {
           seedLabel: this.clusterContext.seedLabel,
@@ -1021,6 +1098,7 @@ export class TuiController {
       this.detailTitle = "Repository Status";
       this.detailText = formatStatusDetail(this.statusSnapshot);
       this.detailStatus = null;
+      this.detailIdentity = "status";
       this.activeUrl = null;
       this.emit();
     }
@@ -1232,6 +1310,125 @@ export class TuiController {
     }
     lines.push("", "Press Enter to inspect the selected row.");
     return lines.join("\n");
+  }
+
+  private availableFocuses(): TuiFocus[] {
+    const focuses: TuiFocus[] = ["nav", "results"];
+    if (this.showDetail) {
+      focuses.push("detail");
+    }
+    if (this.mode !== "status") {
+      focuses.push("query");
+    }
+    return focuses;
+  }
+
+  private isBrowseMode(mode: TuiMode): mode is BrowseMode {
+    return mode === "cross-search" || mode === "pr-search" || mode === "issue-search";
+  }
+
+  private crossSearchLimits(): { pr: number; issue: number; cluster: number } {
+    const pages = Math.max(1, Math.ceil(this.browseLimit / DEFAULT_PAGE_SIZE));
+    return {
+      pr: CROSS_SEARCH_PAGE_SIZE.pr * pages,
+      issue: CROSS_SEARCH_PAGE_SIZE.issue * pages,
+      cluster: CROSS_SEARCH_PAGE_SIZE.cluster * pages,
+    };
+  }
+
+  private currentBrowseCapacity(): number {
+    if (this.mode === "cross-search") {
+      const limits = this.crossSearchLimits();
+      return limits.pr + limits.issue + (this.query ? limits.cluster : 0);
+    }
+    return this.browseLimit;
+  }
+
+  private canLoadMore(): boolean {
+    return this.isBrowseMode(this.mode) && this.rows.length >= this.currentBrowseCapacity();
+  }
+
+  private selectedRowIdentity(): string | null {
+    const row = this.rows[this.selectedIndex];
+    if (!row) {
+      return null;
+    }
+    if (row.kind === "pr") {
+      return `pr:${row.pr.prNumber}`;
+    }
+    if (row.kind === "issue") {
+      return `issue:${row.issue.issueNumber}`;
+    }
+    if (row.kind === "cluster-candidate" || row.kind === "cluster-excluded") {
+      return `cluster:${row.candidate.prNumber}`;
+    }
+    return row.kind;
+  }
+
+  private restoreSelection(selectionIdentity: string | null): void {
+    if (!selectionIdentity) {
+      return;
+    }
+    const nextIndex = this.rows.findIndex((row) => this.rowIdentityForAny(row) === selectionIdentity);
+    if (nextIndex >= 0) {
+      this.selectedIndex = nextIndex;
+      this.activeUrl = this.rowUrl(this.rows[this.selectedIndex]);
+    }
+  }
+
+  private rowIdentityForAny(row: TuiResultRow): string | null {
+    if (row.kind === "pr") {
+      return `pr:${row.pr.prNumber}`;
+    }
+    if (row.kind === "issue") {
+      return `issue:${row.issue.issueNumber}`;
+    }
+    if (row.kind === "cluster-candidate" || row.kind === "cluster-excluded") {
+      return `cluster:${row.candidate.prNumber}`;
+    }
+    return row.kind;
+  }
+
+  private scheduleAutoSync(mode: BrowseMode): void {
+    const target =
+      mode === "pr-search" ? "pr" : mode === "issue-search" ? "issue" : null;
+    if (!target || !this.isMetadataStale(target)) {
+      return;
+    }
+    this.autoSyncPromise = this.autoSyncPromise
+      .catch(() => undefined)
+      .then(async () => {
+        if (target === "pr") {
+          await this.syncPrs();
+        } else {
+          await this.syncIssues();
+        }
+      });
+  }
+
+  private isMetadataStale(kind: "pr" | "issue"): boolean {
+    const value =
+      kind === "pr" ? this.statusSnapshot?.lastSyncAt ?? null : this.statusSnapshot?.issueLastSyncAt ?? null;
+    if (!value) {
+      return true;
+    }
+    return Date.now() - new Date(value).getTime() > AUTO_SYNC_STALE_MS;
+  }
+
+  async loadMore(): Promise<void> {
+    if (!this.isBrowseMode(this.mode)) {
+      return;
+    }
+    const selectionIdentity = this.selectedRowIdentity();
+    this.browseLimit += this.resultLimit;
+    if (this.query) {
+      await this.submitQuery(this.query);
+    } else {
+      await this.loadLandingRows(this.mode);
+    }
+    this.restoreSelection(selectionIdentity);
+    this.message = `Loaded up to ${this.browseLimit} rows.`;
+    this.emit();
   }
 
   private prFreshness(updatedAt: string, key: string): TuiFreshness {

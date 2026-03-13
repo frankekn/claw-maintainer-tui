@@ -122,8 +122,8 @@ function makeCluster(prNumber: number): ClusterPullRequestAnalysis {
 }
 
 class FakeTuiDataService implements TuiDataService {
-  searchCalls: string[] = [];
-  issueSearchCalls: string[] = [];
+  searchCalls: Array<{ query: string; limit: number }> = [];
+  issueSearchCalls: Array<{ query: string; limit: number }> = [];
   syncPrsCalls = 0;
   syncIssuesCalls = 0;
   refreshPrDetailCalls: number[] = [];
@@ -131,29 +131,37 @@ class FakeTuiDataService implements TuiDataService {
   verifyClusterCalls: number[] = [];
   syncBlocked = false;
   blockSyncPrs = false;
+  statusSnapshot: StatusSnapshot = { ...status };
   private syncPrsRelease: (() => void) | null = null;
   private refreshPrRelease: (() => void) | null = null;
 
   async status() {
-    return status;
+    return this.statusSnapshot;
   }
 
   async rateLimit() {
     return rateLimit;
   }
 
-  async search(query: string) {
-    this.searchCalls.push(query);
+  async search(query: string, limit: number) {
+    this.searchCalls.push({ query, limit });
     if (query === "state:open") {
-      return [makePr(41793), makePr(42212)];
+      return [
+        makePr(41793),
+        makePr(42212),
+        ...Array.from({ length: Math.max(0, limit - 2) }, (_, index) => makePr(43000 + index)),
+      ].slice(0, limit);
     }
     return [makePr(41793), makePr(42212, { score: 0.88 })];
   }
 
-  async searchIssues(query: string) {
-    this.issueSearchCalls.push(query);
+  async searchIssues(query: string, limit: number) {
+    this.issueSearchCalls.push({ query, limit });
     if (query === "state:open") {
-      return [makeIssue(41789)];
+      return [
+        makeIssue(41789),
+        ...Array.from({ length: Math.max(0, limit - 1) }, (_, index) => makeIssue(52000 + index)),
+      ].slice(0, limit);
     }
     return [makeIssue(41789)];
   }
@@ -226,11 +234,21 @@ class FakeTuiDataService implements TuiDataService {
         this.syncPrsRelease = resolve;
       });
     }
+    this.statusSnapshot = {
+      ...this.statusSnapshot,
+      lastSyncAt: "2026-03-12T01:00:00.000Z",
+      lastSyncWatermark: "2026-03-12T01:00:00.000Z",
+    };
     return syncSummary;
   }
 
   async syncIssues() {
     this.syncIssuesCalls += 1;
+    this.statusSnapshot = {
+      ...this.statusSnapshot,
+      issueLastSyncAt: "2026-03-12T01:00:00.000Z",
+      issueLastSyncWatermark: "2026-03-12T01:00:00.000Z",
+    };
     return {
       ...syncSummary,
       entity: "issues" as const,
@@ -273,13 +291,13 @@ describe("TuiController", () => {
     await controller.initialize();
 
     const model = controller.getRenderModel();
-    expect(service.searchCalls).toEqual(["state:open"]);
-    expect(service.issueSearchCalls).toEqual(["state:open"]);
+    expect(service.searchCalls).toEqual([{ query: "state:open", limit: 8 }]);
+    expect(service.issueSearchCalls).toEqual([{ query: "state:open", limit: 6 }]);
     expect(model.mode).toBe("cross-search");
-    expect(model.resultTitle).toBe("Cross Search");
-    expect(model.rows).toHaveLength(3);
+    expect(model.resultTitle).toBe("Explore");
+    expect(model.rows).toHaveLength(14);
     expect(model.detailTitle).toBe("Start Here");
-    expect(model.detailText).toContain("Cross Search is the default investigation desk.");
+    expect(model.detailText).toContain("Explore shows cached PRs and issues in one list.");
     expect(model.footer.actions.map((action) => action.label)).toEqual([
       "Search",
       "Detail",
@@ -288,6 +306,7 @@ describe("TuiController", () => {
       "Sync PRs",
       "Sync Issues",
       "Refresh",
+      "More",
     ]);
   });
 
@@ -303,10 +322,16 @@ describe("TuiController", () => {
     await controller.submitQuery("marker spoofing");
 
     const model = controller.getRenderModel();
-    expect(service.searchCalls).toEqual(["state:open", "marker spoofing"]);
-    expect(service.issueSearchCalls).toEqual(["state:open", "marker spoofing"]);
+    expect(service.searchCalls).toEqual([
+      { query: "state:open", limit: 8 },
+      { query: "marker spoofing", limit: 8 },
+    ]);
+    expect(service.issueSearchCalls).toEqual([
+      { query: "state:open", limit: 6 },
+      { query: "marker spoofing", limit: 6 },
+    ]);
     expect(model.rows.map((row) => row.kind)).toEqual(["pr", "pr", "issue", "cluster-candidate"]);
-    expect(model.resultTitle).toBe("Cross Search · marker spoofing");
+    expect(model.resultTitle).toBe("Explore · marker spoofing");
     expect(model.listSummary?.yieldLabel).toBe("4 hits");
     expect(model.listSummary?.confidenceLabel).toContain("PR 2 · Issue 1 · Cluster 1");
     expect(model.listSummary?.coverageLabel).toContain("seed #41793");
@@ -415,5 +440,56 @@ describe("TuiController", () => {
 
     expect(controller.getRenderModel().footer.message).toContain("sync blocked");
     expect(controller.getRenderModel().header.errorMessage).toBe("sync blocked");
+  });
+
+  it("loads more rows in PR search", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    controller.activateMode("pr-search");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(controller.getRenderModel().rows).toHaveLength(20);
+
+    await controller.loadMore();
+
+    expect(controller.getRenderModel().rows).toHaveLength(40);
+    expect(service.searchCalls.at(-1)).toEqual({ query: "state:open", limit: 40 });
+  });
+
+  it("auto syncs stale PR metadata when entering PR search", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    controller.activateMode("pr-search");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(service.syncPrsCalls).toBe(1);
+  });
+
+  it("does not throw on blank numeric xref submit", async () => {
+    const controller = new TuiController(new FakeTuiDataService(), {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    controller.activateMode("pr-xref");
+    await controller.submitQuery("");
+
+    expect(controller.getRenderModel().footer.message).toContain(
+      "PR Links requires a numeric identifier.",
+    );
   });
 });

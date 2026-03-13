@@ -34,7 +34,7 @@ const status: StatusSnapshot = {
 const headerModel: TuiHeaderModel = {
   repo: "openclaw/openclaw",
   dbPath: "/tmp/clawlens.sqlite",
-  activeModeLabel: "Cross Search",
+  activeModeLabel: "Explore",
   ftsOnly: false,
   status,
   rateLimit: {
@@ -52,7 +52,7 @@ describe("tui formatting", () => {
   it("formats a dense header with mode sync quota and detail refresh badges", () => {
     const header = formatHeader(headerModel, new Date("2026-03-11T08:28:13.832Z"));
 
-    expect(header).toContain("MODE Cross Search");
+    expect(header).toContain("MODE Explore");
     expect(header).toContain("REPO openclaw/openclaw");
     expect(header).toContain("PR 1h");
     expect(header).toContain("ISSUE 44m");
@@ -125,12 +125,12 @@ describe("tui formatting", () => {
     const detail = formatCrossSearchLandingDetail(status, new Date("2026-03-11T08:28:13.832Z"));
 
     expect(detail).toContain("START HERE");
-    expect(detail).toContain("Cross Search is the default investigation desk.");
-    expect(detail).toContain("Search once to scan PRs, issues, and cluster signals together.");
+    expect(detail).toContain("Explore shows cached PRs and issues in one list.");
+    expect(detail).toContain("Press m to load 20 more rows.");
 
     const tabs = formatModeTabs("cross-search", "nav");
-    expect(tabs).toContain("Cross Search");
-    expect(tabs).toContain("PR Search");
+    expect(tabs).toContain("Explore");
+    expect(tabs).toContain("PRs");
     expect(tabs).toContain("{#63c8ff-bg}");
   });
 
@@ -148,5 +148,8 @@ describe("tui formatting", () => {
         coverageLabel: "seed #41793 · cached",
       }),
     ).toContain("seed #41793");
+    expect(formatActionBar([{ id: "load-more", slot: 8, label: "More", shortcut: "m", enabled: true }])).toContain(
+      "8 More",
+    );
   });
 });

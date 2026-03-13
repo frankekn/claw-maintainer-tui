@@ -17,14 +17,14 @@ export type TuiMode =
   | "cluster"
   | "status";
 
-export type TuiFocus = "nav" | "results" | "query";
+export type TuiFocus = "nav" | "results" | "detail" | "query";
 
 export const TUI_MODE_ORDER: Array<{ id: TuiMode; label: string; queryPrompt: string }> = [
-  { id: "cross-search", label: "Cross Search", queryPrompt: "Cross Search" },
-  { id: "pr-search", label: "PR Search", queryPrompt: "Search PRs" },
-  { id: "issue-search", label: "Issue Search", queryPrompt: "Search Issues" },
-  { id: "pr-xref", label: "PR Xref", queryPrompt: "Enter PR Number" },
-  { id: "issue-xref", label: "Issue Xref", queryPrompt: "Enter Issue Number" },
+  { id: "cross-search", label: "Explore", queryPrompt: "Search Explore" },
+  { id: "pr-search", label: "PRs", queryPrompt: "Search PRs" },
+  { id: "issue-search", label: "Issues", queryPrompt: "Search Issues" },
+  { id: "pr-xref", label: "PR Links", queryPrompt: "Enter PR Number" },
+  { id: "issue-xref", label: "Issue Links", queryPrompt: "Enter Issue Number" },
   { id: "cluster", label: "Cluster", queryPrompt: "Enter PR Number" },
   { id: "status", label: "Status", queryPrompt: "Status view" },
 ];
@@ -37,6 +37,7 @@ export type TuiActionId =
   | "sync-prs"
   | "sync-issues"
   | "refresh"
+  | "load-more"
   | "open-url"
   | "back";
 
@@ -122,6 +123,7 @@ export type TuiRenderModel = {
   selectedIndex: number;
   detailText: string;
   detailStatus: string | null;
+  detailIdentity: string | null;
   showDetail: boolean;
   activeUrl: string | null;
   query: string;
@@ -178,6 +180,7 @@ export type TuiViewSnapshot = {
   selectedIndex: number;
   detailText: string;
   detailStatus: string | null;
+  detailIdentity: string | null;
   showDetail: boolean;
   activeUrl: string | null;
   detailTitle: string;

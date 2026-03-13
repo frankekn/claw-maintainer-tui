@@ -34,6 +34,8 @@ export class BlessedTuiRenderer {
   private readonly modalBox: Box;
   private spinnerIndex = 0;
   private spinnerInterval: NodeJS.Timeout | null = null;
+  private lastDetailIdentity: string | null = null;
+  private detailVisible = false;
 
   constructor(private readonly controller: TuiController) {
     this.headerBox = blessed.box({
@@ -225,9 +227,12 @@ export class BlessedTuiRenderer {
       model.focus === "nav" ? TUI_THEME.colors.focus : TUI_THEME.colors.border;
     this.resultsBox.style.border.fg =
       model.focus === "results" ? TUI_THEME.colors.focus : TUI_THEME.colors.border;
-    this.detailBox.style.border.fg = model.showDetail
-      ? TUI_THEME.colors.focus
-      : TUI_THEME.colors.borderSoft;
+    this.detailBox.style.border.fg =
+      model.showDetail && model.focus === "detail"
+        ? TUI_THEME.colors.focus
+        : model.showDetail
+          ? TUI_THEME.colors.border
+          : TUI_THEME.colors.borderSoft;
     this.messageBox.style.bg = model.busy
       ? TUI_THEME.colors.footerAccentBg
       : TUI_THEME.colors.footerBg;
@@ -237,9 +242,14 @@ export class BlessedTuiRenderer {
 
   private syncScroll(model: TuiRenderModel): void {
     this.resultsBox.setScroll(Math.max(0, model.selectedIndex - 4));
-    if (model.showDetail) {
+    if (
+      model.showDetail &&
+      (!this.detailVisible || this.lastDetailIdentity !== model.detailIdentity)
+    ) {
       this.detailBox.setScroll(0);
     }
+    this.detailVisible = model.showDetail;
+    this.lastDetailIdentity = model.detailIdentity;
   }
 
   private startSpinner(message: string): void {
@@ -289,6 +299,47 @@ export class BlessedTuiRenderer {
         this.controller.appendQueryCharacter(ch);
       }
       return;
+    }
+
+    if (this.controller.isDetailFocus()) {
+      if (key.name === "escape") {
+        this.controller.focusResults();
+        return;
+      }
+      if (key.name === "tab") {
+        this.controller.focusNext();
+        return;
+      }
+      if (key.name === "up" || key.name === "k") {
+        this.detailBox.scroll(-1);
+        this.screen.render();
+        return;
+      }
+      if (key.name === "down" || key.name === "j") {
+        this.detailBox.scroll(1);
+        this.screen.render();
+        return;
+      }
+      if (key.name === "pageup") {
+        this.detailBox.scroll(-(Number(this.detailBox.height) || 10));
+        this.screen.render();
+        return;
+      }
+      if (key.name === "pagedown") {
+        this.detailBox.scroll(Number(this.detailBox.height) || 10);
+        this.screen.render();
+        return;
+      }
+      if (key.name === "home") {
+        this.detailBox.setScroll(0);
+        this.screen.render();
+        return;
+      }
+      if (key.name === "end") {
+        this.detailBox.setScrollPerc(100);
+        this.screen.render();
+        return;
+      }
     }
 
     if (ch && /^[1-9]$/.test(ch)) {
@@ -357,6 +408,10 @@ export class BlessedTuiRenderer {
     }
     if (key.name === "r") {
       await this.controller.refreshSelected();
+      return;
+    }
+    if (key.name === "m") {
+      await this.controller.loadMore();
       return;
     }
     if (key.name === "o") {
