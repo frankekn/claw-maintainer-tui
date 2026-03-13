@@ -2,6 +2,9 @@
   "name": "clawlens",
   "version": "0.1.0",
   "private": true,
+  "bin": {
+    "clawlens": "./bin/clawlens.js"
+  },
   "type": "module",
   "scripts": {
     "clawlens": "tsx bin/clawlens.ts",
