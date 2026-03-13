@@ -101,6 +101,16 @@ type SearchPullRequestResult = {
   number: number;
 };
 
+type RestRateLimit = {
+  resources?: {
+    core?: {
+      limit?: number | null;
+      remaining?: number | null;
+      reset?: number | null;
+    } | null;
+  } | null;
+};
+
 type GhApiRunner = (path: string) => Promise<string>;
 
 function sleep(ms: number): Promise<void> {
@@ -431,6 +441,34 @@ async function collectPaginated<T>(pathBuilder: (page: number) => string): Promi
 }
 
 export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueDataSource {
+  async getRateLimitStatus(): Promise<{
+    limit: number;
+    remaining: number;
+    resetAt: string;
+  } | null> {
+    const { stdout } = await execFileAsync("gh", ["api", "rate_limit"], {
+      maxBuffer: GH_MAX_BUFFER,
+    });
+    const payload = JSON.parse(stdout) as RestRateLimit;
+    const core = payload.resources?.core;
+    if (
+      !core ||
+      typeof core.limit !== "number" ||
+      typeof core.remaining !== "number" ||
+      typeof core.reset !== "number"
+    ) {
+      return null;
+    }
+    const limit = core.limit;
+    const remaining = core.remaining;
+    const reset = core.reset;
+    return {
+      limit,
+      remaining,
+      resetAt: new Date(reset * 1000).toISOString(),
+    };
+  }
+
   async *listAllPullRequests(repo: RepoRef): AsyncGenerator<PullRequestRecord> {
     for (let page = 1; ; page += 1) {
       const items = await ghApiJsonWithRetry<RestPullRequest[]>(

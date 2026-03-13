@@ -1918,6 +1918,25 @@ export class PrIndexStore {
     }
   }
 
+  async refreshPullRequestDetail(
+    repo: RepoRef,
+    source: PullRequestDataSource,
+    prNumber: number,
+  ): Promise<void> {
+    await this.init();
+    await this.ensurePullRequestCached(repo, source, prNumber, true);
+  }
+
+  async refreshIssueDetail(
+    repo: RepoRef,
+    source: IssueDataSource,
+    issueNumber: number,
+  ): Promise<void> {
+    await this.init();
+    const issue = await source.getIssue(repo, issueNumber);
+    this.upsertIssue(issue);
+  }
+
   private buildClusterCandidate(
     prNumber: number,
     status: ClusterCandidate["status"],

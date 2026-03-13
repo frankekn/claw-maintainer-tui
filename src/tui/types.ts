@@ -9,6 +9,7 @@ import type {
 } from "../types.js";
 
 export type TuiMode =
+  | "cross-search"
   | "pr-search"
   | "issue-search"
   | "pr-xref"
@@ -19,6 +20,7 @@ export type TuiMode =
 export type TuiFocus = "nav" | "results" | "query";
 
 export const TUI_MODE_ORDER: Array<{ id: TuiMode; label: string; queryPrompt: string }> = [
+  { id: "cross-search", label: "Cross Search", queryPrompt: "Cross Search" },
   { id: "pr-search", label: "PR Search", queryPrompt: "Search PRs" },
   { id: "issue-search", label: "Issue Search", queryPrompt: "Search Issues" },
   { id: "pr-xref", label: "PR Xref", queryPrompt: "Enter PR Number" },
@@ -29,12 +31,12 @@ export const TUI_MODE_ORDER: Array<{ id: TuiMode; label: string; queryPrompt: st
 
 export type TuiActionId =
   | "query"
-  | "inspect"
+  | "detail"
   | "xref"
   | "cluster"
   | "sync-prs"
   | "sync-issues"
-  | "refresh-facts"
+  | "refresh"
   | "open-url"
   | "back";
 
@@ -52,11 +54,36 @@ export type TuiListSummary = {
   coverageLabel: string | null;
 };
 
+export type TuiFreshness = "fresh" | "partial" | "stale";
+export type TuiVerificationState = "idle" | "running" | "done" | "rate_limited";
+export type TuiSyncMode = "metadata" | "detail" | "cluster_verify";
+
+export type TuiRateLimitSnapshot = {
+  limit: number;
+  remaining: number;
+  resetAt: string;
+};
+
+export type TuiClusterVerificationSummary = {
+  verifiedPrCount: number;
+  verifiedIssueCount: number;
+  missingCount: number;
+  state: TuiVerificationState;
+};
+
 export type TuiResultRow =
-  | { kind: "pr"; pr: SearchResult }
-  | { kind: "issue"; issue: IssueSearchResult }
-  | { kind: "cluster-candidate"; candidate: ClusterCandidate }
-  | { kind: "cluster-excluded"; candidate: ClusterExcludedCandidate }
+  | { kind: "pr"; pr: SearchResult; freshness: TuiFreshness }
+  | { kind: "issue"; issue: IssueSearchResult; freshness: TuiFreshness }
+  | {
+      kind: "cluster-candidate";
+      candidate: ClusterCandidate;
+      verification: TuiVerificationState;
+    }
+  | {
+      kind: "cluster-excluded";
+      candidate: ClusterExcludedCandidate;
+      verification: TuiVerificationState;
+    }
   | { kind: "status"; label: string; value: string };
 
 export type TuiContext =
@@ -71,6 +98,9 @@ export type TuiHeaderModel = {
   activeModeLabel: string;
   ftsOnly: boolean;
   status: StatusSnapshot | null;
+  rateLimit: TuiRateLimitSnapshot | null;
+  syncMode: TuiSyncMode | null;
+  detailAutoRefreshInFlight: boolean;
   busyMessage: string | null;
   errorMessage: string | null;
 };
@@ -91,6 +121,8 @@ export type TuiRenderModel = {
   rows: TuiResultRow[];
   selectedIndex: number;
   detailText: string;
+  detailStatus: string | null;
+  showDetail: boolean;
   activeUrl: string | null;
   query: string;
   resultTitle: string;
@@ -125,9 +157,18 @@ export interface TuiDataService {
     limit: number,
   ): Promise<{ pullRequest: SearchResult | null; issues: IssueSearchResult[] }>;
   clusterPr(prNumber: number, limit: number): Promise<ClusterPullRequestAnalysis | null>;
+  verifyClusterPr(
+    prNumber: number,
+    limit: number,
+  ): Promise<{
+    analysis: ClusterPullRequestAnalysis | null;
+    summary: TuiClusterVerificationSummary;
+  }>;
   syncPrs(): Promise<SyncSummary>;
   syncIssues(): Promise<SyncSummary>;
-  refreshPrFacts(prNumber: number): Promise<void>;
+  refreshPrDetail(prNumber: number): Promise<void>;
+  refreshIssueDetail(issueNumber: number): Promise<void>;
+  rateLimit(): Promise<TuiRateLimitSnapshot | null>;
 }
 
 export type TuiViewSnapshot = {
@@ -136,6 +177,8 @@ export type TuiViewSnapshot = {
   rows: TuiResultRow[];
   selectedIndex: number;
   detailText: string;
+  detailStatus: string | null;
+  showDetail: boolean;
   activeUrl: string | null;
   detailTitle: string;
   resultTitle: string;

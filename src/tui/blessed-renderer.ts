@@ -3,13 +3,13 @@ import { promisify } from "node:util";
 import blessed from "blessed";
 import {
   formatActionBar,
+  formatDetailStatus,
   formatHeader,
   formatListSummary,
-  formatModeRail,
+  formatModeTabs,
   formatResults,
 } from "./format.js";
 import { TUI_THEME, keyLabel, panelLabel, text, valueTone } from "./theme.js";
-import { TUI_MODE_ORDER } from "./types.js";
 import type { TuiController } from "./controller.js";
 import type { TuiRenderModel } from "./types.js";
 
@@ -26,7 +26,7 @@ export class BlessedTuiRenderer {
     title: "clawlens",
   });
   private readonly headerBox: Box;
-  private readonly navBox: Box;
+  private readonly tabsBox: Box;
   private readonly resultsBox: Box;
   private readonly detailBox: Box;
   private readonly messageBox: Box;
@@ -44,20 +44,16 @@ export class BlessedTuiRenderer {
       height: TUI_THEME.layout.headerHeight,
       tags: true,
       style: { bg: TUI_THEME.colors.headerBg, fg: TUI_THEME.colors.text },
-      padding: { left: 1, right: 1, top: 0, bottom: 0 },
+      padding: { left: 1, right: 1 },
     });
-    this.navBox = blessed.box({
+    this.tabsBox = blessed.box({
       parent: this.screen,
       top: TUI_THEME.layout.headerHeight,
       left: 0,
-      width: TUI_THEME.layout.navWidth,
-      bottom: TUI_THEME.layout.footerHeight + TUI_THEME.layout.queryHeight,
-      label: " Modes ",
+      width: "100%",
+      height: TUI_THEME.layout.tabsHeight,
       tags: true,
       border: "line",
-      wrap: false,
-      scrollable: true,
-      alwaysScroll: true,
       style: {
         border: { fg: TUI_THEME.colors.border },
         fg: TUI_THEME.colors.text,
@@ -67,11 +63,10 @@ export class BlessedTuiRenderer {
     });
     this.resultsBox = blessed.box({
       parent: this.screen,
-      top: TUI_THEME.layout.headerHeight,
-      left: TUI_THEME.layout.resultsLeft,
-      width: TUI_THEME.layout.resultsWidth,
+      top: TUI_THEME.layout.headerHeight + TUI_THEME.layout.tabsHeight,
+      left: 0,
+      width: "100%",
       bottom: TUI_THEME.layout.footerHeight + TUI_THEME.layout.queryHeight,
-      label: " Results ",
       tags: true,
       border: "line",
       wrap: false,
@@ -86,23 +81,21 @@ export class BlessedTuiRenderer {
     });
     this.detailBox = blessed.box({
       parent: this.screen,
-      top: TUI_THEME.layout.headerHeight,
-      left: TUI_THEME.layout.detailLeft,
+      top: TUI_THEME.layout.headerHeight + TUI_THEME.layout.tabsHeight,
+      left: TUI_THEME.layout.resultsWidthWithDetail,
       width: TUI_THEME.layout.detailWidth,
       bottom: TUI_THEME.layout.footerHeight + TUI_THEME.layout.queryHeight,
-      label: " Detail ",
       tags: true,
       border: "line",
       scrollable: true,
       alwaysScroll: true,
-      keys: true,
-      vi: true,
       style: {
         border: { fg: TUI_THEME.colors.borderSoft },
         fg: TUI_THEME.colors.text,
         bg: TUI_THEME.colors.panelBg,
       },
       padding: { left: 1, right: 1 },
+      hidden: true,
     });
     this.messageBox = blessed.box({
       parent: this.screen,
@@ -112,7 +105,7 @@ export class BlessedTuiRenderer {
       height: TUI_THEME.layout.footerHeight,
       tags: true,
       style: { bg: TUI_THEME.colors.footerBg, fg: TUI_THEME.colors.text },
-      padding: { left: 1, right: 1, top: 0, bottom: 0 },
+      padding: { left: 1, right: 1 },
     });
     this.inputBox = blessed.box({
       parent: this.screen,
@@ -122,7 +115,7 @@ export class BlessedTuiRenderer {
       height: TUI_THEME.layout.queryHeight,
       tags: true,
       style: { bg: TUI_THEME.colors.commandBg, fg: TUI_THEME.colors.commandText },
-      padding: { left: 1, right: 1, top: 0, bottom: 0 },
+      padding: { left: 1, right: 1 },
     });
     this.modalBox = blessed.box({
       parent: this.screen,
@@ -165,8 +158,8 @@ export class BlessedTuiRenderer {
 
   private render(model: TuiRenderModel): void {
     this.headerBox.setContent(formatHeader(model.header));
-    this.navBox.setLabel(panelLabel("MODES", model.focus === "nav"));
-    this.navBox.setContent(formatModeRail(model.mode, model.focus).join("\n"));
+    this.tabsBox.setLabel(panelLabel("MODES", model.focus === "nav"));
+    this.tabsBox.setContent(formatModeTabs(model.mode, model.focus));
     this.resultsBox.setLabel(
       panelLabel(
         `${model.resultTitle.toUpperCase()}${model.listSummary ? ` · ${model.listSummary.yieldLabel}` : ""}`,
@@ -174,8 +167,13 @@ export class BlessedTuiRenderer {
       ),
     );
     this.resultsBox.setContent(formatResults(model).join("\n"));
-    this.detailBox.setLabel(panelLabel(model.detailTitle.toUpperCase()));
-    this.detailBox.setContent(model.detailText);
+    this.layoutDetail(model);
+    this.detailBox.setLabel(panelLabel(model.detailTitle.toUpperCase(), model.showDetail));
+    const detailContent = model.detailStatus
+      ? `${formatDetailStatus(model.detailStatus)}\n\n${model.detailText}`
+      : model.detailText;
+    this.detailBox.setContent(detailContent);
+
     const statusTone = model.header.errorMessage
       ? valueTone(model.footer.message, "error")
       : model.busy
@@ -208,13 +206,28 @@ export class BlessedTuiRenderer {
     this.screen.render();
   }
 
+  private layoutDetail(model: TuiRenderModel): void {
+    if (model.showDetail) {
+      this.resultsBox.left = 0;
+      this.resultsBox.width = TUI_THEME.layout.resultsWidthWithDetail;
+      this.detailBox.left = TUI_THEME.layout.resultsWidthWithDetail;
+      this.detailBox.width = TUI_THEME.layout.detailWidth;
+      this.detailBox.show();
+      return;
+    }
+    this.resultsBox.left = 0;
+    this.resultsBox.width = "100%";
+    this.detailBox.hide();
+  }
+
   private updateFocusStyle(model: TuiRenderModel): void {
-    this.navBox.style.border.fg =
+    this.tabsBox.style.border.fg =
       model.focus === "nav" ? TUI_THEME.colors.focus : TUI_THEME.colors.border;
     this.resultsBox.style.border.fg =
       model.focus === "results" ? TUI_THEME.colors.focus : TUI_THEME.colors.border;
-    this.detailBox.style.border.fg =
-      model.focus === "query" ? TUI_THEME.colors.borderSoft : TUI_THEME.colors.border;
+    this.detailBox.style.border.fg = model.showDetail
+      ? TUI_THEME.colors.focus
+      : TUI_THEME.colors.borderSoft;
     this.messageBox.style.bg = model.busy
       ? TUI_THEME.colors.footerAccentBg
       : TUI_THEME.colors.footerBg;
@@ -223,12 +236,10 @@ export class BlessedTuiRenderer {
   }
 
   private syncScroll(model: TuiRenderModel): void {
-    const navIndex = Math.max(
-      0,
-      TUI_MODE_ORDER.findIndex((mode) => mode.id === model.mode),
-    );
-    this.navBox.setScroll(navIndex);
     this.resultsBox.setScroll(Math.max(0, model.selectedIndex - 4));
+    if (model.showDetail) {
+      this.detailBox.setScroll(0);
+    }
   }
 
   private startSpinner(message: string): void {
@@ -293,11 +304,19 @@ export class BlessedTuiRenderer {
       this.controller.focusNext();
       return;
     }
-    if (key.name === "up" || key.name === "k") {
+    if (
+      key.name === "up" ||
+      key.name === "k" ||
+      (this.controller.isNavFocus() && (key.name === "left" || key.name === "h"))
+    ) {
       void this.controller.moveSelection(-1);
       return;
     }
-    if (key.name === "down" || key.name === "j") {
+    if (
+      key.name === "down" ||
+      key.name === "j" ||
+      (this.controller.isNavFocus() && (key.name === "right" || key.name === "l"))
+    ) {
       void this.controller.moveSelection(1);
       return;
     }
@@ -337,7 +356,7 @@ export class BlessedTuiRenderer {
       return;
     }
     if (key.name === "r") {
-      await this.controller.refreshFacts();
+      await this.controller.refreshSelected();
       return;
     }
     if (key.name === "o") {

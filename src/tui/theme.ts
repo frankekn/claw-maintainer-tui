@@ -1,13 +1,11 @@
 export const TUI_THEME = {
   layout: {
     headerHeight: 1,
+    tabsHeight: 3,
     footerHeight: 2,
     queryHeight: 1,
-    navWidth: 14,
-    resultsLeft: 14,
-    resultsWidth: "42%",
-    detailLeft: "52%",
-    detailWidth: "48%",
+    detailWidth: "36%",
+    resultsWidthWithDetail: "64%",
   },
   colors: {
     screenBg: "#071018",
@@ -112,6 +110,22 @@ export function panelLabel(textValue: string, active = false): string {
     );
   }
   return wrap(` ${textValue} `, fg("muted"));
+}
+
+export function tabChip(textValue: string, active = false, focused = false): string {
+  if (active) {
+    return wrap(
+      ` ${textValue} `,
+      `${TUI_THEME.colors.commandText}-fg`,
+      `${focused ? TUI_THEME.colors.focus : TUI_THEME.colors.warn}-bg`,
+      "bold",
+    );
+  }
+  return wrap(
+    ` ${textValue} `,
+    `${TUI_THEME.colors.mutedText}-fg`,
+    `${TUI_THEME.colors.borderSoft}-bg`,
+  );
 }
 
 export function selectedLine(textValue: string, active = true): string {

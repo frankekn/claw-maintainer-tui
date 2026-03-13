@@ -1,15 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
-  formatActionBar,
   buildStatusRows,
+  formatActionBar,
   formatClusterDetail,
+  formatCrossSearchLandingDetail,
   formatHeader,
   formatListSummary,
-  formatSearchLandingDetail,
+  formatModeTabs,
   formatResultRow,
   formatStatusDetail,
 } from "./format.js";
 import type { ClusterCandidate, StatusSnapshot } from "../types.js";
+import type { TuiHeaderModel } from "./types.js";
 
 const status: StatusSnapshot = {
   repo: "openclaw/openclaw",
@@ -29,45 +31,55 @@ const status: StatusSnapshot = {
   embeddingModel: "hf:test",
 };
 
+const headerModel: TuiHeaderModel = {
+  repo: "openclaw/openclaw",
+  dbPath: "/tmp/clawlens.sqlite",
+  activeModeLabel: "Cross Search",
+  ftsOnly: false,
+  status,
+  rateLimit: {
+    limit: 5000,
+    remaining: 0,
+    resetAt: "2026-03-11T09:17:43.000Z",
+  },
+  syncMode: "metadata",
+  detailAutoRefreshInFlight: true,
+  busyMessage: null,
+  errorMessage: null,
+};
+
 describe("tui formatting", () => {
-  it("formats a dense header with sync ages and vector badge", () => {
-    const header = formatHeader(
-      {
-        repo: "openclaw/openclaw",
-        dbPath: "/tmp/clawlens.sqlite",
-        activeModeLabel: "PR Search",
-        ftsOnly: false,
-        status,
-        busyMessage: null,
-        errorMessage: null,
-      },
-      new Date("2026-03-11T08:28:13.832Z"),
-    );
-    expect(header).toContain("PR Search");
+  it("formats a dense header with mode sync quota and detail refresh badges", () => {
+    const header = formatHeader(headerModel, new Date("2026-03-11T08:28:13.832Z"));
+
+    expect(header).toContain("MODE Cross Search");
     expect(header).toContain("REPO openclaw/openclaw");
     expect(header).toContain("PR 1h");
-    expect(header).toContain("VECTOR READY");
+    expect(header).toContain("ISSUE 44m");
+    expect(header).toContain("QUOTA 0/5000");
+    expect(header).toContain("FAST SYNC");
+    expect(header).toContain("DETAIL REFRESHING");
     expect(header).toContain("{#63c8ff-bg}");
   });
 
-  it("formats status detail and rows from the repository snapshot", () => {
+  it("formats status detail and status rows from the repository snapshot", () => {
     const detail = formatStatusDetail(status, new Date("2026-03-11T08:28:13.832Z"));
-    expect(detail).toContain("COUNTS");
-    expect(detail).toContain("prs{/} 23935");
-    expect(detail).toContain("vector_available{/} {#4fd1a1-fg}true{/}");
+    expect(detail).toContain("INDEX");
+    expect(detail).toContain("prs");
+    expect(detail).toContain("23935");
+    expect(detail).toContain("vector");
+    expect(detail).toContain("ready");
 
     expect(buildStatusRows(status)).toEqual([
       { kind: "status", label: "{#9fb0c4-fg}PRs{/}", value: "{#4fd1a1-fg}23935{/}" },
       { kind: "status", label: "{#9fb0c4-fg}Issues{/}", value: "{#4fd1a1-fg}17535{/}" },
-      { kind: "status", label: "{#9fb0c4-fg}PR Labels{/}", value: "{#e7edf5-fg}61148{/}" },
-      { kind: "status", label: "{#9fb0c4-fg}Issue Labels{/}", value: "{#e7edf5-fg}14230{/}" },
       { kind: "status", label: "{#9fb0c4-fg}Comments{/}", value: "{#e7edf5-fg}100{/}" },
       { kind: "status", label: "{#9fb0c4-fg}Docs{/}", value: "{#e7edf5-fg}24035{/}" },
-      { kind: "status", label: "{#9fb0c4-fg}Vector{/}", value: "{#4fd1a1-fg}available{/}" },
+      { kind: "status", label: "{#9fb0c4-fg}Vector{/}", value: "{#4fd1a1-fg}ready{/}" },
     ]);
   });
 
-  it("formats cluster candidate rows and detailed reasoning text", () => {
+  it("formats cluster rows and detail with verification coverage", () => {
     const candidate: ClusterCandidate = {
       prNumber: 42212,
       title: "fix: prune image-containing tool results across context pruning paths",
@@ -88,47 +100,53 @@ describe("tui formatting", () => {
       reason: "broader relevant production coverage",
     };
 
-    expect(formatResultRow({ kind: "cluster-candidate", candidate })).toContain("BEST_BASE");
-    expect(formatResultRow({ kind: "cluster-candidate", candidate })).toContain("p2/2");
+    expect(
+      formatResultRow({
+        kind: "cluster-candidate",
+        candidate,
+        verification: "done",
+      }),
+    ).toContain("VERIFIED");
     expect(
       formatClusterDetail(
         {
           seedLabel: "seed_pr: #41793 prune image-containing tool results",
           clusterBasis: "linked_issue",
           clusterIssues: [41789],
+          verificationSummary: "done · PR 2 · issue 1 · missing 0",
           mergeSummary: "needs_work via review_fact",
-          coverageSummary: "1 candidates · 0 excluded",
         },
         candidate,
       ),
-    ).toContain("reason{/} broader relevant production coverage");
+    ).toContain("verification");
   });
 
-  it("formats a landing brief for the default search desks", () => {
-    const detail = formatSearchLandingDetail(
-      "pr-search",
-      status,
-      new Date("2026-03-11T08:28:13.832Z"),
-    );
+  it("formats cross-search landing copy and mode tabs", () => {
+    const detail = formatCrossSearchLandingDetail(status, new Date("2026-03-11T08:28:13.832Z"));
 
     expect(detail).toContain("START HERE");
-    expect(detail).toContain("Local rows{/} 23935");
-    expect(detail).toContain("1 Search the PR desk");
+    expect(detail).toContain("Cross Search is the default investigation desk.");
+    expect(detail).toContain("Search once to scan PRs, issues, and cluster signals together.");
+
+    const tabs = formatModeTabs("cross-search", "nav");
+    expect(tabs).toContain("Cross Search");
+    expect(tabs).toContain("PR Search");
+    expect(tabs).toContain("{#63c8ff-bg}");
   });
 
   it("formats action bar chips and list summaries", () => {
     expect(
       formatActionBar([
         { id: "query", slot: 1, label: "Search", shortcut: "/", enabled: true },
-        { id: "cluster", slot: 4, label: "Cluster", shortcut: "c", enabled: false },
+        { id: "refresh", slot: 7, label: "Refresh", shortcut: "r", enabled: false },
       ]),
     ).toContain("1 Search");
     expect(
       formatListSummary({
         yieldLabel: "20 hits",
-        confidenceLabel: "score avg 0.910",
-        coverageLabel: null,
+        confidenceLabel: "PR 12 · Issue 5 · Cluster 3",
+        coverageLabel: "seed #41793 · cached",
       }),
-    ).toContain("20 hits");
+    ).toContain("seed #41793");
   });
 });

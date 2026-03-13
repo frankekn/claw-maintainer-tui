@@ -7,7 +7,7 @@ import type {
   StatusSnapshot,
   SyncSummary,
 } from "../types.js";
-import type { TuiDataService } from "./types.js";
+import type { TuiDataService, TuiRateLimitSnapshot } from "./types.js";
 
 function makePr(prNumber: number, overrides: Partial<SearchResult> = {}): SearchResult {
   return {
@@ -61,6 +61,12 @@ const status: StatusSnapshot = {
   embeddingModel: "hf:test",
 };
 
+const rateLimit: TuiRateLimitSnapshot = {
+  limit: 5000,
+  remaining: 0,
+  resetAt: "2026-03-12T09:17:43.000Z",
+};
+
 const syncSummary: SyncSummary = {
   mode: "incremental",
   entity: "prs",
@@ -77,26 +83,78 @@ const syncSummary: SyncSummary = {
   lastSyncWatermark: "2026-03-12T01:00:00.000Z",
 };
 
+function makeCluster(prNumber: number): ClusterPullRequestAnalysis {
+  return {
+    seedPr: {
+      prNumber,
+      title: `PR ${prNumber}`,
+      url: `https://github.com/openclaw/openclaw/pull/${prNumber}`,
+      state: "open",
+      updatedAt: "2026-03-12T00:00:00.000Z",
+    },
+    clusterBasis: "linked_issue",
+    clusterIssueNumbers: [41789],
+    bestBase: null,
+    sameClusterCandidates: [
+      {
+        prNumber: 42212,
+        title: "fix: prune image-containing tool results",
+        url: "https://github.com/openclaw/openclaw/pull/42212",
+        state: "open",
+        updatedAt: "2026-03-10T00:00:00.000Z",
+        headSha: "head-42212",
+        matchedBy: "linked_issue",
+        linkedIssues: [41789],
+        prodFiles: ["a.ts", "b.ts"],
+        testFiles: ["a.test.ts", "b.test.ts"],
+        otherFiles: ["README.md"],
+        relevantProdFiles: ["a.ts"],
+        relevantTestFiles: ["a.test.ts"],
+        noiseFilesCount: 1,
+        status: "best_base",
+        reasonCodes: ["broader_relevant_prod_coverage"],
+        reason: "broader relevant production coverage",
+      },
+    ],
+    nearbyButExcluded: [],
+    mergeReadiness: null,
+  };
+}
+
 class FakeTuiDataService implements TuiDataService {
   searchCalls: string[] = [];
   issueSearchCalls: string[] = [];
-  syncBlocked = false;
   syncPrsCalls = 0;
   syncIssuesCalls = 0;
+  refreshPrDetailCalls: number[] = [];
+  refreshIssueDetailCalls: number[] = [];
+  verifyClusterCalls: number[] = [];
+  syncBlocked = false;
   blockSyncPrs = false;
   private syncPrsRelease: (() => void) | null = null;
+  private refreshPrRelease: (() => void) | null = null;
 
   async status() {
     return status;
   }
 
+  async rateLimit() {
+    return rateLimit;
+  }
+
   async search(query: string) {
     this.searchCalls.push(query);
-    return [makePr(41793), makePr(42212)];
+    if (query === "state:open") {
+      return [makePr(41793), makePr(42212)];
+    }
+    return [makePr(41793), makePr(42212, { score: 0.88 })];
   }
 
   async searchIssues(query: string) {
     this.issueSearchCalls.push(query);
+    if (query === "state:open") {
+      return [makeIssue(41789)];
+    }
     return [makeIssue(41789)];
   }
 
@@ -134,20 +192,27 @@ class FakeTuiDataService implements TuiDataService {
   }
 
   async clusterPr(prNumber: number): Promise<ClusterPullRequestAnalysis | null> {
+    return makeCluster(prNumber);
+  }
+
+  async verifyClusterPr(prNumber: number): Promise<{
+    analysis: ClusterPullRequestAnalysis | null;
+    summary: {
+      verifiedPrCount: number;
+      verifiedIssueCount: number;
+      missingCount: number;
+      state: "idle" | "running" | "done" | "rate_limited";
+    };
+  }> {
+    this.verifyClusterCalls.push(prNumber);
     return {
-      seedPr: {
-        prNumber,
-        title: `PR ${prNumber}`,
-        url: `https://github.com/openclaw/openclaw/pull/${prNumber}`,
-        state: "open",
-        updatedAt: "2026-03-12T00:00:00.000Z",
+      analysis: makeCluster(prNumber),
+      summary: {
+        verifiedPrCount: 2,
+        verifiedIssueCount: 1,
+        missingCount: 0,
+        state: "done",
       },
-      clusterBasis: "linked_issue",
-      clusterIssueNumbers: [41789],
-      bestBase: null,
-      sameClusterCandidates: [],
-      nearbyButExcluded: [],
-      mergeReadiness: null,
     };
   }
 
@@ -174,18 +239,30 @@ class FakeTuiDataService implements TuiDataService {
     };
   }
 
-  async refreshPrFacts() {
-    return;
+  async refreshPrDetail(prNumber: number) {
+    this.refreshPrDetailCalls.push(prNumber);
+    await new Promise<void>((resolve) => {
+      this.refreshPrRelease = resolve;
+    });
+  }
+
+  async refreshIssueDetail(issueNumber: number) {
+    this.refreshIssueDetailCalls.push(issueNumber);
   }
 
   releaseSyncPrs(): void {
     this.syncPrsRelease?.();
     this.syncPrsRelease = null;
   }
+
+  releaseRefreshPr(): void {
+    this.refreshPrRelease?.();
+    this.refreshPrRelease = null;
+  }
 }
 
 describe("TuiController", () => {
-  it("loads recent open PRs on startup so the landing state is useful", async () => {
+  it("loads cross-search landing rows on startup", async () => {
     const service = new FakeTuiDataService();
     const controller = new TuiController(service, {
       repo: "openclaw/openclaw",
@@ -195,22 +272,26 @@ describe("TuiController", () => {
 
     await controller.initialize();
 
+    const model = controller.getRenderModel();
     expect(service.searchCalls).toEqual(["state:open"]);
-    expect(controller.getRenderModel().resultTitle).toBe("Recent Open PRs");
-    expect(controller.getRenderModel().rows).toHaveLength(2);
-    expect(controller.getRenderModel().detailTitle).toBe("Start Here");
-    expect(controller.getRenderModel().detailText).toContain("START HERE");
-    expect(controller.getRenderModel().footer.actions.map((action) => action.label)).toEqual([
+    expect(service.issueSearchCalls).toEqual(["state:open"]);
+    expect(model.mode).toBe("cross-search");
+    expect(model.resultTitle).toBe("Cross Search");
+    expect(model.rows).toHaveLength(3);
+    expect(model.detailTitle).toBe("Start Here");
+    expect(model.detailText).toContain("Cross Search is the default investigation desk.");
+    expect(model.footer.actions.map((action) => action.label)).toEqual([
       "Search",
-      "Inspect",
+      "Detail",
       "Xref",
       "Cluster",
       "Sync PRs",
-      "Back",
+      "Sync Issues",
+      "Refresh",
     ]);
   });
 
-  it("runs PR search and opens the selected PR detail", async () => {
+  it("runs cross-search and shows hit-rate summary across pr issue and cluster rows", async () => {
     const service = new FakeTuiDataService();
     const controller = new TuiController(service, {
       repo: "openclaw/openclaw",
@@ -223,47 +304,38 @@ describe("TuiController", () => {
 
     const model = controller.getRenderModel();
     expect(service.searchCalls).toEqual(["state:open", "marker spoofing"]);
-    expect(model.rows).toHaveLength(2);
-    expect(model.detailText).toContain("PR #41793");
-    expect(model.activeUrl).toBe("https://github.com/openclaw/openclaw/pull/41793");
-    expect(model.listSummary?.yieldLabel).toBe("2 hits");
-    expect(model.listSummary?.confidenceLabel).toContain("score avg");
+    expect(service.issueSearchCalls).toEqual(["state:open", "marker spoofing"]);
+    expect(model.rows.map((row) => row.kind)).toEqual(["pr", "pr", "issue", "cluster-candidate"]);
+    expect(model.resultTitle).toBe("Cross Search · marker spoofing");
+    expect(model.listSummary?.yieldLabel).toBe("4 hits");
+    expect(model.listSummary?.confidenceLabel).toContain("PR 2 · Issue 1 · Cluster 1");
+    expect(model.listSummary?.coverageLabel).toContain("seed #41793");
   });
 
-  it("edits the query inline before submitting", async () => {
-    const controller = new TuiController(new FakeTuiDataService(), {
+  it("opens detail drawer and auto-refreshes selected PR detail", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
       repo: "openclaw/openclaw",
       dbPath: "/tmp/clawlens.sqlite",
       ftsOnly: false,
     });
 
     await controller.initialize();
-    controller.startQueryEntry();
-    controller.appendQueryCharacter("m");
-    controller.appendQueryCharacter("a");
-    controller.appendQueryCharacter("r");
-    controller.backspaceQuery();
-    controller.appendQueryCharacter("r");
+    await controller.submitQuery("marker spoofing");
+    const openPromise = controller.openSelected();
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(controller.getRenderModel().focus).toBe("query");
-    expect(controller.getRenderModel().query).toBe("mar");
+    const model = controller.getRenderModel();
+    expect(model.showDetail).toBe(true);
+    expect(model.detailTitle).toBe("PR #41793");
+    expect(model.detailText).toContain("Comment excerpt");
+    expect(service.refreshPrDetailCalls).toEqual([41793]);
+
+    service.releaseRefreshPr();
+    await openPromise;
   });
 
-  it("can enter guided actions by number instead of memorizing shortcuts", async () => {
-    const controller = new TuiController(new FakeTuiDataService(), {
-      repo: "openclaw/openclaw",
-      dbPath: "/tmp/clawlens.sqlite",
-      ftsOnly: false,
-    });
-
-    await controller.initialize();
-    await controller.triggerAction(1);
-
-    expect(controller.getRenderModel().focus).toBe("query");
-    expect(controller.getRenderModel().footer.actions[0]?.label).toBe("Search");
-  });
-
-  it("navigates into PR xref and back out", async () => {
+  it("navigates into PR xref and back out to cross-search", async () => {
     const controller = new TuiController(new FakeTuiDataService(), {
       repo: "openclaw/openclaw",
       dbPath: "/tmp/clawlens.sqlite",
@@ -278,9 +350,31 @@ describe("TuiController", () => {
     expect(controller.getRenderModel().query).toBe("41793");
     expect(controller.getRenderModel().listSummary?.yieldLabel).toBe("1 related issue");
     expect(controller.getRenderModel().listSummary?.coverageLabel).toBe("source PR #41793");
+
     controller.goBack();
-    expect(controller.getRenderModel().mode).toBe("pr-search");
+
+    expect(controller.getRenderModel().mode).toBe("cross-search");
     expect(controller.getRenderModel().query).toBe("marker spoofing");
+  });
+
+  it("uses refresh to verify cluster results on demand", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.submitQuery("marker spoofing");
+    await controller.clusterSelected();
+    await controller.refreshSelected();
+
+    const model = controller.getRenderModel();
+    expect(service.verifyClusterCalls).toEqual([41793]);
+    expect(model.mode).toBe("cluster");
+    expect(model.listSummary?.coverageLabel).toContain("done");
+    expect(model.footer.message).toContain("Verified cluster: 2 PR(s), 1 issue(s).");
   });
 
   it("locks overlapping sync actions behind the busy state", async () => {
@@ -296,12 +390,15 @@ describe("TuiController", () => {
     const firstSync = controller.syncPrs();
     await Promise.resolve();
     await controller.syncIssues();
+
     expect(service.syncPrsCalls).toBe(1);
     expect(service.syncIssuesCalls).toBe(0);
     expect(controller.getRenderModel().footer.message).toContain("Busy:");
+
     service.releaseSyncPrs();
     await firstSync;
-    expect(controller.getRenderModel().footer.message).toContain("Synced PRs:");
+
+    expect(controller.getRenderModel().footer.message).toContain("Synced PR metadata:");
   });
 
   it("surfaces sync errors in the header and footer", async () => {
@@ -315,6 +412,7 @@ describe("TuiController", () => {
     await controller.initialize();
     service.syncBlocked = true;
     await controller.syncPrs();
+
     expect(controller.getRenderModel().footer.message).toContain("sync blocked");
     expect(controller.getRenderModel().header.errorMessage).toBe("sync blocked");
   });
