@@ -19,7 +19,7 @@ type Box = blessed.Widgets.BoxElement;
 
 export class BlessedTuiRenderer {
   private readonly screen = blessed.screen({
-    smartCSR: true,
+    smartCSR: false,
     dockBorders: true,
     fullUnicode: true,
     autoPadding: false,
@@ -160,6 +160,15 @@ export class BlessedTuiRenderer {
   }
 
   private render(model: TuiRenderModel): void {
+    (this.screen as blessed.Widgets.Screen & {
+      clearRegion: (
+        xi: number,
+        xl: number,
+        yi: number,
+        yl: number,
+        override?: boolean,
+      ) => void;
+    }).clearRegion(0, this.screen.cols, 0, this.screen.rows, true);
     this.headerBox.setContent(formatHeader(model.header));
     this.tabsBox.setLabel(panelLabel("MODES", model.focus === "nav"));
     this.tabsBox.setContent(formatModeTabs(model.mode, model.focus));
@@ -169,8 +178,8 @@ export class BlessedTuiRenderer {
         model.focus === "results",
       ),
     );
-    this.resultsBox.setContent(formatResults(model).join("\n"));
     this.layoutDetail(model);
+    this.resultsBox.setContent(formatResults(model).join("\n"));
     this.detailBox.setLabel(panelLabel(model.detailTitle.toUpperCase(), model.showDetail));
     const detailContent = model.detailStatus
       ? `${formatDetailStatus(model.detailStatus)}\n\n${model.detailText}`

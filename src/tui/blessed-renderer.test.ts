@@ -94,6 +94,17 @@ afterEach(() => {
 });
 
 describe("BlessedTuiRenderer", () => {
+  it("uses full repaint mode for layout changes", () => {
+    const controller = createControllerStub();
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness & {
+      screen: blessed.Widgets.Screen & { options: { smartCSR?: boolean } };
+    };
+    renderers.push(harness);
+
+    expect(harness.screen.options.smartCSR).toBe(false);
+  });
+
   it("routes v/w/i/u shortcuts to triage actions", async () => {
     const controller = createControllerStub();
     const renderer = new BlessedTuiRenderer(controller as never);

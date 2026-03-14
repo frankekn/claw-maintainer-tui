@@ -188,8 +188,10 @@ class FakeTuiDataService implements TuiDataService {
   statusSnapshot: StatusSnapshot = { ...status };
   syncBlocked = false;
   blockSyncPrs = false;
+  blockPriorityQueue = false;
   private syncPrsRelease: (() => void) | null = null;
   private refreshPrRelease: (() => void) | null = null;
+  private priorityQueueRelease: (() => void) | null = null;
 
   async status() {
     return this.statusSnapshot;
@@ -201,6 +203,11 @@ class FakeTuiDataService implements TuiDataService {
 
   async listPriorityQueue(options: { limit: number; scanLimit?: number }) {
     this.priorityQueueCalls.push(options);
+    if (this.blockPriorityQueue) {
+      await new Promise<void>((resolve) => {
+        this.priorityQueueRelease = resolve;
+      });
+    }
     return Array.from({ length: options.limit }, (_, index) => {
       const prNumber = 41793 + index;
       const state = this.attentionState.get(prNumber) ?? undefined;
@@ -357,6 +364,11 @@ class FakeTuiDataService implements TuiDataService {
     this.refreshPrRelease?.();
     this.refreshPrRelease = null;
   }
+
+  releasePriorityQueue(): void {
+    this.priorityQueueRelease?.();
+    this.priorityQueueRelease = null;
+  }
 }
 
 async function flushMicrotasks(rounds = 4): Promise<void> {
@@ -432,6 +444,36 @@ describe("TuiController", () => {
     expect(model.mode).toBe("inbox");
     expect(model.detailAnchorKey).not.toBeNull();
     expect(model.detailText).toContain("CLUSTER");
+  });
+
+  it("does not reopen detail if a background list replay finishes after closing it", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    const openPromise = controller.openSelected();
+    await flushMicrotasks();
+
+    service.blockPriorityQueue = true;
+    const replayPromise = (controller as any).refreshActiveListPreservingUi();
+    await flushMicrotasks();
+
+    await controller.openSelected();
+    service.blockPriorityQueue = false;
+    service.releasePriorityQueue();
+    await replayPromise;
+
+    const model = controller.getRenderModel();
+    expect(model.showDetail).toBe(false);
+    expect(model.detailTitle).toBe("Start Here");
+    expect(model.detailText).toContain("Inbox ranks PRs");
+
+    service.releaseRefreshPr();
+    await openPromise;
   });
 
   it("toggles watch state and shows it in Watchlist", async () => {

@@ -42,7 +42,6 @@ type ControllerOptions = {
   resultLimit?: number;
 };
 
-type DetailRefreshTarget = { kind: "pr"; id: number } | { kind: "issue"; id: number } | null;
 type SearchMode = "cross-search" | "pr-search" | "issue-search";
 type PriorityMode = "inbox" | "watchlist";
 type ListMode = SearchMode | PriorityMode;
@@ -99,7 +98,6 @@ export class TuiController {
   private listRequestId = 0;
   private isLandingView = false;
   private detailAutoRefreshInFlight = false;
-  private detailRefreshTarget: DetailRefreshTarget = null;
   private readonly detailFreshness = new Map<string, TuiFreshness>();
   private rateLimitSnapshot: Awaited<ReturnType<TuiDataService["rateLimit"]>> = null;
   private readonly syncJobs: Record<MetadataEntity, TuiSyncJobSnapshot> = {
@@ -243,7 +241,6 @@ export class TuiController {
     this.detailAnchorLine = null;
     this.detailAnchorKey = null;
     this.detailAutoRefreshInFlight = false;
-    this.detailRefreshTarget = null;
     this.context = null;
     this.activeUrl = null;
     this.query = "";
@@ -382,6 +379,7 @@ export class TuiController {
       this.detailIdentity = null;
       this.detailAnchorLine = null;
       this.detailAnchorKey = null;
+      this.loadLandingDetailForCurrentMode();
       this.focus = "results";
       this.message = "Closed detail drawer.";
       this.emit();
@@ -390,9 +388,6 @@ export class TuiController {
     this.showDetail = true;
     this.isLandingView = false;
     await this.refreshDetailForSelection(true);
-    if (row.kind === "pr" || row.kind === "issue") {
-      void this.autoRefreshDetail(row);
-    }
   }
 
   async triggerAction(slot: number): Promise<void> {
@@ -911,12 +906,7 @@ export class TuiController {
       this.detailTitle = `PR #${bundle.candidate.pr.prNumber}`;
       this.detailText = formatted.text;
       this.detailIdentity = `pr:${bundle.candidate.pr.prNumber}`;
-      this.detailStatus =
-        this.detailAutoRefreshInFlight &&
-        this.detailRefreshTarget?.kind === "pr" &&
-        this.detailRefreshTarget.id === bundle.candidate.pr.prNumber
-          ? "Refreshing detail..."
-          : `Freshness: ${this.rowFreshness(row).toUpperCase()}`;
+      this.detailStatus = `Freshness: ${this.rowFreshness(row).toUpperCase()}`;
       this.context = { kind: "pr", prNumber: bundle.candidate.pr.prNumber };
       this.activeUrl = bundle.candidate.pr.url;
       if (focusSection) {
@@ -938,12 +928,7 @@ export class TuiController {
       this.detailTitle = `Issue #${issue.issueNumber}`;
       this.detailText = formatIssueDetail(issue);
       this.detailIdentity = `issue:${issue.issueNumber}`;
-      this.detailStatus =
-        this.detailAutoRefreshInFlight &&
-        this.detailRefreshTarget?.kind === "issue" &&
-        this.detailRefreshTarget.id === issue.issueNumber
-          ? "Refreshing detail..."
-          : `Freshness: ${this.rowFreshness(row).toUpperCase()}`;
+      this.detailStatus = `Freshness: ${this.rowFreshness(row).toUpperCase()}`;
       this.context = { kind: "issue", issueNumber: issue.issueNumber };
       this.activeUrl = issue.url;
       this.detailAnchorLine = null;
@@ -972,53 +957,6 @@ export class TuiController {
     this.showDetail = true;
     this.isLandingView = false;
     await this.refreshDetailForSelection(true, section);
-    void this.autoRefreshDetail(row);
-  }
-
-  private async autoRefreshDetail(
-    row: Extract<TuiResultRow, { kind: "pr" | "issue" }>,
-  ): Promise<void> {
-    if (this.detailAutoRefreshInFlight) {
-      return;
-    }
-    const target: DetailRefreshTarget =
-      row.kind === "pr"
-        ? { kind: "pr", id: row.pr.prNumber }
-        : { kind: "issue", id: row.issue.issueNumber };
-    this.detailAutoRefreshInFlight = true;
-    this.detailRefreshTarget = target;
-    this.syncMode = "detail";
-    this.detailStatus = "Refreshing detail...";
-    this.emit();
-    try {
-      if (row.kind === "pr") {
-        await this.service.refreshPrDetail(row.pr.prNumber);
-        this.detailFreshness.set(this.rowIdentity(row), "fresh");
-      } else {
-        await this.service.refreshIssueDetail(row.issue.issueNumber);
-        this.detailFreshness.set(this.rowIdentity(row), "fresh");
-      }
-      await this.refreshStatus();
-      if (this.showDetail && this.matchesDetailTarget(target)) {
-        await this.refreshDetailForSelection(true);
-      }
-      this.message = `${row.kind === "pr" ? "PR" : "Issue"} detail refreshed from GitHub.`;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.message = /rate limit/i.test(message)
-        ? "Detail refresh rate-limited. Showing cached detail."
-        : `Detail refresh failed: ${message}`;
-      this.errorMessage = null;
-    } finally {
-      this.detailAutoRefreshInFlight = false;
-      this.detailRefreshTarget = null;
-      this.syncMode = null;
-      if (this.showDetail && this.matchesDetailTarget(target)) {
-        await this.refreshDetailForSelection(true);
-      } else {
-        this.emit();
-      }
-    }
   }
 
   private async refreshDetailForPr(prNumber: number, manual = false): Promise<void> {
@@ -1257,20 +1195,6 @@ export class TuiController {
     return row.kind;
   }
 
-  private matchesDetailTarget(target: DetailRefreshTarget): boolean {
-    if (!target) {
-      return false;
-    }
-    const row = this.rows[this.selectedIndex];
-    if (!row) {
-      return false;
-    }
-    return (
-      (row.kind === "pr" && target.kind === "pr" && row.pr.prNumber === target.id) ||
-      (row.kind === "issue" && target.kind === "issue" && row.issue.issueNumber === target.id)
-    );
-  }
-
   private scheduleAutoSync(mode: ListMode): void {
     for (const entity of this.entitiesForMode(mode)) {
       if (this.isMetadataStale(entity, ENTRY_STALE_MS)) {
@@ -1463,8 +1387,6 @@ export class TuiController {
       return;
     }
     const selectionIdentity = this.selectedRowIdentity();
-    const preservedFocus = this.focus;
-    const preservedShowDetail = this.showDetail;
     const requestId = ++this.listRequestId;
     const result = await this.resolveListRows(
       this.mode,
@@ -1476,10 +1398,8 @@ export class TuiController {
     this.applyListResult(result);
     this.context = null;
     this.restoreSelection(selectionIdentity);
-    if (preservedShowDetail && this.rows[this.selectedIndex]) {
-      this.showDetail = true;
+    if (this.showDetail && this.rows[this.selectedIndex]) {
       await this.refreshDetailForSelection(true);
-      this.focus = preservedFocus === "detail" ? "detail" : preservedFocus;
       return;
     }
     this.showDetail = false;
@@ -1487,6 +1407,10 @@ export class TuiController {
     this.detailIdentity = null;
     this.detailAnchorLine = null;
     this.detailAnchorKey = null;
+    if (this.focus === "detail") {
+      this.focus = "results";
+    }
+    this.loadLandingDetailForCurrentMode();
     this.emit();
   }
 
