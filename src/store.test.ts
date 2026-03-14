@@ -851,4 +851,182 @@ describe("PrIndexStore", () => {
       ]),
     );
   });
+
+  it("prioritizes issue-linked hub PRs above recency-only PRs", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-14T00:00:00.000Z"));
+
+    try {
+      const store = await createStore();
+      const recentOnly = makePullRequest(50010, {
+        title: "chore: tidy recent copy updates",
+        body: "Routine copy cleanup.",
+        updatedAt: "2026-03-13T23:00:00.000Z",
+      });
+      const hub = makePullRequest(50011, {
+        title: "fix: gateway timeout cascade across retry paths",
+        body: "Closes #42001\nFix the gateway timeout cascade across retry paths.",
+        updatedAt: "2026-03-13T12:00:00.000Z",
+      });
+      const sibling = makePullRequest(50012, {
+        title: "fix: gateway timeout cascade in retry loop cleanup",
+        body: "Closes #42001\nReduce retry loop fallout from the same gateway timeout cascade.",
+        updatedAt: "2026-03-13T11:00:00.000Z",
+      });
+
+      await store.sync({
+        repo,
+        source: new FakePullRequestDataSource([recentOnly, hub, sibling]),
+        full: true,
+      });
+
+      const queue = await store.listPriorityQueue({ repo, limit: 10, scanLimit: 10 });
+
+      expect(queue[0]?.pr.prNumber).toBe(50011);
+      expect(queue[0]?.linkedIssueCount).toBe(1);
+      expect(queue[0]?.relatedPullRequestCount).toBeGreaterThan(0);
+      expect(queue[0]?.reasons.map((reason) => reason.type)).toEqual(
+        expect.arrayContaining(["freshness", "linked_issue", "related_pr", "hub_bonus"]),
+      );
+      expect(queue.find((candidate) => candidate.pr.prNumber === 50010)).toBeTruthy();
+      expect(queue.find((candidate) => candidate.pr.prNumber === 50010)?.linkedIssueCount).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("treats maintainer as badge-only while watch and ignore stay local", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-14T00:00:00.000Z"));
+
+    try {
+      const store = await createStore();
+      const maintainerPr = makePullRequest(50020, {
+        title: "refactor: normalize inbox score output",
+        body: "Keep inbox score output stable.",
+        updatedAt: "2026-03-13T08:00:00.000Z",
+        labels: ["maintainer"],
+      });
+      const plainPr = makePullRequest(50021, {
+        title: "refactor: normalize inbox score output",
+        body: "Keep inbox score output stable.",
+        updatedAt: "2026-03-13T08:00:00.000Z",
+      });
+      const ignoredPr = makePullRequest(50022, {
+        title: "docs: refresh triage notes",
+        body: "Routine docs cleanup.",
+        updatedAt: "2026-03-13T08:00:00.000Z",
+      });
+
+      await store.sync({
+        repo,
+        source: new FakePullRequestDataSource([maintainerPr, plainPr, ignoredPr]),
+        full: true,
+      });
+
+      let queue = await store.listPriorityQueue({ repo, limit: 10, scanLimit: 10 });
+      const maintainerCandidate = queue.find((candidate) => candidate.pr.prNumber === 50020);
+      const plainCandidate = queue.find((candidate) => candidate.pr.prNumber === 50021);
+
+      expect(maintainerCandidate?.badges.maintainer).toBe(true);
+      expect(plainCandidate?.badges.maintainer).toBe(false);
+      expect(maintainerCandidate?.score).toBe(plainCandidate?.score);
+
+      await store.setPrAttentionState(repo, 50021, "watch");
+      await store.setPrAttentionState(repo, 50022, "ignore");
+
+      queue = await store.listPriorityQueue({ repo, limit: 10, scanLimit: 10 });
+      const watchedCandidate = queue.find((candidate) => candidate.pr.prNumber === 50021);
+
+      expect(queue.some((candidate) => candidate.pr.prNumber === 50022)).toBe(false);
+      expect(watchedCandidate?.attentionState).toBe("watch");
+      expect(watchedCandidate?.reasons.map((reason) => reason.type)).toContain("watch");
+      expect(watchedCandidate?.score).toBeGreaterThan(maintainerCandidate?.score ?? 0);
+
+      const watchlist = await store.listWatchlist(repo, 10);
+      expect(watchlist.map((candidate) => candidate.pr.prNumber)).toEqual([50021]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("builds a context bundle with linked issues, related PRs, cluster, and sparse extras", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-14T00:00:00.000Z"));
+
+    try {
+      const store = await createStore();
+      const seed = makePullRequest(50030, {
+        title: "fix: compaction timeout spiral across retry paths",
+        body: "Closes #42002\nFix the compaction timeout spiral across retry paths.",
+        updatedAt: "2026-03-13T10:00:00.000Z",
+      });
+      seed.comments.push(
+        makeComment("issue:50030", "Investigate retry and backoff interaction in compaction."),
+      );
+      const sibling = makePullRequest(50031, {
+        title: "fix: compaction timeout spiral in retry loop handling",
+        body: "Closes #42002\nReduce retry loop fallout from the same compaction timeout spiral.",
+        updatedAt: "2026-03-13T09:00:00.000Z",
+      });
+
+      await store.sync({
+        repo,
+        source: new FakePullRequestDataSource([seed, sibling]),
+        full: true,
+        hydrateAll: true,
+      });
+      await store.syncIssues({
+        repo,
+        source: new FakeIssueDataSource([
+          makeIssue(42002, {
+            title: "Compaction timeout spiral",
+            body: "Retry paths keep re-triggering compaction timeouts.",
+          }),
+        ]),
+        full: true,
+      });
+      await store.recordPullRequestFacts(
+        makePullRequestFacts(50030, {
+          headSha: "head-50030",
+          linkedIssues: [{ issueNumber: 42002, linkSource: "closing_reference" }],
+          changedFiles: [{ path: "src/agents/compaction.ts", kind: "prod" }],
+        }),
+      );
+      await store.recordPullRequestFacts(
+        makePullRequestFacts(50031, {
+          headSha: "head-50031",
+          linkedIssues: [{ issueNumber: 42002, linkSource: "closing_reference" }],
+          changedFiles: [{ path: "src/agents/compaction.ts", kind: "prod" }],
+        }),
+      );
+      await store.recordReviewFact(
+        makeReviewFact(50030, {
+          summary: "Contract coverage still fails under retry-heavy runs.",
+          commands: ["pnpm test -- compaction"],
+          failingTests: ["compaction.test.ts > retries without timeout spiral"],
+        }),
+      );
+
+      const bundle = await store.getPrContextBundle(repo, 50030);
+
+      expect(bundle?.candidate.pr.prNumber).toBe(50030);
+      expect(bundle?.linkedIssues.map((issue) => issue.issueNumber)).toEqual([42002]);
+      expect(bundle?.relatedPullRequests).toEqual(
+        expect.arrayContaining([expect.objectContaining({ prNumber: 50031 })]),
+      );
+      expect(bundle?.cluster?.clusterBasis).toBe("linked_issue");
+      expect(bundle?.cluster?.sameClusterCandidates).toEqual(
+        expect.arrayContaining([expect.objectContaining({ prNumber: 50031 })]),
+      );
+      expect(bundle?.comments[0]?.excerpt).toContain("retry and backoff");
+      expect(bundle?.latestReviewFact?.summary).toContain("Contract coverage still fails");
+      expect(bundle?.mergeReadiness).toMatchObject({
+        source: "review_fact",
+        state: "needs_work",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

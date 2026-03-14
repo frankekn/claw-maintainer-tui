@@ -11,6 +11,7 @@ import {
   type LocalEmbeddingProvider,
 } from "./embedding.js";
 import type {
+  AttentionState,
   ClusterCandidate,
   ClusterExcludedCandidate,
   ClusterExcludedReasonCode,
@@ -31,12 +32,17 @@ import type {
   PullRequestLinkedIssue,
   PullRequestRecord,
   PullRequestReviewFact,
+  PrContextBundle,
+  PriorityCandidate,
+  PriorityReason,
+  PriorityAttentionState,
   ReviewFactDecision,
   RepoRef,
   SemanticCorpusDocument,
   SearchDocument,
   SearchFilters,
   SearchResult,
+  SyncProgressEvent,
   StatusSnapshot,
   SyncSummary,
 } from "./types.js";
@@ -150,6 +156,13 @@ type PullRequestReviewFactRow = {
   failing_tests_json: string;
   source: string;
   recorded_at: string;
+};
+
+type PrTriageStateRow = {
+  repo: string;
+  pr_number: number;
+  attention_state: AttentionState;
+  updated_at: string;
 };
 
 function toVectorBlob(values: number[]): Buffer {
@@ -653,6 +666,14 @@ export class PrIndexStore {
         recorded_at TEXT NOT NULL,
         PRIMARY KEY (repo, pr_number, head_sha, source)
       );
+
+      CREATE TABLE IF NOT EXISTS pr_triage_state (
+        repo TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        attention_state TEXT NOT NULL CHECK(attention_state IN ('seen', 'watch', 'ignore')),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (repo, pr_number)
+      );
     `);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_prs_updated_at ON prs(updated_at);`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_prs_state ON prs(state);`);
@@ -673,6 +694,10 @@ export class PrIndexStore {
     );
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_pr_review_facts_pr_number ON pr_review_facts(pr_number);`,
+    );
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_pr_triage_state_attention
+         ON pr_triage_state(repo, attention_state, updated_at);`,
     );
     this.db.exec(
       `CREATE VIRTUAL TABLE IF NOT EXISTS ${FTS_TABLE} USING fts5(
@@ -955,6 +980,156 @@ export class PrIndexStore {
       failingTests: JSON.parse(row.failing_tests_json) as string[],
       source: row.source,
       recordedAt: row.recorded_at,
+    };
+  }
+
+  private repoKey(repo: RepoRef | string): string {
+    return typeof repo === "string" ? repo : `${repo.owner}/${repo.name}`;
+  }
+
+  private getAttentionState(repo: string, prNumber: number): PriorityAttentionState {
+    const row = this.db
+      .prepare(
+        `SELECT attention_state
+           FROM pr_triage_state
+          WHERE repo = ? AND pr_number = ?`,
+      )
+      .get(repo, prNumber) as Pick<PrTriageStateRow, "attention_state"> | undefined;
+    return row?.attention_state ?? "new";
+  }
+
+  private buildSearchResultFromPrRow(pr: PrRow, score: number): SearchResult {
+    return {
+      prNumber: pr.number,
+      title: pr.title,
+      url: pr.url,
+      state: pr.state,
+      author: pr.author,
+      labels: this.getLabelsForPr(pr.number),
+      updatedAt: pr.updated_at,
+      score,
+      matchedDocKind: "pr_body",
+      matchedExcerpt: truncateUtf16Safe(normalizeSearchText(pr.body || pr.title), 280),
+    };
+  }
+
+  private freshnessReason(updatedAt: string): PriorityReason | null {
+    const ageMs = Date.now() - new Date(updatedAt).getTime();
+    if (ageMs < 24 * 60 * 60 * 1000) {
+      return { type: "freshness", label: "updated in the last 24h", points: 10 };
+    }
+    if (ageMs < 72 * 60 * 60 * 1000) {
+      return { type: "freshness", label: "updated in the last 72h", points: 6 };
+    }
+    if (ageMs < 7 * 24 * 60 * 60 * 1000) {
+      return { type: "freshness", label: "updated in the last 7d", points: 3 };
+    }
+    return null;
+  }
+
+  private buildPriorityCandidateBase(pr: PrRow, repo: string): PriorityCandidate {
+    const attentionState = this.getAttentionState(repo, pr.number);
+    const reasons: PriorityReason[] = [];
+    let score = 0;
+
+    if (attentionState === "watch") {
+      reasons.push({ type: "watch", label: "watchlist pin", points: 30 });
+      score += 30;
+    }
+    const freshness = this.freshnessReason(pr.updated_at);
+    if (freshness) {
+      reasons.push(freshness);
+      score += freshness.points;
+    }
+    if (reasons.length === 0) {
+      reasons.push({ type: "freshness", label: "open PR fallback", points: 0 });
+    }
+    if (pr.is_draft) {
+      score -= 6;
+    }
+
+    const searchResult = this.buildSearchResultFromPrRow(pr, score);
+    const labels = this.getLabelsForPr(pr.number);
+    return {
+      pr: searchResult,
+      attentionState,
+      score,
+      reasons,
+      linkedIssueCount: 0,
+      relatedPullRequestCount: 0,
+      badges: {
+        draft: Boolean(pr.is_draft),
+        maintainer: labels.includes("maintainer"),
+      },
+    };
+  }
+
+  private async enrichPriorityCandidate(
+    candidate: PriorityCandidate,
+    options: { relatedLimit?: number; clusterLimit?: number } = {},
+  ): Promise<PriorityCandidate> {
+    const linkedIssues = this.getLinkedIssuesForPr(candidate.pr.prNumber);
+    const relatedPullRequests = await this.findRelatedPullRequests(
+      candidate.pr.prNumber,
+      options.relatedLimit ?? 5,
+      { ftsOnly: true },
+    );
+    const cluster = await this.clusterPullRequest({
+      prNumber: candidate.pr.prNumber,
+      limit: options.clusterLimit ?? 5,
+      ftsOnly: true,
+    });
+    const relatedNumbers = new Set<number>(relatedPullRequests.map((pr) => pr.prNumber));
+    for (const clusterCandidate of cluster?.sameClusterCandidates ?? []) {
+      relatedNumbers.add(clusterCandidate.prNumber);
+    }
+    relatedNumbers.delete(candidate.pr.prNumber);
+
+    const linkedIssueCount = linkedIssues.length;
+    const relatedPullRequestCount = relatedNumbers.size;
+    const reasons = [...candidate.reasons];
+    let score = candidate.score;
+
+    if (linkedIssueCount > 0) {
+      const points = Math.min(24, 12 + Math.max(0, linkedIssueCount - 1) * 4);
+      reasons.push({
+        type: "linked_issue",
+        label: `links ${linkedIssueCount} issue${linkedIssueCount === 1 ? "" : "s"}`,
+        points,
+      });
+      score += points;
+    }
+    if (relatedPullRequestCount > 0) {
+      const points = Math.min(16, 10 + Math.max(0, relatedPullRequestCount - 1) * 3);
+      reasons.push({
+        type: "related_pr",
+        label: `connects to ${relatedPullRequestCount} related PR${relatedPullRequestCount === 1 ? "" : "s"}`,
+        points,
+      });
+      score += points;
+    }
+    if (linkedIssueCount > 0 && relatedPullRequestCount > 0) {
+      reasons.push({
+        type: "hub_bonus",
+        label: "connects issues and related PR work",
+        points: 8,
+      });
+      score += 8;
+    }
+
+    const orderedReasons = reasons
+      .slice()
+      .sort((left, right) => right.points - left.points || left.label.localeCompare(right.label));
+    return {
+      ...candidate,
+      pr: {
+        ...candidate.pr,
+        score,
+      },
+      score,
+      reasons: orderedReasons,
+      linkedIssueCount,
+      relatedPullRequestCount,
     };
   }
 
@@ -1399,6 +1574,7 @@ export class PrIndexStore {
     source: PullRequestDataSource;
     full?: boolean;
     hydrateAll?: boolean;
+    onProgress?: (event: SyncProgressEvent) => void;
   }): Promise<SyncSummary> {
     await this.init();
     const mode = params.full || !this.getMeta(META_LAST_SYNC_WATERMARK) ? "full" : "incremental";
@@ -1410,12 +1586,37 @@ export class PrIndexStore {
     const shallowPullRequests: HydratedPullRequest[] = [];
     const summaryPullRequests: PullRequestRecord[] = [];
     let skippedPrs = 0;
+    let processedPrs = 0;
+    const emitProgress = (
+      phase: SyncProgressEvent["phase"],
+      currentId: number | null = null,
+      currentTitle: string | null = null,
+    ) => {
+      params.onProgress?.({
+        entity: "prs",
+        phase,
+        processed: processedPrs,
+        skipped: skippedPrs,
+        queued: Math.max(
+          0,
+          shallowPullRequests.length + summaryPullRequests.length + toProcess.length - processedPrs,
+        ),
+        totalKnown:
+          mode === "incremental"
+            ? shallowPullRequests.length + summaryPullRequests.length + toProcess.length
+            : null,
+        currentId,
+        currentTitle,
+      });
+    };
 
     if (mode === "full") {
       for await (const pr of params.source.listAllPullRequests(params.repo)) {
+        emitProgress("discovering", pr.number, pr.title);
         const existingUpdatedAt = this.getStoredUpdatedAt(pr.number);
         if (existingUpdatedAt === pr.updatedAt) {
           skippedPrs += 1;
+          emitProgress("discovering", pr.number, pr.title);
           continue;
         }
         if (params.hydrateAll) {
@@ -1438,14 +1639,20 @@ export class PrIndexStore {
 
     for (const payload of shallowPullRequests) {
       await this.upsertHydratedPullRequest(payload, { indexVectors: false });
+      processedPrs += 1;
+      emitProgress("syncing", payload.pr.number, payload.pr.title);
     }
     for (const pr of summaryPullRequests) {
       this.upsertPullRequestSummary(pr);
+      processedPrs += 1;
+      emitProgress("syncing", pr.number, pr.title);
     }
 
     const tasks = toProcess.map((prNumber) => async () => {
       const hydrated = await params.source.hydratePullRequest(params.repo, prNumber);
       await this.upsertHydratedPullRequest(hydrated, { indexVectors: false });
+      processedPrs += 1;
+      emitProgress("syncing", hydrated.pr.number, hydrated.pr.title);
       return prNumber;
     });
 
@@ -1461,12 +1668,13 @@ export class PrIndexStore {
     const syncedAt = isoNow();
     this.setMeta(META_LAST_SYNC_AT, syncedAt);
     this.setMeta(META_LAST_SYNC_WATERMARK, syncedAt);
+    emitProgress("complete");
 
     return {
       mode,
       entity: "prs",
       repo: repoName,
-      processedPrs: toProcess.length + shallowPullRequests.length + summaryPullRequests.length,
+      processedPrs,
       processedIssues: 0,
       skippedPrs,
       skippedIssues: 0,
@@ -1483,6 +1691,7 @@ export class PrIndexStore {
     repo: RepoRef;
     source: IssueDataSource;
     full?: boolean;
+    onProgress?: (event: SyncProgressEvent) => void;
   }): Promise<SyncSummary> {
     await this.init();
     const mode =
@@ -1494,12 +1703,31 @@ export class PrIndexStore {
     const toProcess: number[] = [];
     const shallowIssues: IssueRecord[] = [];
     let skippedIssues = 0;
+    let processedIssues = 0;
+    const emitProgress = (
+      phase: SyncProgressEvent["phase"],
+      currentId: number | null = null,
+      currentTitle: string | null = null,
+    ) => {
+      params.onProgress?.({
+        entity: "issues",
+        phase,
+        processed: processedIssues,
+        skipped: skippedIssues,
+        queued: Math.max(0, shallowIssues.length + toProcess.length - processedIssues),
+        totalKnown: mode === "incremental" ? shallowIssues.length + toProcess.length : null,
+        currentId,
+        currentTitle,
+      });
+    };
 
     if (mode === "full") {
       for await (const issue of params.source.listAllIssues(params.repo)) {
+        emitProgress("discovering", issue.number, issue.title);
         const existingUpdatedAt = this.getStoredIssueUpdatedAt(issue.number);
         if (existingUpdatedAt === issue.updatedAt) {
           skippedIssues += 1;
+          emitProgress("discovering", issue.number, issue.title);
           continue;
         }
         shallowIssues.push(issue);
@@ -1516,11 +1744,15 @@ export class PrIndexStore {
 
     for (const issue of shallowIssues) {
       this.upsertIssue(issue);
+      processedIssues += 1;
+      emitProgress("syncing", issue.number, issue.title);
     }
 
     const tasks = toProcess.map((issueNumber) => async () => {
       const issue = await params.source.getIssue(params.repo, issueNumber);
       this.upsertIssue(issue);
+      processedIssues += 1;
+      emitProgress("syncing", issue.number, issue.title);
       return issueNumber;
     });
 
@@ -1536,13 +1768,14 @@ export class PrIndexStore {
     const syncedAt = isoNow();
     this.setMeta(META_ISSUE_LAST_SYNC_AT, syncedAt);
     this.setMeta(META_ISSUE_LAST_SYNC_WATERMARK, syncedAt);
+    emitProgress("complete");
 
     return {
       mode,
       entity: "issues",
       repo: repoName,
       processedPrs: 0,
-      processedIssues: toProcess.length + shallowIssues.length,
+      processedIssues,
       skippedPrs: 0,
       skippedIssues,
       docCount: this.countRows("search_docs"),
@@ -1559,6 +1792,226 @@ export class PrIndexStore {
       count: number;
     };
     return row.count;
+  }
+
+  async setPrAttentionState(
+    repo: RepoRef | string,
+    prNumber: number,
+    state: AttentionState | null,
+  ): Promise<void> {
+    await this.init();
+    const repoKey = this.repoKey(repo);
+    if (state === null) {
+      this.db
+        .prepare(`DELETE FROM pr_triage_state WHERE repo = ? AND pr_number = ?`)
+        .run(repoKey, prNumber);
+      return;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO pr_triage_state (repo, pr_number, attention_state, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(repo, pr_number) DO UPDATE SET
+           attention_state = excluded.attention_state,
+           updated_at = excluded.updated_at`,
+      )
+      .run(repoKey, prNumber, state, isoNow());
+  }
+
+  async listPriorityQueue(params: {
+    repo: RepoRef | string;
+    limit: number;
+    scanLimit?: number;
+  }): Promise<PriorityCandidate[]> {
+    await this.init();
+    await this.ensureDerivedIssueLinksBackfilled();
+    const repoKey = this.repoKey(params.repo);
+    const scanLimit = Math.max(params.limit, params.scanLimit ?? 300);
+    const recentOpen = this.db
+      .prepare(
+        `SELECT *
+           FROM prs
+          WHERE state = 'open'
+          ORDER BY updated_at DESC, number DESC
+          LIMIT ?`,
+      )
+      .all(scanLimit) as PrRow[];
+    const watchedOpen = this.db
+      .prepare(
+        `SELECT p.*
+           FROM prs p
+           JOIN pr_triage_state t
+             ON t.repo = ?
+            AND t.pr_number = p.number
+          WHERE p.state = 'open'
+            AND t.attention_state = 'watch'
+          ORDER BY p.updated_at DESC, p.number DESC`,
+      )
+      .all(repoKey) as PrRow[];
+
+    const byNumber = new Map<number, PrRow>();
+    for (const row of recentOpen) {
+      byNumber.set(row.number, row);
+    }
+    for (const row of watchedOpen) {
+      byNumber.set(row.number, row);
+    }
+
+    const baseline = Array.from(byNumber.values())
+      .map((row) => this.buildPriorityCandidateBase(row, repoKey))
+      .filter((candidate) => candidate.attentionState !== "ignore")
+      .sort(
+        (left, right) =>
+          right.score - left.score ||
+          right.pr.updatedAt.localeCompare(left.pr.updatedAt) ||
+          right.pr.prNumber - left.pr.prNumber,
+      );
+
+    const topForEnrichment = baseline.slice(0, Math.min(80, baseline.length));
+    const enriched = new Map<number, PriorityCandidate>();
+    const result = await runTasksWithConcurrency({
+      tasks: topForEnrichment.map((candidate) => async () => {
+        enriched.set(candidate.pr.prNumber, await this.enrichPriorityCandidate(candidate));
+        return candidate.pr.prNumber;
+      }),
+      limit: 6,
+      errorMode: "stop",
+    });
+    if (result.hasError) {
+      throw result.firstError;
+    }
+
+    return baseline
+      .map((candidate) => enriched.get(candidate.pr.prNumber) ?? candidate)
+      .sort(
+        (left, right) =>
+          right.score - left.score ||
+          right.pr.updatedAt.localeCompare(left.pr.updatedAt) ||
+          right.pr.prNumber - left.pr.prNumber,
+      )
+      .slice(0, params.limit);
+  }
+
+  async listWatchlist(
+    repo: RepoRef | string,
+    limit = DEFAULT_SEARCH_LIMIT,
+  ): Promise<PriorityCandidate[]> {
+    await this.init();
+    await this.ensureDerivedIssueLinksBackfilled();
+    const repoKey = this.repoKey(repo);
+    const rows = this.db
+      .prepare(
+        `SELECT p.*
+           FROM prs p
+           JOIN pr_triage_state t
+             ON t.repo = ?
+            AND t.pr_number = p.number
+          WHERE p.state = 'open'
+            AND t.attention_state = 'watch'
+          ORDER BY p.updated_at DESC, p.number DESC
+          LIMIT ?`,
+      )
+      .all(repoKey, limit) as PrRow[];
+    const result = await runTasksWithConcurrency({
+      tasks: rows.map(
+        (row) => async () =>
+          this.enrichPriorityCandidate(this.buildPriorityCandidateBase(row, repoKey)),
+      ),
+      limit: 6,
+      errorMode: "stop",
+    });
+    if (result.hasError) {
+      throw result.firstError;
+    }
+    return result.results
+      .filter((value): value is PriorityCandidate => Boolean(value))
+      .sort(
+        (left, right) =>
+          right.score - left.score ||
+          right.pr.updatedAt.localeCompare(left.pr.updatedAt) ||
+          right.pr.prNumber - left.pr.prNumber,
+      );
+  }
+
+  async getPrContextBundle(
+    repo: RepoRef | string,
+    prNumber: number,
+  ): Promise<PrContextBundle | null> {
+    await this.init();
+    await this.ensureDerivedIssueLinksBackfilled();
+    const repoKey = this.repoKey(repo);
+    const pr = this.getPrRow(prNumber);
+    if (!pr) {
+      return null;
+    }
+    const payload = await this.show(prNumber);
+    const candidate = await this.enrichPriorityCandidate(
+      this.buildPriorityCandidateBase(pr, repoKey),
+    );
+    const linkedIssues = this.getLinkedIssuesForPr(prNumber)
+      .map((issue) => this.getIssueRow(issue.issueNumber))
+      .filter((issue): issue is IssueRow => Boolean(issue))
+      .map((issue) => ({
+        issueNumber: issue.number,
+        title: issue.title,
+        url: issue.url,
+        state: issue.state,
+        author: issue.author,
+        labels: this.getLabelsForIssue(issue.number),
+        updatedAt: issue.updated_at,
+        score: 1,
+        matchedExcerpt: truncateUtf16Safe(normalizeSearchText(issue.body || issue.title), 280),
+      }));
+    const cluster = await this.clusterPullRequest({
+      prNumber,
+      limit: 5,
+      ftsOnly: true,
+    });
+    const relatedPullRequests = new Map<number, SearchResult>();
+    for (const relatedPullRequest of await this.findRelatedPullRequests(prNumber, 5, {
+      ftsOnly: true,
+    })) {
+      relatedPullRequests.set(relatedPullRequest.prNumber, relatedPullRequest);
+    }
+    for (const clusterCandidate of cluster?.sameClusterCandidates ?? []) {
+      if (clusterCandidate.prNumber === prNumber) {
+        continue;
+      }
+      if (relatedPullRequests.has(clusterCandidate.prNumber)) {
+        continue;
+      }
+      const clusterPr = this.getPrRow(clusterCandidate.prNumber);
+      if (!clusterPr) {
+        continue;
+      }
+      relatedPullRequests.set(
+        clusterCandidate.prNumber,
+        this.buildSearchResultFromPrRow(clusterPr, clusterCandidate.semanticScore ?? 1),
+      );
+    }
+
+    return {
+      candidate: {
+        ...candidate,
+        pr: payload.pr
+          ? {
+              ...payload.pr,
+              score: candidate.score,
+            }
+          : candidate.pr,
+      },
+      comments: payload.comments,
+      linkedIssues,
+      relatedPullRequests: Array.from(relatedPullRequests.values()).sort(
+        (left, right) =>
+          right.updatedAt.localeCompare(left.updatedAt) || right.prNumber - left.prNumber,
+      ),
+      cluster,
+      latestReviewFact: this.getLatestReviewFact(prNumber, repoKey),
+      mergeReadiness: this.resolveMergeReadiness(
+        this.buildClusterCandidate(prNumber, "same_cluster_candidate", "linked_issue"),
+      ),
+    };
   }
 
   async search(rawQuery: string, limit = DEFAULT_SEARCH_LIMIT): Promise<SearchResult[]> {

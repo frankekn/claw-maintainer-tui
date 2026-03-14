@@ -2,6 +2,8 @@ import type {
   ClusterCandidate,
   ClusterExcludedCandidate,
   IssueSearchResult,
+  PrContextBundle,
+  PriorityCandidate,
   SearchResult,
   StatusSnapshot,
 } from "../types.js";
@@ -22,9 +24,11 @@ import type {
   TuiFocus,
   TuiFreshness,
   TuiHeaderModel,
+  TuiDetailSection,
   TuiListSummary,
   TuiRenderModel,
   TuiResultRow,
+  TuiSyncJobSnapshot,
   TuiVerificationState,
 } from "./types.js";
 
@@ -143,6 +147,9 @@ function formatDateShort(value: string): string {
 }
 
 function formatPrRow(row: Extract<TuiResultRow, { kind: "pr" }>): string {
+  if (row.priority) {
+    return formatPriorityRow(row.priority);
+  }
   const result = row.pr;
   return `${padRight(formatKind(row.kind), 8)} ${padRight(`#${result.prNumber}`, 9)} ${result.score
     .toFixed(3)
@@ -150,6 +157,27 @@ function formatPrRow(row: Extract<TuiResultRow, { kind: "pr" }>): string {
     formatFreshness(row.freshness),
     7,
   )} ${padRight(formatDateShort(result.updatedAt), 10)} ${truncate(result.title, 54)}`;
+}
+
+function formatPriorityRow(candidate: PriorityCandidate): string {
+  const reasons = candidate.reasons
+    .slice(0, 3)
+    .map((reason) => truncate(reason.label, 18))
+    .join(" · ");
+  const attention = candidate.attentionState.toUpperCase().padEnd(6);
+  const badges = [candidate.badges.draft ? "D" : "", candidate.badges.maintainer ? "M" : ""]
+    .filter(Boolean)
+    .join("");
+  const context = `I${candidate.linkedIssueCount} R${candidate.relatedPullRequestCount}`;
+  return `${padRight("PR", 8)} ${padRight(`#${candidate.pr.prNumber}`, 9)} ${String(
+    candidate.score,
+  ).padStart(4)} ${padRight(attention, 7)} ${padRight(
+    formatRelativeAge(candidate.pr.updatedAt),
+    4,
+  )} ${padRight(context, 7)} ${padRight(badges || "-", 3)} ${truncate(
+    `${candidate.pr.title}${reasons ? ` · ${reasons}` : ""}`,
+    64,
+  )}`;
 }
 
 function formatIssueRow(row: Extract<TuiResultRow, { kind: "issue" }>): string {
@@ -194,10 +222,22 @@ function formatClusterExcludedRow(
   )} ${truncate(candidate.title, 46)}`;
 }
 
-export function formatResultRow(row: TuiResultRow): string {
+export function formatResultRow(row: TuiResultRow, mode = ""): string {
   switch (row.kind) {
     case "pr":
-      return formatPrRow(row);
+      return mode === "inbox" || mode === "watchlist"
+        ? formatPriorityRow(
+            row.priority ?? {
+              pr: row.pr,
+              attentionState: "new",
+              score: Math.round(row.pr.score),
+              reasons: [],
+              linkedIssueCount: 0,
+              relatedPullRequestCount: 0,
+              badges: { draft: false, maintainer: false },
+            },
+          )
+        : formatPrRow(row);
     case "issue":
       return formatIssueRow(row);
     case "cluster-candidate":
@@ -212,6 +252,15 @@ export function formatResultRow(row: TuiResultRow): string {
 }
 
 function formatTableHeader(mode: string): string {
+  if (mode === "inbox" || mode === "watchlist") {
+    return text(
+      `${padRight("Kind", 8)} ${padRight("ID", 9)} ${padRight("Score", 4)} ${padRight(
+        "State",
+        7,
+      )} ${padRight("Age", 4)} ${padRight("Ctx", 7)} ${padRight("Tag", 3)} Title / reasons`,
+      "dim",
+    );
+  }
   if (mode === "cluster") {
     return text(
       `${padRight("Kind", 8)} ${padRight("ID", 9)} ${padRight("Match", 11)} ${padRight(
@@ -257,6 +306,123 @@ export function formatPrDetail(
     }
   }
   return lines.join("\n");
+}
+
+function formatReasonLines(reasons: PriorityCandidate["reasons"]): string[] {
+  if (reasons.length === 0) {
+    return ["- open PR fallback"];
+  }
+  return reasons.map((reason) => `- ${reason.label} ${text(`(+${reason.points})`, "muted")}`);
+}
+
+function formatPrioritySummary(candidate: PriorityCandidate): string[] {
+  const badges = [
+    candidate.badges.draft ? "draft" : "",
+    candidate.badges.maintainer ? "maintainer" : "",
+  ].filter(Boolean);
+  return [
+    `${text(`PR #${candidate.pr.prNumber}`, "accent")} ${candidate.pr.title}`,
+    `${valueTone(candidate.pr.state.toUpperCase(), stateTone(candidate.pr.state))}  ${text(candidate.pr.author, "muted")}  ${text(candidate.pr.updatedAt, "dim")}`,
+    accentMeta("labels", formatLabelBlock(candidate.pr.labels)),
+    accentMeta("github", candidate.pr.url),
+    accentMeta("attention", candidate.attentionState),
+    accentMeta("priority_score", String(candidate.score)),
+    accentMeta("badges", badges.length > 0 ? badges.join(", ") : "(none)"),
+  ];
+}
+
+function appendSection(
+  lines: string[],
+  anchors: Partial<Record<TuiDetailSection, number>>,
+  section: TuiDetailSection,
+  title: string,
+  body: string[],
+): void {
+  if (lines.length > 0) {
+    lines.push("");
+  }
+  anchors[section] = lines.length;
+  lines.push(sectionLabel(title));
+  lines.push(...body);
+}
+
+export function formatPriorityPrDetail(
+  bundle: PrContextBundle,
+  focusSection: TuiDetailSection | null = null,
+): { text: string; anchorLine: number | null } {
+  const lines = formatPrioritySummary(bundle.candidate);
+  const anchors: Partial<Record<TuiDetailSection, number>> = {};
+  appendSection(lines, anchors, "summary", "Summary", [
+    truncate(bundle.candidate.pr.matchedExcerpt, 520),
+  ]);
+  if (lines.length > 0) {
+    lines.push("");
+  }
+  lines.push(sectionLabel("Why Prioritized"));
+  lines.push(...formatReasonLines(bundle.candidate.reasons));
+  appendSection(lines, anchors, "linked-issues", "Linked Issues", [
+    `${text("count", "muted")} ${bundle.linkedIssues.length}`,
+    ...(bundle.linkedIssues.length > 0
+      ? bundle.linkedIssues.map((issue) => `- #${issue.issueNumber} ${issue.title}`)
+      : ["(none)"]),
+  ]);
+  appendSection(lines, anchors, "related-prs", "Related PRs", [
+    `${text("count", "muted")} ${bundle.relatedPullRequests.length}`,
+    ...(bundle.relatedPullRequests.length > 0
+      ? bundle.relatedPullRequests.map((pr) => `- #${pr.prNumber} ${pr.title}`)
+      : ["(none)"]),
+  ]);
+  const clusterCandidates =
+    (bundle.cluster?.sameClusterCandidates.length ?? 0) +
+    (bundle.cluster?.nearbyButExcluded.length ?? 0);
+  appendSection(lines, anchors, "cluster", "Cluster", [
+    bundle.cluster
+      ? `${text("basis", "muted")} ${bundle.cluster.clusterBasis}`
+      : `${text("basis", "muted")} (none)`,
+    bundle.cluster && bundle.cluster.clusterIssueNumbers.length > 0
+      ? `${text("issues", "muted")} ${bundle.cluster.clusterIssueNumbers
+          .map((issue) => `#${issue}`)
+          .join(", ")}`
+      : `${text("issues", "muted")} (none)`,
+    `${text("rows", "muted")} ${clusterCandidates}`,
+    ...(bundle.cluster?.sameClusterCandidates.length
+      ? bundle.cluster.sameClusterCandidates.map(
+          (candidate) => `- #${candidate.prNumber} ${candidate.title}`,
+        )
+      : ["(none)"]),
+  ]);
+  appendSection(lines, anchors, "maintainer-state", "Maintainer State", [
+    `${text("attention", "muted")} ${bundle.candidate.attentionState}`,
+    `${text("watchlist", "muted")} ${bundle.candidate.attentionState === "watch" ? "yes" : "no"}`,
+    `${text("ignore", "muted")} ${bundle.candidate.attentionState === "ignore" ? "yes" : "no"}`,
+  ]);
+  if (bundle.comments.length > 0 || bundle.latestReviewFact || bundle.mergeReadiness) {
+    if (lines.length > 0) {
+      lines.push("");
+    }
+    lines.push(sectionLabel("Sparse Extras"));
+    if (bundle.comments.length > 0) {
+      lines.push(`${text("recent_comments", "muted")} ${bundle.comments.length}`);
+      for (const comment of bundle.comments) {
+        lines.push(`- [${comment.kind}] ${comment.author}: ${truncate(comment.excerpt, 120)}`);
+      }
+    }
+    if (bundle.latestReviewFact) {
+      lines.push(
+        `${text("latest_review_fact", "muted")} ${bundle.latestReviewFact.decision} · ${bundle.latestReviewFact.summary}`,
+      );
+    }
+    if (bundle.mergeReadiness) {
+      lines.push(
+        `${text("merge_readiness", "muted")} ${bundle.mergeReadiness.state} via ${bundle.mergeReadiness.source}`,
+      );
+      lines.push(`  ${truncate(bundle.mergeReadiness.summary, 160)}`);
+    }
+  }
+  return {
+    text: lines.join("\n"),
+    anchorLine: focusSection ? (anchors[focusSection] ?? 0) : 0,
+  };
 }
 
 export function formatIssueDetail(issue: IssueSearchResult): string {
@@ -374,7 +540,56 @@ export function formatCrossSearchLandingDetail(
     "1 Browse the cached list or press / to refine it.",
     "2 Press Enter to open the selected detail drawer.",
     "3 Press m to load 20 more rows.",
-    "4 Use Refresh only when you want full cluster verification.",
+    "4 Use x or c to jump to linked issues or cluster context.",
+  );
+  return lines.join("\n");
+}
+
+export function formatInboxLandingDetail(status: StatusSnapshot | null, now = new Date()): string {
+  const lines = [
+    sectionLabel("Start Here"),
+    "Inbox ranks PRs by how much context they can open up.",
+  ];
+  if (status) {
+    lines.push(accentMeta("repo", status.repo));
+    lines.push(
+      `${text("freshness", "muted")} ${valueTone(
+        `PR ${formatRelativeAge(status.lastSyncAt, now)}`,
+        freshnessTone(status.lastSyncAt, now),
+      )}`,
+    );
+  }
+  lines.push(
+    "",
+    sectionLabel("Workflow"),
+    "1 Review the single priority queue.",
+    "2 Press Enter to open the PR investigation workspace.",
+    "3 Press x or c to jump to linked issues or cluster.",
+    "4 Press v / w / i / u to manage local triage state.",
+  );
+  return lines.join("\n");
+}
+
+export function formatWatchlistLandingDetail(
+  status: StatusSnapshot | null,
+  now = new Date(),
+): string {
+  const lines = [sectionLabel("Start Here"), "Watchlist is your revisit queue for open PRs."];
+  if (status) {
+    lines.push(accentMeta("repo", status.repo));
+    lines.push(
+      `${text("freshness", "muted")} ${valueTone(
+        formatRelativeAge(status.lastSyncAt, now),
+        freshnessTone(status.lastSyncAt, now),
+      )}`,
+    );
+  }
+  lines.push(
+    "",
+    sectionLabel("Workflow"),
+    "1 Review watched PRs in one list.",
+    "2 Press Enter to open the PR investigation workspace.",
+    "3 Press u to clear local watch state when you are done.",
   );
   return lines.join("\n");
 }
@@ -497,6 +712,12 @@ export function formatHeader(model: TuiHeaderModel, now = new Date()): string {
       ),
     );
   }
+  for (const job of model.syncJobs) {
+    const badgeText = formatSyncJobBadge(job);
+    if (badgeText) {
+      segments.push(badgeText);
+    }
+  }
   if (model.detailAutoRefreshInFlight) {
     segments.push(badge("DETAIL REFRESHING", "warn"));
   }
@@ -537,12 +758,36 @@ export function formatModeTabs(activeMode: string, focus: TuiFocus): string {
 
 export function formatResults(model: TuiRenderModel): string[] {
   if (model.rows.length === 0) {
+    if (model.mode === "inbox") {
+      if (/^Loading\b/.test(model.footer.message)) {
+        return [
+          text("Loading priority queue...", "muted"),
+          text("Assembling cached PR context from the local index.", "dim"),
+        ];
+      }
+      return [
+        text("No prioritized PRs.", "muted"),
+        text("Background sync will repopulate the queue when metadata changes.", "dim"),
+      ];
+    }
+    if (model.mode === "watchlist") {
+      if (/^Loading\b/.test(model.footer.message)) {
+        return [
+          text("Loading watchlist...", "muted"),
+          text("Restoring local triage state.", "dim"),
+        ];
+      }
+      return [text("Watchlist is empty.", "muted"), text("Press w on a PR to pin it here.", "dim")];
+    }
+    if (model.mode === "status") {
+      return [text("Loading repository status...", "muted")];
+    }
     return [text("No rows.", "muted"), text("Press / to search this desk.", "dim")];
   }
   const lines = [formatTableHeader(model.mode)];
   lines.push(
     ...model.rows.map((row, index) => {
-      const line = formatResultRow(row);
+      const line = formatResultRow(row, model.mode);
       if (index !== model.selectedIndex) {
         return `${text("  ", "dim")}${line}`;
       }
@@ -552,8 +797,37 @@ export function formatResults(model: TuiRenderModel): string[] {
   return lines;
 }
 
-export function defaultSecondaryHintText(canLoadMore = false): string {
-  return `${text("Move/Scroll", "muted")} j/k ↑↓  ${text("Enter", "muted")} detail  ${text("Tab", "muted")} focus  ${text("/", "muted")} query${canLoadMore ? `  ${text("m", "muted")} more` : ""}  ${text("q", "muted")} quit`;
+export function defaultSecondaryHintText(
+  mode: TuiRenderModel["mode"],
+  canLoadMore = false,
+): string {
+  const queryHint =
+    mode === "cross-search" || mode === "pr-search" || mode === "issue-search"
+      ? `  ${text("/", "muted")} query`
+      : "";
+  const triageHint =
+    mode === "inbox" || mode === "watchlist"
+      ? `  ${text("v/w/i/u", "muted")} triage  ${text("x/c", "muted")} context`
+      : `  ${text("x/c", "muted")} context`;
+  return `${text("Move/Scroll", "muted")} j/k ↑↓  ${text("Enter", "muted")} detail  ${text("Tab", "muted")} focus${queryHint}${triageHint}${canLoadMore ? `  ${text("m", "muted")} more` : ""}  ${text("q", "muted")} quit`;
+}
+
+function formatSyncJobBadge(job: TuiSyncJobSnapshot): string | null {
+  const prefix = job.entity === "prs" ? "PR" : "ISSUE";
+  if (job.state === "queued") {
+    return badge(`${prefix} QUEUED`, "warn");
+  }
+  if (job.state === "error") {
+    return badge(`${prefix} ERROR`, "error");
+  }
+  if (job.state !== "running" || !job.progress) {
+    return null;
+  }
+  const countLabel =
+    job.progress.totalKnown === null
+      ? `${job.progress.processed}+${job.progress.skipped}`
+      : `${job.progress.processed}/${job.progress.totalKnown}`;
+  return badge(`${prefix} SYNC ${countLabel}`, "warn");
 }
 
 export function formatDetailStatus(status: string | null): string {

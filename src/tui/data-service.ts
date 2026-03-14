@@ -1,11 +1,12 @@
 import { GhCliPullRequestDataSource } from "../github.js";
 import { PrIndexStore } from "../store.js";
-import type { RepoRef } from "../types.js";
+import type { AttentionState, RepoRef } from "../types.js";
 import type {
   TuiClusterVerificationSummary,
   TuiDataService,
   TuiVerificationState,
 } from "./types.js";
+import type { SyncProgressEvent } from "../types.js";
 
 export class StoreBackedTuiDataService implements TuiDataService {
   private rateLimitCache: {
@@ -23,12 +24,28 @@ export class StoreBackedTuiDataService implements TuiDataService {
     return this.store.status();
   }
 
+  listPriorityQueue(options: { limit: number; scanLimit?: number }) {
+    return this.store.listPriorityQueue({
+      repo: this.repo,
+      limit: options.limit,
+      scanLimit: options.scanLimit,
+    });
+  }
+
+  listWatchlist(limit: number) {
+    return this.store.listWatchlist(this.repo, limit);
+  }
+
   search(query: string, limit: number) {
     return this.store.search(query, limit);
   }
 
   searchIssues(query: string, limit: number) {
     return this.store.searchIssues(query, limit);
+  }
+
+  getPrContextBundle(prNumber: number) {
+    return this.store.getPrContextBundle(this.repo, prNumber);
   }
 
   show(prNumber: number) {
@@ -142,21 +159,27 @@ export class StoreBackedTuiDataService implements TuiDataService {
     };
   }
 
-  syncPrs() {
+  syncPrs(options?: { onProgress?: (event: SyncProgressEvent) => void }) {
     return this.store.sync({
       repo: this.repo,
       source: this.source,
       full: false,
       hydrateAll: false,
+      onProgress: options?.onProgress,
     });
   }
 
-  syncIssues() {
+  syncIssues(options?: { onProgress?: (event: SyncProgressEvent) => void }) {
     return this.store.syncIssues({
       repo: this.repo,
       source: this.source,
       full: false,
+      onProgress: options?.onProgress,
     });
+  }
+
+  async setPrAttentionState(prNumber: number, state: AttentionState | null) {
+    await this.store.setPrAttentionState(this.repo, prNumber, state);
   }
 
   async refreshPrDetail(prNumber: number) {

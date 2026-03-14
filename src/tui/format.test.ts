@@ -1,16 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
   buildStatusRows,
-  formatActionBar,
-  formatClusterDetail,
-  formatCrossSearchLandingDetail,
+  defaultSecondaryHintText,
   formatHeader,
+  formatInboxLandingDetail,
   formatListSummary,
   formatModeTabs,
+  formatPriorityPrDetail,
   formatResultRow,
   formatStatusDetail,
 } from "./format.js";
-import type { ClusterCandidate, StatusSnapshot } from "../types.js";
+import type { PrContextBundle, PriorityCandidate, StatusSnapshot } from "../types.js";
 import type { TuiHeaderModel } from "./types.js";
 
 const status: StatusSnapshot = {
@@ -34,7 +34,7 @@ const status: StatusSnapshot = {
 const headerModel: TuiHeaderModel = {
   repo: "openclaw/openclaw",
   dbPath: "/tmp/clawlens.sqlite",
-  activeModeLabel: "Explore",
+  activeModeLabel: "Inbox",
   ftsOnly: false,
   status,
   rateLimit: {
@@ -42,31 +42,172 @@ const headerModel: TuiHeaderModel = {
     remaining: 0,
     resetAt: "2026-03-11T09:17:43.000Z",
   },
-  syncMode: "metadata",
+  syncMode: null,
+  syncJobs: [
+    {
+      entity: "prs",
+      state: "running",
+      progress: {
+        entity: "prs",
+        phase: "syncing",
+        processed: 12,
+        skipped: 3,
+        queued: 9,
+        totalKnown: null,
+        currentId: 42531,
+        currentTitle: "PR 42531",
+      },
+      errorMessage: null,
+      pendingRerun: false,
+      nextAutoUpdateAt: null,
+      lastCompletedAt: null,
+    },
+  ],
   detailAutoRefreshInFlight: true,
   busyMessage: null,
   errorMessage: null,
 };
 
+function makeCandidate(): PriorityCandidate {
+  return {
+    pr: {
+      prNumber: 41793,
+      title: "prune image-containing tool results",
+      url: "https://github.com/openclaw/openclaw/pull/41793",
+      state: "open",
+      author: "frank",
+      labels: ["maintainer"],
+      updatedAt: "2026-03-11T08:00:00.000Z",
+      score: 54,
+      matchedDocKind: "pr_body",
+      matchedExcerpt: "Matched excerpt for the priority candidate.",
+    },
+    attentionState: "watch",
+    score: 54,
+    reasons: [
+      { type: "watch", label: "watchlist pin", points: 30 },
+      { type: "linked_issue", label: "links 2 issues", points: 16 },
+      { type: "hub_bonus", label: "connects issues and related PR work", points: 8 },
+    ],
+    linkedIssueCount: 2,
+    relatedPullRequestCount: 3,
+    badges: {
+      draft: false,
+      maintainer: true,
+    },
+  };
+}
+
+function makeBundle(): PrContextBundle {
+  const candidate = makeCandidate();
+  return {
+    candidate,
+    comments: [
+      {
+        kind: "issue_comment",
+        author: "reviewer",
+        createdAt: "2026-03-12T00:00:00.000Z",
+        url: "https://github.com/openclaw/openclaw/pull/41793#comment",
+        excerpt: "Comment excerpt",
+      },
+    ],
+    linkedIssues: [
+      {
+        issueNumber: 41789,
+        title: "Issue 41789",
+        url: "https://github.com/openclaw/openclaw/issues/41789",
+        state: "open",
+        author: "frank",
+        labels: [],
+        updatedAt: "2026-03-12T00:00:00.000Z",
+        score: 1,
+        matchedExcerpt: "Issue excerpt",
+      },
+    ],
+    relatedPullRequests: [
+      {
+        prNumber: 42212,
+        title: "fix: prune image-containing tool results",
+        url: "https://github.com/openclaw/openclaw/pull/42212",
+        state: "open",
+        author: "frank",
+        labels: [],
+        updatedAt: "2026-03-12T00:00:00.000Z",
+        score: 0.91,
+        matchedDocKind: "pr_body",
+        matchedExcerpt: "Related PR excerpt",
+      },
+    ],
+    cluster: {
+      seedPr: {
+        prNumber: 41793,
+        title: "prune image-containing tool results",
+        url: "https://github.com/openclaw/openclaw/pull/41793",
+        state: "open",
+        updatedAt: "2026-03-12T00:00:00.000Z",
+      },
+      clusterBasis: "linked_issue",
+      clusterIssueNumbers: [41789],
+      bestBase: null,
+      sameClusterCandidates: [],
+      nearbyButExcluded: [],
+      mergeReadiness: null,
+    },
+    latestReviewFact: null,
+    mergeReadiness: null,
+  };
+}
+
 describe("tui formatting", () => {
-  it("formats a dense header with mode sync quota and detail refresh badges", () => {
+  it("formats the header with sync badges", () => {
     const header = formatHeader(headerModel, new Date("2026-03-11T08:28:13.832Z"));
 
-    expect(header).toContain("MODE Explore");
+    expect(header).toContain("MODE Inbox");
     expect(header).toContain("REPO openclaw/openclaw");
     expect(header).toContain("PR 1h");
     expect(header).toContain("ISSUE 44m");
     expect(header).toContain("QUOTA 0/5000");
-    expect(header).toContain("FAST SYNC");
+    expect(header).toContain("PR SYNC 12+3");
     expect(header).toContain("DETAIL REFRESHING");
-    expect(header).toContain("{#63c8ff-bg}");
   });
 
-  it("formats status detail and status rows from the repository snapshot", () => {
+  it("formats priority rows and detail sections", () => {
+    const candidate = makeCandidate();
+    const row = formatResultRow(
+      {
+        kind: "pr",
+        pr: candidate.pr,
+        freshness: "fresh",
+        priority: candidate,
+      },
+      "inbox",
+    );
+    expect(row).toContain("WATCH");
+    expect(row).toContain("I2 R3");
+
+    const detail = formatPriorityPrDetail(makeBundle(), "linked-issues");
+    expect(detail.text).toContain("WHY PRIORITIZED");
+    expect(detail.text).toContain("LINKED ISSUES");
+    expect(detail.text).toContain("MAINTAINER STATE");
+    expect(detail.anchorLine).not.toBeNull();
+  });
+
+  it("formats Inbox landing copy and mode tabs", () => {
+    const detail = formatInboxLandingDetail(status, new Date("2026-03-11T08:28:13.832Z"));
+
+    expect(detail).toContain("START HERE");
+    expect(detail).toContain("single priority queue");
+    expect(detail).toContain("v / w / i / u");
+
+    const tabs = formatModeTabs("inbox", "nav");
+    expect(tabs).toContain("Inbox");
+    expect(tabs).toContain("Watchlist");
+    expect(tabs).toContain("Explore");
+  });
+
+  it("formats status detail, status rows, summaries, and hints", () => {
     const detail = formatStatusDetail(status, new Date("2026-03-11T08:28:13.832Z"));
     expect(detail).toContain("INDEX");
-    expect(detail).toContain("prs");
-    expect(detail).toContain("23935");
     expect(detail).toContain("vector");
     expect(detail).toContain("ready");
 
@@ -77,79 +218,15 @@ describe("tui formatting", () => {
       { kind: "status", label: "{#9fb0c4-fg}Docs{/}", value: "{#e7edf5-fg}24035{/}" },
       { kind: "status", label: "{#9fb0c4-fg}Vector{/}", value: "{#4fd1a1-fg}ready{/}" },
     ]);
-  });
 
-  it("formats cluster rows and detail with verification coverage", () => {
-    const candidate: ClusterCandidate = {
-      prNumber: 42212,
-      title: "fix: prune image-containing tool results across context pruning paths",
-      url: "https://github.com/openclaw/openclaw/pull/42212",
-      state: "open",
-      updatedAt: "2026-03-10T00:00:00.000Z",
-      headSha: "head-42212",
-      matchedBy: "linked_issue",
-      linkedIssues: [41789],
-      prodFiles: ["a.ts", "b.ts"],
-      testFiles: ["a.test.ts", "b.test.ts"],
-      otherFiles: ["README.md"],
-      relevantProdFiles: ["a.ts", "b.ts"],
-      relevantTestFiles: ["a.test.ts"],
-      noiseFilesCount: 1,
-      status: "best_base",
-      reasonCodes: ["broader_relevant_prod_coverage"],
-      reason: "broader relevant production coverage",
-    };
-
-    expect(
-      formatResultRow({
-        kind: "cluster-candidate",
-        candidate,
-        verification: "done",
-      }),
-    ).toContain("VERIFIED");
-    expect(
-      formatClusterDetail(
-        {
-          seedLabel: "seed_pr: #41793 prune image-containing tool results",
-          clusterBasis: "linked_issue",
-          clusterIssues: [41789],
-          verificationSummary: "done · PR 2 · issue 1 · missing 0",
-          mergeSummary: "needs_work via review_fact",
-        },
-        candidate,
-      ),
-    ).toContain("verification");
-  });
-
-  it("formats cross-search landing copy and mode tabs", () => {
-    const detail = formatCrossSearchLandingDetail(status, new Date("2026-03-11T08:28:13.832Z"));
-
-    expect(detail).toContain("START HERE");
-    expect(detail).toContain("Explore shows cached PRs and issues in one list.");
-    expect(detail).toContain("Press m to load 20 more rows.");
-
-    const tabs = formatModeTabs("cross-search", "nav");
-    expect(tabs).toContain("Explore");
-    expect(tabs).toContain("PRs");
-    expect(tabs).toContain("{#63c8ff-bg}");
-  });
-
-  it("formats action bar chips and list summaries", () => {
-    expect(
-      formatActionBar([
-        { id: "query", slot: 1, label: "Search", shortcut: "/", enabled: true },
-        { id: "refresh", slot: 7, label: "Refresh", shortcut: "r", enabled: false },
-      ]),
-    ).toContain("1 Search");
     expect(
       formatListSummary({
-        yieldLabel: "20 hits",
-        confidenceLabel: "PR 12 · Issue 5 · Cluster 3",
-        coverageLabel: "seed #41793 · cached",
+        yieldLabel: "20 PRs",
+        confidenceLabel: "issue-linked 8 · related 5",
+        coverageLabel: "priority queue",
       }),
-    ).toContain("seed #41793");
-    expect(formatActionBar([{ id: "load-more", slot: 8, label: "More", shortcut: "m", enabled: true }])).toContain(
-      "8 More",
-    );
+    ).toContain("priority queue");
+    expect(defaultSecondaryHintText("inbox", true)).toContain("v/w/i/u");
+    expect(defaultSecondaryHintText("pr-search", true)).toContain("/");
   });
 });

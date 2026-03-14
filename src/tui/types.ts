@@ -1,45 +1,57 @@
 import type {
+  AttentionState,
   ClusterCandidate,
   ClusterExcludedCandidate,
   ClusterPullRequestAnalysis,
   IssueSearchResult,
+  PrContextBundle,
+  PriorityCandidate,
   SearchResult,
   StatusSnapshot,
+  SyncProgressEvent,
   SyncSummary,
 } from "../types.js";
 
 export type TuiMode =
+  | "inbox"
+  | "watchlist"
   | "cross-search"
   | "pr-search"
   | "issue-search"
-  | "pr-xref"
-  | "issue-xref"
-  | "cluster"
   | "status";
 
 export type TuiFocus = "nav" | "results" | "detail" | "query";
+export type TuiDetailSection =
+  | "summary"
+  | "linked-issues"
+  | "related-prs"
+  | "cluster"
+  | "maintainer-state";
 
 export const TUI_MODE_ORDER: Array<{ id: TuiMode; label: string; queryPrompt: string }> = [
+  { id: "inbox", label: "Inbox", queryPrompt: "Inbox is browse-only" },
+  { id: "watchlist", label: "Watchlist", queryPrompt: "Watchlist is browse-only" },
   { id: "cross-search", label: "Explore", queryPrompt: "Search Explore" },
   { id: "pr-search", label: "PRs", queryPrompt: "Search PRs" },
   { id: "issue-search", label: "Issues", queryPrompt: "Search Issues" },
-  { id: "pr-xref", label: "PR Links", queryPrompt: "Enter PR Number" },
-  { id: "issue-xref", label: "Issue Links", queryPrompt: "Enter Issue Number" },
-  { id: "cluster", label: "Cluster", queryPrompt: "Enter PR Number" },
   { id: "status", label: "Status", queryPrompt: "Status view" },
 ];
 
 export type TuiActionId =
   | "query"
   | "detail"
-  | "xref"
+  | "jump-linked-issues"
   | "cluster"
   | "sync-prs"
   | "sync-issues"
   | "refresh"
   | "load-more"
   | "open-url"
-  | "back";
+  | "back"
+  | "mark-seen"
+  | "toggle-watch"
+  | "toggle-ignore"
+  | "clear-state";
 
 export type TuiAction = {
   id: TuiActionId;
@@ -58,6 +70,17 @@ export type TuiListSummary = {
 export type TuiFreshness = "fresh" | "partial" | "stale";
 export type TuiVerificationState = "idle" | "running" | "done" | "rate_limited";
 export type TuiSyncMode = "metadata" | "detail" | "cluster_verify";
+export type TuiSyncJobState = "idle" | "queued" | "running" | "cooldown" | "error";
+
+export type TuiSyncJobSnapshot = {
+  entity: "prs" | "issues";
+  state: TuiSyncJobState;
+  progress: SyncProgressEvent | null;
+  errorMessage: string | null;
+  pendingRerun: boolean;
+  nextAutoUpdateAt: string | null;
+  lastCompletedAt: string | null;
+};
 
 export type TuiRateLimitSnapshot = {
   limit: number;
@@ -73,7 +96,7 @@ export type TuiClusterVerificationSummary = {
 };
 
 export type TuiResultRow =
-  | { kind: "pr"; pr: SearchResult; freshness: TuiFreshness }
+  | { kind: "pr"; pr: SearchResult; freshness: TuiFreshness; priority: PriorityCandidate | null }
   | { kind: "issue"; issue: IssueSearchResult; freshness: TuiFreshness }
   | {
       kind: "cluster-candidate";
@@ -90,7 +113,6 @@ export type TuiResultRow =
 export type TuiContext =
   | { kind: "pr"; prNumber: number }
   | { kind: "issue"; issueNumber: number }
-  | { kind: "cluster"; prNumber: number }
   | null;
 
 export type TuiHeaderModel = {
@@ -101,6 +123,7 @@ export type TuiHeaderModel = {
   status: StatusSnapshot | null;
   rateLimit: TuiRateLimitSnapshot | null;
   syncMode: TuiSyncMode | null;
+  syncJobs: TuiSyncJobSnapshot[];
   detailAutoRefreshInFlight: boolean;
   busyMessage: string | null;
   errorMessage: string | null;
@@ -112,6 +135,7 @@ export type TuiFooterModel = {
   queryPrompt: string;
   queryValue: string;
   actions: TuiAction[];
+  autoUpdateHint: string | null;
 };
 
 export type TuiRenderModel = {
@@ -124,6 +148,8 @@ export type TuiRenderModel = {
   detailText: string;
   detailStatus: string | null;
   detailIdentity: string | null;
+  detailAnchorLine: number | null;
+  detailAnchorKey: string | null;
   showDetail: boolean;
   activeUrl: string | null;
   query: string;
@@ -137,8 +163,12 @@ export type TuiRenderModel = {
 
 export interface TuiDataService {
   status(): Promise<StatusSnapshot>;
+  listPriorityQueue(options: { limit: number; scanLimit?: number }): Promise<PriorityCandidate[]>;
+  listWatchlist(limit: number): Promise<PriorityCandidate[]>;
   search(query: string, limit: number): Promise<SearchResult[]>;
   searchIssues(query: string, limit: number): Promise<IssueSearchResult[]>;
+  getPrContextBundle(prNumber: number): Promise<PrContextBundle | null>;
+  setPrAttentionState(prNumber: number, state: AttentionState | null): Promise<void>;
   show(prNumber: number): Promise<{
     pr: SearchResult | null;
     comments: Array<{
@@ -166,8 +196,8 @@ export interface TuiDataService {
     analysis: ClusterPullRequestAnalysis | null;
     summary: TuiClusterVerificationSummary;
   }>;
-  syncPrs(): Promise<SyncSummary>;
-  syncIssues(): Promise<SyncSummary>;
+  syncPrs(options?: { onProgress?: (event: SyncProgressEvent) => void }): Promise<SyncSummary>;
+  syncIssues(options?: { onProgress?: (event: SyncProgressEvent) => void }): Promise<SyncSummary>;
   refreshPrDetail(prNumber: number): Promise<void>;
   refreshIssueDetail(issueNumber: number): Promise<void>;
   rateLimit(): Promise<TuiRateLimitSnapshot | null>;
@@ -181,6 +211,8 @@ export type TuiViewSnapshot = {
   detailText: string;
   detailStatus: string | null;
   detailIdentity: string | null;
+  detailAnchorLine: number | null;
+  detailAnchorKey: string | null;
   showDetail: boolean;
   activeUrl: string | null;
   detailTitle: string;

@@ -4,11 +4,7 @@ function suppressKnownSqliteWarning(): void {
   process.emitWarning = ((warning: string | Error, ...args: unknown[]) => {
     const message = typeof warning === "string" ? warning : warning.message;
     const type =
-      typeof args[0] === "string"
-        ? args[0]
-        : warning instanceof Error
-          ? warning.name
-          : undefined;
+      typeof args[0] === "string" ? args[0] : warning instanceof Error ? warning.name : undefined;
 
     if (
       type === "ExperimentalWarning" &&

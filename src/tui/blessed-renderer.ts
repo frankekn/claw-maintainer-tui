@@ -35,6 +35,7 @@ export class BlessedTuiRenderer {
   private spinnerIndex = 0;
   private spinnerInterval: NodeJS.Timeout | null = null;
   private lastDetailIdentity: string | null = null;
+  private lastDetailAnchorKey: string | null = null;
   private detailVisible = false;
 
   constructor(private readonly controller: TuiController) {
@@ -187,7 +188,7 @@ export class BlessedTuiRenderer {
     this.messageBox.setContent(
       `${keyLabel("STATUS")} ${statusTone}${listSummary ? `  ${listSummary}` : ""}\n${keyLabel("ACTIONS")} ${formatActionBar(
         model.footer.actions,
-      )}  ${keyLabel("KEYS")} ${model.footer.hintText}`,
+      )}  ${keyLabel("KEYS")} ${model.footer.hintText}${model.footer.autoUpdateHint ? `  ${keyLabel("AUTO")} ${text(model.footer.autoUpdateHint, "dim")}` : ""}`,
     );
     const promptPrefix = `${keyLabel("QUERY")} ${text(model.footer.queryPrompt.toUpperCase(), "dim")} >`;
     const queryValue =
@@ -248,8 +249,16 @@ export class BlessedTuiRenderer {
     ) {
       this.detailBox.setScroll(0);
     }
+    if (
+      model.showDetail &&
+      model.detailAnchorKey &&
+      this.lastDetailAnchorKey !== model.detailAnchorKey
+    ) {
+      this.detailBox.setScroll(model.detailAnchorLine ?? 0);
+    }
     this.detailVisible = model.showDetail;
     this.lastDetailIdentity = model.detailIdentity;
+    this.lastDetailAnchorKey = model.detailAnchorKey;
   }
 
   private startSpinner(message: string): void {
@@ -278,6 +287,8 @@ export class BlessedTuiRenderer {
     ch: string,
     key: blessed.Widgets.Events.IKeyEventArg,
   ): Promise<void> {
+    this.controller.noteInteraction();
+
     if (this.controller.isQueryFocus()) {
       if (key.name === "escape") {
         this.controller.stopQueryEntry();
@@ -396,6 +407,22 @@ export class BlessedTuiRenderer {
     }
     if (key.name === "c") {
       await this.controller.clusterSelected();
+      return;
+    }
+    if (key.name === "v") {
+      await this.controller.markSeenSelected();
+      return;
+    }
+    if (key.name === "w") {
+      await this.controller.toggleWatchSelected();
+      return;
+    }
+    if (key.name === "i") {
+      await this.controller.toggleIgnoreSelected();
+      return;
+    }
+    if (key.name === "u") {
+      await this.controller.clearSelectedAttentionState();
       return;
     }
     if (key.name === "s" && key.shift) {

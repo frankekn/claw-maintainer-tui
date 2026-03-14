@@ -31,6 +31,8 @@ export type PullRequestLinkSource =
   | "title_reference";
 export type PullRequestChangedFileKind = "prod" | "test" | "other";
 export type ReviewFactDecision = "ready" | "needs_work" | "blocked";
+export type AttentionState = "seen" | "watch" | "ignore";
+export type PriorityAttentionState = AttentionState | "new";
 export type ClusterMatchSource =
   | "linked_issue"
   | "live_issue_search"
@@ -118,6 +120,32 @@ export type SearchResult = {
   score: number;
   matchedDocKind: SearchDocKind;
   matchedExcerpt: string;
+};
+
+export type PriorityReasonType =
+  | "watch"
+  | "freshness"
+  | "linked_issue"
+  | "related_pr"
+  | "hub_bonus";
+
+export type PriorityReason = {
+  type: PriorityReasonType;
+  label: string;
+  points: number;
+};
+
+export type PriorityCandidate = {
+  pr: SearchResult;
+  attentionState: PriorityAttentionState;
+  score: number;
+  reasons: PriorityReason[];
+  linkedIssueCount: number;
+  relatedPullRequestCount: number;
+  badges: {
+    draft: boolean;
+    maintainer: boolean;
+  };
 };
 
 export type PullRequestLinkedIssue = {
@@ -394,6 +422,33 @@ export type SyncSummary = {
   vectorAvailable: boolean;
   lastSyncAt: string;
   lastSyncWatermark: string;
+};
+
+export type SyncProgressEvent = {
+  entity: "prs" | "issues";
+  phase: "discovering" | "syncing" | "complete";
+  processed: number;
+  skipped: number;
+  queued: number;
+  totalKnown: number | null;
+  currentId: number | null;
+  currentTitle: string | null;
+};
+
+export type PrContextBundle = {
+  candidate: PriorityCandidate;
+  comments: Array<{
+    kind: string;
+    author: string;
+    createdAt: string;
+    url: string;
+    excerpt: string;
+  }>;
+  linkedIssues: IssueSearchResult[];
+  relatedPullRequests: SearchResult[];
+  cluster: ClusterPullRequestAnalysis | null;
+  latestReviewFact: PullRequestReviewFact | null;
+  mergeReadiness: MergeReadiness | null;
 };
 
 export interface PullRequestDataSource {
