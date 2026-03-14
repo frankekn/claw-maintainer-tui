@@ -322,9 +322,7 @@ export class TuiController {
 
   moveSelection(delta: number): void {
     if (this.focus === "nav") {
-      const currentIndex = TUI_MODE_ORDER.findIndex((mode) => mode.id === this.mode);
-      const nextIndex = Math.max(0, Math.min(TUI_MODE_ORDER.length - 1, currentIndex + delta));
-      this.activateMode(TUI_MODE_ORDER[nextIndex]!.id);
+      this.moveMode(delta);
       return;
     }
     if (this.focus !== "results" || this.rows.length === 0) {
@@ -336,6 +334,12 @@ export class TuiController {
     if (this.showDetail) {
       void this.refreshDetailForSelection(true);
     }
+  }
+
+  moveMode(delta: number): void {
+    const currentIndex = TUI_MODE_ORDER.findIndex((mode) => mode.id === this.mode);
+    const nextIndex = Math.max(0, Math.min(TUI_MODE_ORDER.length - 1, currentIndex + delta));
+    this.activateMode(TUI_MODE_ORDER[nextIndex]!.id);
   }
 
   async submitQuery(value: string): Promise<void> {

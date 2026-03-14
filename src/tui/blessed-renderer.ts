@@ -160,25 +160,17 @@ export class BlessedTuiRenderer {
   }
 
   private render(model: TuiRenderModel): void {
-    (this.screen as blessed.Widgets.Screen & {
-      clearRegion: (
-        xi: number,
-        xl: number,
-        yi: number,
-        yl: number,
-        override?: boolean,
-      ) => void;
-    }).clearRegion(0, this.screen.cols, 0, this.screen.rows, true);
+    (this.screen as blessed.Widgets.Screen & { realloc: () => void }).realloc();
     this.headerBox.setContent(formatHeader(model.header));
     this.tabsBox.setLabel(panelLabel("MODES", model.focus === "nav"));
     this.tabsBox.setContent(formatModeTabs(model.mode, model.focus));
+    this.layoutDetail(model);
     this.resultsBox.setLabel(
       panelLabel(
         `${model.resultTitle.toUpperCase()}${model.listSummary ? ` · ${model.listSummary.yieldLabel}` : ""}`,
         model.focus === "results",
       ),
     );
-    this.layoutDetail(model);
     this.resultsBox.setContent(formatResults(model).join("\n"));
     this.detailBox.setLabel(panelLabel(model.detailTitle.toUpperCase(), model.showDetail));
     const detailContent = model.detailStatus
@@ -373,6 +365,14 @@ export class BlessedTuiRenderer {
     }
     if (key.name === "tab") {
       this.controller.focusNext();
+      return;
+    }
+    if (key.name === "left") {
+      this.controller.moveMode(-1);
+      return;
+    }
+    if (key.name === "right") {
+      this.controller.moveMode(1);
       return;
     }
     if (
