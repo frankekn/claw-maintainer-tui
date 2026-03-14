@@ -115,6 +115,60 @@ export type TuiContext =
   | { kind: "issue"; issueNumber: number }
   | null;
 
+export type TuiDetailPayload =
+  | { kind: "landing"; mode: TuiMode; status: StatusSnapshot | null }
+  | { kind: "pr"; bundle: PrContextBundle }
+  | { kind: "issue"; issue: IssueSearchResult }
+  | { kind: "status"; status: StatusSnapshot | null };
+
+export type TuiDetailState = {
+  visible: boolean;
+  payload: TuiDetailPayload;
+  status: string | null;
+  identity: string | null;
+  focusSection: TuiDetailSection | null;
+  anchorKey: string | null;
+};
+
+export type TuiSessionState = {
+  mode: TuiMode;
+  focus: TuiFocus;
+  rows: TuiResultRow[];
+  selectedIndex: number;
+  activeUrl: string | null;
+  query: string;
+  context: TuiContext;
+  resultTitle: string;
+  message: string;
+  errorMessage: string | null;
+  browseLimit: number;
+  isLandingView: boolean;
+  history: TuiViewSnapshot[];
+};
+
+export type TuiCommand =
+  | { type: "focus_next" }
+  | { type: "focus_results" }
+  | { type: "activate_mode"; delta: number }
+  | { type: "move_selection"; delta: number }
+  | { type: "toggle_detail" }
+  | { type: "jump_detail_section"; section: Extract<TuiDetailSection, "linked-issues" | "cluster"> }
+  | { type: "start_query" }
+  | { type: "stop_query" }
+  | { type: "append_query"; value: string }
+  | { type: "backspace_query" }
+  | { type: "submit_query" }
+  | { type: "trigger_action"; slot: number }
+  | { type: "go_back" }
+  | { type: "mark_seen" }
+  | { type: "toggle_watch" }
+  | { type: "toggle_ignore" }
+  | { type: "clear_attention_state" }
+  | { type: "sync_prs" }
+  | { type: "sync_issues" }
+  | { type: "refresh_selected" }
+  | { type: "load_more" };
+
 export type TuiHeaderModel = {
   repo: string;
   dbPath: string;
@@ -138,27 +192,39 @@ export type TuiFooterModel = {
   autoUpdateHint: string | null;
 };
 
+export type TuiLayoutMode = "single-pane" | "split-pane";
+
+export type TuiResultsPaneModel = {
+  title: string;
+  summary: TuiListSummary | null;
+  rows: TuiResultRow[];
+  selectedIndex: number;
+  lines: string[];
+};
+
+export type TuiDetailPaneModel = {
+  visible: boolean;
+  title: string;
+  status: string | null;
+  lines: string[];
+  identity: string | null;
+  anchorLine: number | null;
+  anchorKey: string | null;
+};
+
 export type TuiRenderModel = {
   header: TuiHeaderModel;
   footer: TuiFooterModel;
   mode: TuiMode;
   focus: TuiFocus;
-  rows: TuiResultRow[];
-  selectedIndex: number;
-  detailText: string;
-  detailStatus: string | null;
-  detailIdentity: string | null;
-  detailAnchorLine: number | null;
-  detailAnchorKey: string | null;
-  showDetail: boolean;
+  layoutMode: TuiLayoutMode;
+  resultsPane: TuiResultsPaneModel;
+  detailPane: TuiDetailPaneModel;
   activeUrl: string | null;
   query: string;
-  resultTitle: string;
-  detailTitle: string;
   context: TuiContext;
   queryPlaceholder: string;
   busy: boolean;
-  listSummary: TuiListSummary | null;
 };
 
 export interface TuiDataService {
@@ -204,19 +270,6 @@ export interface TuiDataService {
 }
 
 export type TuiViewSnapshot = {
-  mode: TuiMode;
-  query: string;
-  rows: TuiResultRow[];
-  selectedIndex: number;
-  detailText: string;
-  detailStatus: string | null;
-  detailIdentity: string | null;
-  detailAnchorLine: number | null;
-  detailAnchorKey: string | null;
-  showDetail: boolean;
-  activeUrl: string | null;
-  detailTitle: string;
-  resultTitle: string;
-  context: TuiContext;
-  isLandingView: boolean;
+  session: Omit<TuiSessionState, "history">;
+  detail: TuiDetailState;
 };

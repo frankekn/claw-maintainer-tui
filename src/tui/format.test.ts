@@ -186,18 +186,18 @@ describe("tui formatting", () => {
     expect(row).toContain("I2 R3");
 
     const detail = formatPriorityPrDetail(makeBundle(), "linked-issues");
-    expect(detail.text).toContain("WHY PRIORITIZED");
-    expect(detail.text).toContain("LINKED ISSUES");
-    expect(detail.text).toContain("MAINTAINER STATE");
+    expect(detail.lines.join("\n")).toContain("WHY PRIORITIZED");
+    expect(detail.lines.join("\n")).toContain("LINKED ISSUES");
+    expect(detail.lines.join("\n")).toContain("MAINTAINER STATE");
     expect(detail.anchorLine).not.toBeNull();
   });
 
   it("formats Inbox landing copy and mode tabs", () => {
     const detail = formatInboxLandingDetail(status, new Date("2026-03-11T08:28:13.832Z"));
 
-    expect(detail).toContain("START HERE");
-    expect(detail).toContain("single priority queue");
-    expect(detail).toContain("v / w / i / u");
+    expect(detail.join("\n")).toContain("START HERE");
+    expect(detail.join("\n")).toContain("single priority queue");
+    expect(detail.join("\n")).toContain("v / w / i / u");
 
     const tabs = formatModeTabs("inbox", "nav");
     expect(tabs).toContain("Inbox");
@@ -207,9 +207,9 @@ describe("tui formatting", () => {
 
   it("formats status detail, status rows, summaries, and hints", () => {
     const detail = formatStatusDetail(status, new Date("2026-03-11T08:28:13.832Z"));
-    expect(detail).toContain("INDEX");
-    expect(detail).toContain("vector");
-    expect(detail).toContain("ready");
+    expect(detail.join("\n")).toContain("INDEX");
+    expect(detail.join("\n")).toContain("vector");
+    expect(detail.join("\n")).toContain("ready");
 
     expect(buildStatusRows(status)).toEqual([
       { kind: "status", label: "{#9fb0c4-fg}PRs{/}", value: "{#4fd1a1-fg}23935{/}" },

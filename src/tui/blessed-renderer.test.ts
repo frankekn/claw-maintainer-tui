@@ -27,53 +27,34 @@ const renderModel: TuiRenderModel = {
   },
   mode: "inbox",
   focus: "results",
-  rows: [],
-  selectedIndex: 0,
-  detailText: "",
-  detailStatus: null,
-  detailIdentity: null,
-  detailAnchorLine: null,
-  detailAnchorKey: null,
-  showDetail: false,
+  layoutMode: "single-pane",
+  resultsPane: {
+    title: "Inbox",
+    summary: null,
+    rows: [],
+    selectedIndex: 0,
+    lines: [],
+  },
+  detailPane: {
+    visible: false,
+    title: "Start Here",
+    status: null,
+    lines: [],
+    identity: null,
+    anchorLine: null,
+    anchorKey: null,
+  },
   activeUrl: null,
   query: "",
-  resultTitle: "Inbox",
-  detailTitle: "Start Here",
   context: null,
   queryPlaceholder: "",
   busy: false,
-  listSummary: null,
 };
 
 function createControllerStub() {
   return {
     noteInteraction: vi.fn(),
-    isQueryFocus: vi.fn(() => false),
-    isDetailFocus: vi.fn(() => false),
-    isNavFocus: vi.fn(() => false),
-    stopQueryEntry: vi.fn(),
-    focusNext: vi.fn(),
-    submitCurrentQuery: vi.fn(),
-    backspaceQuery: vi.fn(),
-    appendQueryCharacter: vi.fn(),
-    focusResults: vi.fn(),
-    triggerAction: vi.fn(),
-    moveMode: vi.fn(),
-    moveSelection: vi.fn(),
-    openSelected: vi.fn(),
-    canStartSlashQuery: vi.fn(() => false),
-    startQueryEntry: vi.fn(),
-    goBack: vi.fn(),
-    crossReferenceSelected: vi.fn(),
-    clusterSelected: vi.fn(),
-    markSeenSelected: vi.fn(),
-    toggleWatchSelected: vi.fn(),
-    toggleIgnoreSelected: vi.fn(),
-    clearSelectedAttentionState: vi.fn(),
-    syncIssues: vi.fn(),
-    syncPrs: vi.fn(),
-    refreshSelected: vi.fn(),
-    loadMore: vi.fn(),
+    dispatch: vi.fn(async () => {}),
     getActiveUrl: vi.fn(() => null),
     subscribe: vi.fn(() => () => {}),
     getRenderModel: vi.fn(() => renderModel),
@@ -111,14 +92,20 @@ describe("BlessedTuiRenderer", () => {
     const controller = createControllerStub();
     const renderer = new BlessedTuiRenderer(controller as never);
     const harness = renderer as unknown as RendererHarness & {
-      screen: blessed.Widgets.Screen & { realloc: () => void };
+      screen: blessed.Widgets.Screen & {
+        realloc: () => void;
+        program: { clearScreen: () => void };
+      };
     };
     renderers.push(harness);
     const reallocSpy = vi.spyOn(harness.screen, "realloc");
+    const clearScreenSpy = vi.fn();
+    Object.assign(harness.screen.program, { clearScreen: clearScreenSpy });
 
     harness.render(renderModel);
 
     expect(reallocSpy).toHaveBeenCalledTimes(1);
+    expect(clearScreenSpy).toHaveBeenCalledTimes(1);
   });
 
   it("routes v/w/i/u shortcuts to triage actions", async () => {
@@ -132,10 +119,10 @@ describe("BlessedTuiRenderer", () => {
     await harness.handleKeypress("i", { name: "i" } as blessed.Widgets.Events.IKeyEventArg);
     await harness.handleKeypress("u", { name: "u" } as blessed.Widgets.Events.IKeyEventArg);
 
-    expect(controller.markSeenSelected).toHaveBeenCalledTimes(1);
-    expect(controller.toggleWatchSelected).toHaveBeenCalledTimes(1);
-    expect(controller.toggleIgnoreSelected).toHaveBeenCalledTimes(1);
-    expect(controller.clearSelectedAttentionState).toHaveBeenCalledTimes(1);
+    expect(controller.dispatch).toHaveBeenNthCalledWith(1, { type: "mark_seen" });
+    expect(controller.dispatch).toHaveBeenNthCalledWith(2, { type: "toggle_watch" });
+    expect(controller.dispatch).toHaveBeenNthCalledWith(3, { type: "toggle_ignore" });
+    expect(controller.dispatch).toHaveBeenNthCalledWith(4, { type: "clear_attention_state" });
   });
 
   it("routes left and right arrows to mode changes from non-query focus", async () => {
@@ -147,7 +134,20 @@ describe("BlessedTuiRenderer", () => {
     await harness.handleKeypress("", { name: "left" } as blessed.Widgets.Events.IKeyEventArg);
     await harness.handleKeypress("", { name: "right" } as blessed.Widgets.Events.IKeyEventArg);
 
-    expect(controller.moveMode).toHaveBeenNthCalledWith(1, -1);
-    expect(controller.moveMode).toHaveBeenNthCalledWith(2, 1);
+    expect(controller.dispatch).toHaveBeenNthCalledWith(1, { type: "activate_mode", delta: -1 });
+    expect(controller.dispatch).toHaveBeenNthCalledWith(2, { type: "activate_mode", delta: 1 });
+  });
+
+  it("deduplicates enter and return keypresses fired back-to-back", async () => {
+    const controller = createControllerStub();
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness;
+    renderers.push(harness);
+
+    await harness.handleKeypress("", { name: "enter" } as blessed.Widgets.Events.IKeyEventArg);
+    await harness.handleKeypress("", { name: "return" } as blessed.Widgets.Events.IKeyEventArg);
+
+    expect(controller.dispatch).toHaveBeenCalledTimes(1);
+    expect(controller.dispatch).toHaveBeenCalledWith({ type: "toggle_detail" });
   });
 });

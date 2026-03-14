@@ -7,11 +7,11 @@ import {
   formatHeader,
   formatListSummary,
   formatModeTabs,
-  formatResults,
 } from "./format.js";
+import { resolveKeyAction } from "./keymap.js";
 import { TUI_THEME, keyLabel, panelLabel, text, valueTone } from "./theme.js";
 import type { TuiController } from "./controller.js";
-import type { TuiRenderModel } from "./types.js";
+import type { TuiLayoutMode, TuiRenderModel } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -27,8 +27,10 @@ export class BlessedTuiRenderer {
   });
   private readonly headerBox: Box;
   private readonly tabsBox: Box;
-  private readonly resultsBox: Box;
-  private readonly detailBox: Box;
+  private readonly bodyBox: Box;
+  private bodyFrame: Box;
+  private resultsBox: Box;
+  private detailBox: Box;
   private readonly messageBox: Box;
   private readonly inputBox: Box;
   private readonly modalBox: Box;
@@ -37,6 +39,9 @@ export class BlessedTuiRenderer {
   private lastDetailIdentity: string | null = null;
   private lastDetailAnchorKey: string | null = null;
   private detailVisible = false;
+  private layoutMode: TuiLayoutMode = "single-pane";
+  private lastSubmitKeyName: "enter" | "return" | null = null;
+  private lastSubmitKeyAt = 0;
 
   constructor(private readonly controller: TuiController) {
     this.headerBox = blessed.box({
@@ -64,42 +69,16 @@ export class BlessedTuiRenderer {
       },
       padding: { left: 1, right: 1 },
     });
-    this.resultsBox = blessed.box({
+    this.bodyBox = blessed.box({
       parent: this.screen,
       top: TUI_THEME.layout.headerHeight + TUI_THEME.layout.tabsHeight,
       left: 0,
       width: "100%",
       bottom: TUI_THEME.layout.footerHeight + TUI_THEME.layout.queryHeight,
-      tags: true,
-      border: "line",
-      wrap: false,
-      scrollable: true,
-      alwaysScroll: true,
-      style: {
-        border: { fg: TUI_THEME.colors.border },
-        fg: TUI_THEME.colors.text,
-        bg: TUI_THEME.colors.panelBg,
-      },
-      padding: { left: 1, right: 1 },
     });
-    this.detailBox = blessed.box({
-      parent: this.screen,
-      top: TUI_THEME.layout.headerHeight + TUI_THEME.layout.tabsHeight,
-      left: TUI_THEME.layout.resultsWidthWithDetail,
-      width: TUI_THEME.layout.detailWidth,
-      bottom: TUI_THEME.layout.footerHeight + TUI_THEME.layout.queryHeight,
-      tags: true,
-      border: "line",
-      scrollable: true,
-      alwaysScroll: true,
-      style: {
-        border: { fg: TUI_THEME.colors.borderSoft },
-        fg: TUI_THEME.colors.text,
-        bg: TUI_THEME.colors.panelBg,
-      },
-      padding: { left: 1, right: 1 },
-      hidden: true,
-    });
+    this.bodyFrame = this.createBodyFrame();
+    this.resultsBox = this.createResultsBox(this.bodyFrame, "single-pane");
+    this.detailBox = this.createDetailBox(this.bodyFrame, "single-pane");
     this.messageBox = blessed.box({
       parent: this.screen,
       bottom: TUI_THEME.layout.queryHeight,
@@ -161,30 +140,43 @@ export class BlessedTuiRenderer {
 
   private render(model: TuiRenderModel): void {
     (this.screen as blessed.Widgets.Screen & { realloc: () => void }).realloc();
+    this.screen.clearRegion(0, this.screen.cols, 0, this.screen.rows);
+    (
+      this.screen as blessed.Widgets.Screen & {
+        program?: { clearScreen?: () => void };
+      }
+    ).program?.clearScreen?.();
+    const layoutChanged = this.transitionLayout(model.layoutMode);
     this.headerBox.setContent(formatHeader(model.header));
     this.tabsBox.setLabel(panelLabel("MODES", model.focus === "nav"));
     this.tabsBox.setContent(formatModeTabs(model.mode, model.focus));
-    this.layoutDetail(model);
     this.resultsBox.setLabel(
       panelLabel(
-        `${model.resultTitle.toUpperCase()}${model.listSummary ? ` · ${model.listSummary.yieldLabel}` : ""}`,
+        `${model.resultsPane.title.toUpperCase()}${model.resultsPane.summary ? ` · ${model.resultsPane.summary.yieldLabel}` : ""}`,
         model.focus === "results",
       ),
     );
-    this.resultsBox.setContent(formatResults(model).join("\n"));
-    this.detailBox.setLabel(panelLabel(model.detailTitle.toUpperCase(), model.showDetail));
-    const detailContent = model.detailStatus
-      ? `${formatDetailStatus(model.detailStatus)}\n\n${model.detailText}`
-      : model.detailText;
-    this.detailBox.setContent(detailContent);
+    this.resultsBox.setContent(model.resultsPane.lines.join("\n"));
+    if (model.detailPane.visible) {
+      this.detailBox.setLabel(
+        panelLabel(model.detailPane.title.toUpperCase(), model.detailPane.visible),
+      );
+      const detailContent = model.detailPane.status
+        ? `${formatDetailStatus(model.detailPane.status)}\n\n${model.detailPane.lines.join("\n")}`
+        : model.detailPane.lines.join("\n");
+      this.detailBox.setContent(detailContent);
+    } else {
+      this.detailBox.setLabel("");
+      this.detailBox.setContent("");
+    }
 
     const statusTone = model.header.errorMessage
       ? valueTone(model.footer.message, "error")
       : model.busy
         ? valueTone(model.footer.message, "warn")
         : text(model.footer.message, "muted");
-    const listSummary = model.listSummary
-      ? `${keyLabel("HITS")} ${formatListSummary(model.listSummary)}`
+    const listSummary = model.resultsPane.summary
+      ? `${keyLabel("HITS")} ${formatListSummary(model.resultsPane.summary)}`
       : "";
     this.messageBox.setContent(
       `${keyLabel("STATUS")} ${statusTone}${listSummary ? `  ${listSummary}` : ""}\n${keyLabel("ACTIONS")} ${formatActionBar(
@@ -208,20 +200,79 @@ export class BlessedTuiRenderer {
       this.stopSpinner();
     }
     this.screen.render();
+    if (layoutChanged) {
+      this.screen.render();
+    }
   }
 
-  private layoutDetail(model: TuiRenderModel): void {
-    if (model.showDetail) {
-      this.resultsBox.left = 0;
+  private createBodyFrame(): Box {
+    return blessed.box({
+      parent: this.bodyBox,
+      top: 0,
+      left: 0,
+      width: "100%",
+      height: "100%",
+    });
+  }
+
+  private createResultsBox(parent: Box, layoutMode: TuiLayoutMode): Box {
+    return blessed.box({
+      parent,
+      top: 0,
+      left: 0,
+      width: layoutMode === "split-pane" ? TUI_THEME.layout.resultsWidthWithDetail : "100%",
+      height: "100%",
+      tags: true,
+      border: "line",
+      wrap: false,
+      scrollable: true,
+      alwaysScroll: true,
+      style: {
+        border: { fg: TUI_THEME.colors.border },
+        fg: TUI_THEME.colors.text,
+        bg: TUI_THEME.colors.panelBg,
+      },
+      padding: { left: 1, right: 1 },
+    });
+  }
+
+  private createDetailBox(parent: Box, layoutMode: TuiLayoutMode): Box {
+    return blessed.box({
+      parent,
+      top: 0,
+      left: TUI_THEME.layout.resultsWidthWithDetail,
+      width: TUI_THEME.layout.detailWidth,
+      height: "100%",
+      tags: true,
+      border: "line",
+      scrollable: true,
+      alwaysScroll: true,
+      hidden: layoutMode === "single-pane",
+      style: {
+        border: { fg: TUI_THEME.colors.borderSoft },
+        fg: TUI_THEME.colors.text,
+        bg: TUI_THEME.colors.panelBg,
+      },
+      padding: { left: 1, right: 1 },
+    });
+  }
+
+  private transitionLayout(nextLayoutMode: TuiLayoutMode): boolean {
+    if (this.layoutMode === nextLayoutMode) {
+      return false;
+    }
+    if (nextLayoutMode === "split-pane") {
       this.resultsBox.width = TUI_THEME.layout.resultsWidthWithDetail;
       this.detailBox.left = TUI_THEME.layout.resultsWidthWithDetail;
       this.detailBox.width = TUI_THEME.layout.detailWidth;
       this.detailBox.show();
-      return;
+    } else {
+      this.resultsBox.width = "100%";
+      this.detailBox.setContent("");
+      this.detailBox.hide();
     }
-    this.resultsBox.left = 0;
-    this.resultsBox.width = "100%";
-    this.detailBox.hide();
+    this.layoutMode = nextLayoutMode;
+    return true;
   }
 
   private updateFocusStyle(model: TuiRenderModel): void {
@@ -230,9 +281,9 @@ export class BlessedTuiRenderer {
     this.resultsBox.style.border.fg =
       model.focus === "results" ? TUI_THEME.colors.focus : TUI_THEME.colors.border;
     this.detailBox.style.border.fg =
-      model.showDetail && model.focus === "detail"
+      model.detailPane.visible && model.focus === "detail"
         ? TUI_THEME.colors.focus
-        : model.showDetail
+        : model.detailPane.visible
           ? TUI_THEME.colors.border
           : TUI_THEME.colors.borderSoft;
     this.messageBox.style.bg = model.busy
@@ -243,23 +294,23 @@ export class BlessedTuiRenderer {
   }
 
   private syncScroll(model: TuiRenderModel): void {
-    this.resultsBox.setScroll(Math.max(0, model.selectedIndex - 4));
+    this.resultsBox.setScroll(Math.max(0, model.resultsPane.selectedIndex - 4));
     if (
-      model.showDetail &&
-      (!this.detailVisible || this.lastDetailIdentity !== model.detailIdentity)
+      model.detailPane.visible &&
+      (!this.detailVisible || this.lastDetailIdentity !== model.detailPane.identity)
     ) {
       this.detailBox.setScroll(0);
     }
     if (
-      model.showDetail &&
-      model.detailAnchorKey &&
-      this.lastDetailAnchorKey !== model.detailAnchorKey
+      model.detailPane.visible &&
+      model.detailPane.anchorKey &&
+      this.lastDetailAnchorKey !== model.detailPane.anchorKey
     ) {
-      this.detailBox.setScroll(model.detailAnchorLine ?? 0);
+      this.detailBox.setScroll(model.detailPane.anchorLine ?? 0);
     }
-    this.detailVisible = model.showDetail;
-    this.lastDetailIdentity = model.detailIdentity;
-    this.lastDetailAnchorKey = model.detailAnchorKey;
+    this.detailVisible = model.detailPane.visible;
+    this.lastDetailIdentity = model.detailPane.identity;
+    this.lastDetailAnchorKey = model.detailPane.anchorKey;
   }
 
   private startSpinner(message: string): void {
@@ -288,170 +339,40 @@ export class BlessedTuiRenderer {
     ch: string,
     key: blessed.Widgets.Events.IKeyEventArg,
   ): Promise<void> {
-    this.controller.noteInteraction();
-
-    if (this.controller.isQueryFocus()) {
-      if (key.name === "escape") {
-        this.controller.stopQueryEntry();
-        return;
-      }
-      if (key.name === "tab") {
-        this.controller.focusNext();
-        return;
-      }
-      if (key.name === "enter" || key.name === "return") {
-        await this.controller.submitCurrentQuery();
-        return;
-      }
-      if (key.name === "backspace" || key.name === "delete") {
-        this.controller.backspaceQuery();
-        return;
-      }
-      if (!key.ctrl && !key.meta && ch && ch >= " ") {
-        this.controller.appendQueryCharacter(ch);
-      }
+    if (this.isDuplicateSubmitKey(key)) {
       return;
     }
-
-    if (this.controller.isDetailFocus()) {
-      if (key.name === "escape") {
-        this.controller.focusResults();
+    this.controller.noteInteraction();
+    const action = resolveKeyAction(this.controller.getRenderModel(), ch, key);
+    switch (action.kind) {
+      case "command":
+        await this.controller.dispatch(action.command);
         return;
-      }
-      if (key.name === "tab") {
-        this.controller.focusNext();
-        return;
-      }
-      if (key.name === "up" || key.name === "k") {
-        this.detailBox.scroll(-1);
+      case "detail-scroll":
+        this.detailBox.scroll(action.delta);
         this.screen.render();
         return;
-      }
-      if (key.name === "down" || key.name === "j") {
-        this.detailBox.scroll(1);
+      case "detail-page":
+        this.detailBox.scroll((Number(this.detailBox.height) || 10) * action.delta);
         this.screen.render();
         return;
-      }
-      if (key.name === "pageup") {
-        this.detailBox.scroll(-(Number(this.detailBox.height) || 10));
-        this.screen.render();
-        return;
-      }
-      if (key.name === "pagedown") {
-        this.detailBox.scroll(Number(this.detailBox.height) || 10);
-        this.screen.render();
-        return;
-      }
-      if (key.name === "home") {
+      case "detail-home":
         this.detailBox.setScroll(0);
         this.screen.render();
         return;
-      }
-      if (key.name === "end") {
+      case "detail-end":
         this.detailBox.setScrollPerc(100);
         this.screen.render();
         return;
-      }
-    }
-
-    if (ch && /^[1-9]$/.test(ch)) {
-      await this.controller.triggerAction(Number(ch));
-      return;
-    }
-
-    if (key.name === "q") {
-      this.screen.destroy();
-      return;
-    }
-    if (key.name === "tab") {
-      this.controller.focusNext();
-      return;
-    }
-    if (key.name === "left") {
-      this.controller.moveMode(-1);
-      return;
-    }
-    if (key.name === "right") {
-      this.controller.moveMode(1);
-      return;
-    }
-    if (
-      key.name === "up" ||
-      key.name === "k" ||
-      (this.controller.isNavFocus() && (key.name === "left" || key.name === "h"))
-    ) {
-      void this.controller.moveSelection(-1);
-      return;
-    }
-    if (
-      key.name === "down" ||
-      key.name === "j" ||
-      (this.controller.isNavFocus() && (key.name === "right" || key.name === "l"))
-    ) {
-      void this.controller.moveSelection(1);
-      return;
-    }
-    if (key.name === "enter" || key.name === "return") {
-      if (this.controller.isNavFocus()) {
-        await this.controller.triggerAction(1);
+      case "quit":
+        this.screen.destroy();
         return;
-      }
-      await this.controller.openSelected();
-      return;
-    }
-    if (
-      (ch === "/" || key.full === "/" || key.name === "slash") &&
-      this.controller.canStartSlashQuery()
-    ) {
-      this.controller.startQueryEntry();
-      return;
-    }
-    if (key.name === "b") {
-      this.controller.goBack();
-      return;
-    }
-    if (key.name === "x") {
-      await this.controller.crossReferenceSelected();
-      return;
-    }
-    if (key.name === "c") {
-      await this.controller.clusterSelected();
-      return;
-    }
-    if (key.name === "v") {
-      await this.controller.markSeenSelected();
-      return;
-    }
-    if (key.name === "w") {
-      await this.controller.toggleWatchSelected();
-      return;
-    }
-    if (key.name === "i") {
-      await this.controller.toggleIgnoreSelected();
-      return;
-    }
-    if (key.name === "u") {
-      await this.controller.clearSelectedAttentionState();
-      return;
-    }
-    if (key.name === "s" && key.shift) {
-      await this.controller.syncIssues();
-      return;
-    }
-    if (key.name === "s") {
-      await this.controller.syncPrs();
-      return;
-    }
-    if (key.name === "r") {
-      await this.controller.refreshSelected();
-      return;
-    }
-    if (key.name === "m") {
-      await this.controller.loadMore();
-      return;
-    }
-    if (key.name === "o") {
-      await this.openActiveUrl();
+      case "open-url":
+        await this.openActiveUrl();
+        return;
+      case "noop":
+      default:
+        return;
     }
   }
 
@@ -465,5 +386,21 @@ export class BlessedTuiRenderer {
     } catch {
       return;
     }
+  }
+
+  private isDuplicateSubmitKey(key: blessed.Widgets.Events.IKeyEventArg): boolean {
+    if (key.name !== "enter" && key.name !== "return") {
+      this.lastSubmitKeyName = null;
+      this.lastSubmitKeyAt = 0;
+      return false;
+    }
+    const now = Date.now();
+    const isDuplicate =
+      this.lastSubmitKeyName !== null &&
+      this.lastSubmitKeyName !== key.name &&
+      now - this.lastSubmitKeyAt < 75;
+    this.lastSubmitKeyName = key.name;
+    this.lastSubmitKeyAt = now;
+    return isDuplicate;
   }
 }

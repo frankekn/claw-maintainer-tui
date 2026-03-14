@@ -189,9 +189,11 @@ class FakeTuiDataService implements TuiDataService {
   syncBlocked = false;
   blockSyncPrs = false;
   blockPriorityQueue = false;
+  blockPrContextBundle = false;
   private syncPrsRelease: (() => void) | null = null;
   private refreshPrRelease: (() => void) | null = null;
   private priorityQueueRelease: (() => void) | null = null;
+  private prContextBundleRelease: (() => void) | null = null;
 
   async status() {
     return this.statusSnapshot;
@@ -245,6 +247,11 @@ class FakeTuiDataService implements TuiDataService {
   }
 
   async getPrContextBundle(prNumber: number) {
+    if (this.blockPrContextBundle) {
+      await new Promise<void>((resolve) => {
+        this.prContextBundleRelease = resolve;
+      });
+    }
     return makeBundle(prNumber, this.attentionState.get(prNumber) ?? "new");
   }
 
@@ -369,6 +376,11 @@ class FakeTuiDataService implements TuiDataService {
     this.priorityQueueRelease?.();
     this.priorityQueueRelease = null;
   }
+
+  releasePrContextBundle(): void {
+    this.prContextBundleRelease?.();
+    this.prContextBundleRelease = null;
+  }
 }
 
 async function flushMicrotasks(rounds = 4): Promise<void> {
@@ -394,9 +406,9 @@ describe("TuiController", () => {
 
     const model = controller.getRenderModel();
     expect(model.mode).toBe("inbox");
-    expect(model.resultTitle).toBe("Inbox");
-    expect(model.rows).toHaveLength(20);
-    expect(model.detailText).toContain("Inbox ranks PRs");
+    expect(model.resultsPane.title).toBe("Inbox");
+    expect(model.resultsPane.rows).toHaveLength(20);
+    expect(model.detailPane.lines.join("\n")).toContain("Inbox ranks PRs");
     expect(service.priorityQueueCalls).toEqual([{ limit: 20, scanLimit: 300 }]);
   });
 
@@ -413,10 +425,10 @@ describe("TuiController", () => {
     await flushMicrotasks();
 
     const model = controller.getRenderModel();
-    expect(model.showDetail).toBe(true);
-    expect(model.detailTitle).toBe("PR #41793");
-    expect(model.detailText).toContain("WHY PRIORITIZED");
-    expect(model.detailText).toContain("LINKED ISSUES");
+    expect(model.detailPane.visible).toBe(true);
+    expect(model.detailPane.title).toBe("PR #41793");
+    expect(model.detailPane.lines.join("\n")).toContain("WHY PRIORITIZED");
+    expect(model.detailPane.lines.join("\n")).toContain("LINKED ISSUES");
 
     service.releaseRefreshPr();
     await openPromise;
@@ -435,15 +447,15 @@ describe("TuiController", () => {
 
     let model = controller.getRenderModel();
     expect(model.mode).toBe("inbox");
-    expect(model.showDetail).toBe(true);
-    expect(model.detailAnchorKey).not.toBeNull();
-    expect(model.detailText).toContain("LINKED ISSUES");
+    expect(model.detailPane.visible).toBe(true);
+    expect(model.detailPane.anchorKey).not.toBeNull();
+    expect(model.detailPane.lines.join("\n")).toContain("LINKED ISSUES");
 
     await controller.clusterSelected();
     model = controller.getRenderModel();
     expect(model.mode).toBe("inbox");
-    expect(model.detailAnchorKey).not.toBeNull();
-    expect(model.detailText).toContain("CLUSTER");
+    expect(model.detailPane.anchorKey).not.toBeNull();
+    expect(model.detailPane.lines.join("\n")).toContain("CLUSTER");
   });
 
   it("does not reopen detail if a background list replay finishes after closing it", async () => {
@@ -468,12 +480,36 @@ describe("TuiController", () => {
     await replayPromise;
 
     const model = controller.getRenderModel();
-    expect(model.showDetail).toBe(false);
-    expect(model.detailTitle).toBe("Start Here");
-    expect(model.detailText).toContain("Inbox ranks PRs");
+    expect(model.detailPane.visible).toBe(false);
+    expect(model.detailPane.title).toBe("Start Here");
+    expect(model.detailPane.lines.join("\n")).toContain("Inbox ranks PRs");
 
     service.releaseRefreshPr();
     await openPromise;
+  });
+
+  it("does not reopen detail if a pending detail load finishes after closing it", async () => {
+    const service = new FakeTuiDataService();
+    service.blockPrContextBundle = true;
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    const openPromise = controller.openSelected();
+    await flushMicrotasks();
+
+    await controller.openSelected();
+    service.blockPrContextBundle = false;
+    service.releasePrContextBundle();
+    await openPromise;
+
+    const model = controller.getRenderModel();
+    expect(model.detailPane.visible).toBe(false);
+    expect(model.layoutMode).toBe("single-pane");
+    expect(model.detailPane.title).toBe("Start Here");
   });
 
   it("toggles watch state and shows it in Watchlist", async () => {
@@ -494,8 +530,8 @@ describe("TuiController", () => {
 
     const model = controller.getRenderModel();
     expect(model.mode).toBe("watchlist");
-    expect(model.rows).toHaveLength(1);
-    expect(model.rows[0]?.kind).toBe("pr");
+    expect(model.resultsPane.rows).toHaveLength(1);
+    expect(model.resultsPane.rows[0]?.kind).toBe("pr");
   });
 
   it("ignores PRs in Inbox without hiding them from other desks", async () => {
@@ -509,12 +545,12 @@ describe("TuiController", () => {
     await controller.initialize();
     await controller.toggleIgnoreSelected();
 
-    const inboxRows = controller.getRenderModel().rows;
+    const inboxRows = controller.getRenderModel().resultsPane.rows;
     expect(inboxRows.some((row) => row.kind === "pr" && row.pr.prNumber === 41793)).toBe(false);
 
     controller.activateMode("pr-search");
     await flushMicrotasks();
-    expect(controller.getRenderModel().rows[0]?.kind).toBe("pr");
+    expect(controller.getRenderModel().resultsPane.rows[0]?.kind).toBe("pr");
   });
 
   it("loads more Inbox rows in batches of 20", async () => {
@@ -528,7 +564,7 @@ describe("TuiController", () => {
     await controller.initialize();
     await controller.loadMore();
 
-    expect(controller.getRenderModel().rows).toHaveLength(40);
+    expect(controller.getRenderModel().resultsPane.rows).toHaveLength(40);
     expect(service.priorityQueueCalls.at(-1)).toEqual({ limit: 40, scanLimit: 300 });
   });
 

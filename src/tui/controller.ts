@@ -1,14 +1,19 @@
+import { buildStatusRows } from "./format.js";
+import { TuiEffects } from "./effects.js";
+import type {
+  ListLoadResult,
+  ListMode,
+  MetadataEntity,
+  PriorityMode,
+  SearchMode,
+} from "./effects.js";
+import { buildRenderModel } from "./presenter.js";
 import {
-  buildStatusRows,
-  defaultSecondaryHintText,
-  formatCrossSearchLandingDetail,
-  formatInboxLandingDetail,
-  formatIssueDetail,
-  formatPriorityPrDetail,
-  formatSearchLandingDetail,
-  formatStatusDetail,
-  formatWatchlistLandingDetail,
-} from "./format.js";
+  availableFocuses,
+  createInitialSessionState,
+  createLandingDetailState,
+  createViewSnapshot,
+} from "./state.js";
 import { TUI_MODE_ORDER } from "./types.js";
 import type {
   AttentionState,
@@ -21,8 +26,9 @@ import type {
 import type {
   TuiAction,
   TuiActionId,
+  TuiCommand,
   TuiContext,
-  TuiDataService,
+  TuiDetailState,
   TuiDetailSection,
   TuiFocus,
   TuiFreshness,
@@ -30,9 +36,9 @@ import type {
   TuiMode,
   TuiRenderModel,
   TuiResultRow,
+  TuiSessionState,
   TuiSyncJobSnapshot,
   TuiSyncMode,
-  TuiViewSnapshot,
 } from "./types.js";
 
 type ControllerOptions = {
@@ -40,21 +46,6 @@ type ControllerOptions = {
   dbPath: string;
   ftsOnly: boolean;
   resultLimit?: number;
-};
-
-type SearchMode = "cross-search" | "pr-search" | "issue-search";
-type PriorityMode = "inbox" | "watchlist";
-type ListMode = SearchMode | PriorityMode;
-type MetadataEntity = "prs" | "issues";
-type ListLoadResult = {
-  mode: ListMode;
-  rows: TuiResultRow[];
-  resultTitle: string;
-  detailTitle: string;
-  detailText: string;
-  message: string;
-  activeUrl: string | null;
-  isLandingView: boolean;
 };
 
 const DEFAULT_PAGE_SIZE = 20;
@@ -71,35 +62,18 @@ const REPLAY_DEBOUNCE_MS = 150;
 export class TuiController {
   private readonly listeners = new Set<() => void>();
   private readonly resultLimit: number;
-  private browseLimit: number;
+  private readonly effects: TuiEffects;
+  private readonly sessionState: TuiSessionState;
+  private detailState: TuiDetailState;
   private statusSnapshot: StatusSnapshot | null = null;
-  private mode: TuiMode = "inbox";
-  private focus: TuiFocus = "results";
-  private rows: TuiResultRow[] = [];
-  private selectedIndex = 0;
-  private detailText = "Loading Inbox...";
-  private detailTitle = "Start Here";
-  private detailStatus: string | null = null;
-  private detailIdentity: string | null = null;
-  private detailAnchorLine: number | null = null;
-  private detailAnchorKey: string | null = null;
   private detailAnchorNonce = 0;
-  private showDetail = false;
-  private resultTitle = "Inbox";
-  private activeUrl: string | null = null;
-  private query = "";
-  private context: TuiContext = null;
   private busyMessage: string | null = null;
   private syncMode: TuiSyncMode | null = null;
-  private errorMessage: string | null = null;
-  private message = "Loading Inbox...";
-  private readonly history: TuiViewSnapshot[] = [];
   private detailRequestId = 0;
   private listRequestId = 0;
-  private isLandingView = false;
   private detailAutoRefreshInFlight = false;
   private readonly detailFreshness = new Map<string, TuiFreshness>();
-  private rateLimitSnapshot: Awaited<ReturnType<TuiDataService["rateLimit"]>> = null;
+  private rateLimitSnapshot: Awaited<ReturnType<TuiEffects["rateLimit"]>> = null;
   private readonly syncJobs: Record<MetadataEntity, TuiSyncJobSnapshot> = {
     prs: {
       entity: "prs",
@@ -127,11 +101,13 @@ export class TuiController {
   private lastInteractionAt = Date.now();
 
   constructor(
-    private readonly service: TuiDataService,
+    service: TuiEffects | ConstructorParameters<typeof TuiEffects>[0],
     private readonly options: ControllerOptions,
   ) {
     this.resultLimit = options.resultLimit ?? DEFAULT_PAGE_SIZE;
-    this.browseLimit = this.resultLimit;
+    this.effects = service instanceof TuiEffects ? service : new TuiEffects(service);
+    this.sessionState = createInitialSessionState(this.resultLimit);
+    this.detailState = createLandingDetailState("inbox", null);
   }
 
   subscribe(listener: () => void): () => void {
@@ -142,48 +118,170 @@ export class TuiController {
   }
 
   getRenderModel(): TuiRenderModel {
-    const modeInfo = TUI_MODE_ORDER.find((mode) => mode.id === this.mode)!;
-    return {
-      header: {
-        repo: this.options.repo,
-        dbPath: this.options.dbPath,
-        activeModeLabel: modeInfo.label,
-        ftsOnly: this.options.ftsOnly,
-        status: this.statusSnapshot,
-        rateLimit: this.rateLimitSnapshot,
-        syncMode: this.syncMode,
-        syncJobs: Object.values(this.syncJobs),
-        detailAutoRefreshInFlight: this.detailAutoRefreshInFlight,
-        busyMessage: this.busyMessage,
-        errorMessage: this.errorMessage,
-      },
-      footer: {
-        hintText: defaultSecondaryHintText(this.mode, this.canLoadMore()),
-        message: this.errorMessage ?? this.message,
-        queryPrompt: modeInfo.queryPrompt,
-        queryValue: this.query,
-        actions: this.buildActions(),
-        autoUpdateHint: "auto-update every 5m when idle",
-      },
-      mode: this.mode,
-      focus: this.focus,
-      rows: this.rows,
-      selectedIndex: this.selectedIndex,
-      detailText: this.detailText,
-      detailStatus: this.detailStatus,
-      detailIdentity: this.detailIdentity,
-      detailAnchorLine: this.detailAnchorLine,
-      detailAnchorKey: this.detailAnchorKey,
-      showDetail: this.showDetail,
-      activeUrl: this.getActiveUrl(),
-      query: this.query,
-      resultTitle: this.resultTitle,
-      detailTitle: this.detailTitle,
-      context: this.context,
-      queryPlaceholder: modeInfo.queryPrompt,
-      busy: this.busyMessage !== null,
+    return buildRenderModel(this.sessionState, this.detailState, {
+      repo: this.options.repo,
+      dbPath: this.options.dbPath,
+      ftsOnly: this.options.ftsOnly,
+      status: this.statusSnapshot,
+      rateLimit: this.rateLimitSnapshot,
+      syncMode: this.syncMode,
+      syncJobs: Object.values(this.syncJobs),
+      detailAutoRefreshInFlight: this.detailAutoRefreshInFlight,
+      busyMessage: this.busyMessage,
+      errorMessage: this.errorMessage,
+      actions: this.buildActions(),
       listSummary: this.buildListSummary(),
-    };
+      canLoadMore: this.canLoadMore(),
+    });
+  }
+
+  private get mode(): TuiMode {
+    return this.sessionState.mode;
+  }
+
+  private set mode(value: TuiMode) {
+    this.sessionState.mode = value;
+  }
+
+  private get focus(): TuiFocus {
+    return this.sessionState.focus;
+  }
+
+  private set focus(value: TuiFocus) {
+    this.sessionState.focus = value;
+  }
+
+  private get rows(): TuiResultRow[] {
+    return this.sessionState.rows;
+  }
+
+  private set rows(value: TuiResultRow[]) {
+    this.sessionState.rows = value;
+  }
+
+  private get selectedIndex(): number {
+    return this.sessionState.selectedIndex;
+  }
+
+  private set selectedIndex(value: number) {
+    this.sessionState.selectedIndex = value;
+  }
+
+  private get activeUrl(): string | null {
+    return this.sessionState.activeUrl;
+  }
+
+  private set activeUrl(value: string | null) {
+    this.sessionState.activeUrl = value;
+  }
+
+  private get query(): string {
+    return this.sessionState.query;
+  }
+
+  private set query(value: string) {
+    this.sessionState.query = value;
+  }
+
+  private get context(): TuiContext {
+    return this.sessionState.context;
+  }
+
+  private set context(value: TuiContext) {
+    this.sessionState.context = value;
+  }
+
+  private get resultTitle(): string {
+    return this.sessionState.resultTitle;
+  }
+
+  private set resultTitle(value: string) {
+    this.sessionState.resultTitle = value;
+  }
+
+  private get message(): string {
+    return this.sessionState.message;
+  }
+
+  private set message(value: string) {
+    this.sessionState.message = value;
+  }
+
+  private get errorMessage(): string | null {
+    return this.sessionState.errorMessage;
+  }
+
+  private set errorMessage(value: string | null) {
+    this.sessionState.errorMessage = value;
+  }
+
+  private get browseLimit(): number {
+    return this.sessionState.browseLimit;
+  }
+
+  private set browseLimit(value: number) {
+    this.sessionState.browseLimit = value;
+  }
+
+  private get isLandingView(): boolean {
+    return this.sessionState.isLandingView;
+  }
+
+  private set isLandingView(value: boolean) {
+    this.sessionState.isLandingView = value;
+  }
+
+  private get history() {
+    return this.sessionState.history;
+  }
+
+  private get showDetail(): boolean {
+    return this.detailState.visible;
+  }
+
+  private set showDetail(value: boolean) {
+    this.detailState.visible = value;
+  }
+
+  private get detailStatus(): string | null {
+    return this.detailState.status;
+  }
+
+  private set detailStatus(value: string | null) {
+    this.detailState.status = value;
+  }
+
+  private get detailIdentity(): string | null {
+    return this.detailState.identity;
+  }
+
+  private set detailIdentity(value: string | null) {
+    this.detailState.identity = value;
+  }
+
+  private get detailAnchorKey(): string | null {
+    return this.detailState.anchorKey;
+  }
+
+  private set detailAnchorKey(value: string | null) {
+    this.detailState.anchorKey = value;
+  }
+
+  private get detailFocusSection(): TuiDetailSection | null {
+    return this.detailState.focusSection;
+  }
+
+  private set detailFocusSection(value: TuiDetailSection | null) {
+    this.detailState.focusSection = value;
+  }
+
+  private resetDetailState(mode = this.mode): void {
+    this.detailRequestId += 1;
+    this.detailState = createLandingDetailState(mode, this.statusSnapshot);
+  }
+
+  private setDetailPayload(next: TuiDetailState): void {
+    this.detailState = next;
   }
 
   async initialize(): Promise<void> {
@@ -198,6 +296,80 @@ export class TuiController {
 
   noteInteraction(): void {
     this.lastInteractionAt = Date.now();
+  }
+
+  async dispatch(command: TuiCommand): Promise<void> {
+    switch (command.type) {
+      case "focus_next":
+        this.focusNext();
+        return;
+      case "focus_results":
+        this.focusResults();
+        return;
+      case "activate_mode":
+        this.moveMode(command.delta);
+        return;
+      case "move_selection":
+        this.moveSelection(command.delta);
+        return;
+      case "toggle_detail":
+        await this.openSelected();
+        return;
+      case "jump_detail_section":
+        if (command.section === "linked-issues") {
+          await this.crossReferenceSelected();
+          return;
+        }
+        await this.clusterSelected();
+        return;
+      case "start_query":
+        this.startQueryEntry();
+        return;
+      case "stop_query":
+        this.stopQueryEntry();
+        return;
+      case "append_query":
+        this.appendQueryCharacter(command.value);
+        return;
+      case "backspace_query":
+        this.backspaceQuery();
+        return;
+      case "submit_query":
+        await this.submitCurrentQuery();
+        return;
+      case "trigger_action":
+        await this.triggerAction(command.slot);
+        return;
+      case "go_back":
+        this.goBack();
+        return;
+      case "mark_seen":
+        await this.markSeenSelected();
+        return;
+      case "toggle_watch":
+        await this.toggleWatchSelected();
+        return;
+      case "toggle_ignore":
+        await this.toggleIgnoreSelected();
+        return;
+      case "clear_attention_state":
+        await this.clearSelectedAttentionState();
+        return;
+      case "sync_prs":
+        await this.syncPrs();
+        return;
+      case "sync_issues":
+        await this.syncIssues();
+        return;
+      case "refresh_selected":
+        await this.refreshSelected();
+        return;
+      case "load_more":
+        await this.loadMore();
+        return;
+      default:
+        return;
+    }
   }
 
   isQueryFocus(): boolean {
@@ -235,11 +407,7 @@ export class TuiController {
     this.focus = "results";
     this.rows = [];
     this.selectedIndex = 0;
-    this.showDetail = false;
-    this.detailStatus = null;
-    this.detailIdentity = null;
-    this.detailAnchorLine = null;
-    this.detailAnchorKey = null;
+    this.resetDetailState(mode);
     this.detailAutoRefreshInFlight = false;
     this.context = null;
     this.activeUrl = null;
@@ -248,16 +416,9 @@ export class TuiController {
     this.errorMessage = null;
     this.isLandingView = false;
     this.resultTitle = this.modeLabel(mode);
-    this.detailTitle = "Start Here";
     this.message = this.isListMode(mode)
       ? `Loading ${this.modeLabel(mode)}...`
       : `Switched to ${this.modeLabel(mode)}.`;
-    this.detailText =
-      mode === "status"
-        ? this.statusSnapshot
-          ? formatStatusDetail(this.statusSnapshot)
-          : "Loading repository status..."
-        : `Switched to ${this.modeLabel(mode)}.`;
     this.emit();
 
     if (this.isListMode(mode)) {
@@ -268,8 +429,7 @@ export class TuiController {
     if (mode === "status" && this.statusSnapshot) {
       this.rows = buildStatusRows(this.statusSnapshot);
       this.resultTitle = "Status";
-      this.detailTitle = "Repository Status";
-      this.detailText = formatStatusDetail(this.statusSnapshot);
+      this.detailState = createLandingDetailState("status", this.statusSnapshot);
       this.emit();
     }
   }
@@ -350,11 +510,7 @@ export class TuiController {
     this.query = value.trim();
     this.errorMessage = null;
     this.isLandingView = false;
-    this.showDetail = false;
-    this.detailStatus = null;
-    this.detailIdentity = null;
-    this.detailAnchorLine = null;
-    this.detailAnchorKey = null;
+    this.resetDetailState(this.mode);
     this.activeUrl = null;
     const requestId = ++this.listRequestId;
     if (!this.query) {
@@ -378,11 +534,7 @@ export class TuiController {
       return;
     }
     if (this.showDetail) {
-      this.showDetail = false;
-      this.detailStatus = null;
-      this.detailIdentity = null;
-      this.detailAnchorLine = null;
-      this.detailAnchorKey = null;
+      this.resetDetailState(this.mode);
       this.loadLandingDetailForCurrentMode();
       this.focus = "results";
       this.message = "Closed detail drawer.";
@@ -510,21 +662,15 @@ export class TuiController {
       this.emit();
       return;
     }
-    this.mode = snapshot.mode;
-    this.query = snapshot.query;
-    this.rows = snapshot.rows;
-    this.selectedIndex = snapshot.selectedIndex;
-    this.detailText = snapshot.detailText;
-    this.detailStatus = snapshot.detailStatus;
-    this.detailIdentity = snapshot.detailIdentity;
-    this.detailAnchorLine = snapshot.detailAnchorLine;
-    this.detailAnchorKey = snapshot.detailAnchorKey;
-    this.showDetail = snapshot.showDetail;
-    this.activeUrl = snapshot.activeUrl;
-    this.detailTitle = snapshot.detailTitle;
-    this.resultTitle = snapshot.resultTitle;
-    this.context = snapshot.context;
-    this.isLandingView = snapshot.isLandingView;
+    this.mode = snapshot.session.mode;
+    this.query = snapshot.session.query;
+    this.rows = snapshot.session.rows;
+    this.selectedIndex = snapshot.session.selectedIndex;
+    this.activeUrl = snapshot.session.activeUrl;
+    this.resultTitle = snapshot.session.resultTitle;
+    this.context = snapshot.session.context;
+    this.isLandingView = snapshot.session.isLandingView;
+    this.setDetailPayload(snapshot.detail);
     this.errorMessage = null;
     this.focus = "results";
     this.message = "Returned to previous view.";
@@ -554,7 +700,7 @@ export class TuiController {
     if (!row || row.kind !== "pr") {
       return;
     }
-    await this.service.setPrAttentionState(row.pr.prNumber, state);
+    await this.effects.setPrAttentionState(row.pr.prNumber, state);
     this.message = message;
     await this.refreshActiveListPreservingUi();
   }
@@ -566,7 +712,7 @@ export class TuiController {
     if (fromRow) {
       return fromRow;
     }
-    const bundle = await this.service.getPrContextBundle(prNumber);
+    const bundle = await this.effects.getPrContextBundle(prNumber);
     return bundle?.candidate.attentionState ?? "new";
   }
 
@@ -699,47 +845,26 @@ export class TuiController {
     if (this.rows.length === 0 && !this.query && this.mode === "inbox") {
       return;
     }
-    this.history.push({
-      mode: this.mode,
-      query: this.query,
-      rows: this.rows,
-      selectedIndex: this.selectedIndex,
-      detailText: this.detailText,
-      detailStatus: this.detailStatus,
-      detailIdentity: this.detailIdentity,
-      detailAnchorLine: this.detailAnchorLine,
-      detailAnchorKey: this.detailAnchorKey,
-      showDetail: this.showDetail,
-      activeUrl: this.activeUrl,
-      detailTitle: this.detailTitle,
-      resultTitle: this.resultTitle,
-      context: this.context,
-      isLandingView: this.isLandingView,
-    });
+    this.history.push(createViewSnapshot(this.sessionState, this.detailState));
   }
 
   private async refreshStatus(): Promise<void> {
-    this.statusSnapshot = await this.service.status();
+    this.statusSnapshot = await this.effects.status();
     try {
-      this.rateLimitSnapshot = await this.service.rateLimit();
+      this.rateLimitSnapshot = await this.effects.rateLimit();
     } catch {
       this.rateLimitSnapshot = this.rateLimitSnapshot ?? null;
     }
     if (this.mode === "status" && this.statusSnapshot) {
       this.rows = buildStatusRows(this.statusSnapshot);
-      this.detailTitle = "Repository Status";
-      this.detailText = formatStatusDetail(this.statusSnapshot);
+      this.detailState = createLandingDetailState("status", this.statusSnapshot);
     }
   }
 
   private async loadLandingRows(mode: ListMode): Promise<void> {
     const requestId = ++this.listRequestId;
     this.isLandingView = true;
-    this.showDetail = false;
-    this.detailStatus = null;
-    this.detailIdentity = null;
-    this.detailAnchorLine = null;
-    this.detailAnchorKey = null;
+    this.resetDetailState(mode);
     this.message = `Loading ${this.modeLabel(mode)}...`;
     this.emit();
     try {
@@ -763,16 +888,15 @@ export class TuiController {
     this.rows = result.rows;
     this.selectedIndex = 0;
     this.resultTitle = result.resultTitle;
-    this.detailTitle = result.detailTitle;
-    this.detailText = result.detailText;
     this.message = result.message;
     this.activeUrl = result.activeUrl;
     this.isLandingView = result.isLandingView;
+    this.resetDetailState(result.mode);
   }
 
   private async resolveListRows(mode: ListMode, query: string): Promise<ListLoadResult> {
     if (mode === "inbox") {
-      const candidates = await this.service.listPriorityQueue({
+      const candidates = await this.effects.listPriorityQueue({
         limit: this.browseLimit,
         scanLimit: PRIORITY_SCAN_LIMIT,
       });
@@ -781,8 +905,6 @@ export class TuiController {
         mode,
         rows,
         resultTitle: "Inbox",
-        detailTitle: "Start Here",
-        detailText: formatInboxLandingDetail(this.statusSnapshot),
         message:
           rows.length > 0
             ? `Loaded ${rows.length} prioritized PR(s).`
@@ -793,14 +915,12 @@ export class TuiController {
     }
 
     if (mode === "watchlist") {
-      const candidates = await this.service.listWatchlist(this.browseLimit);
+      const candidates = await this.effects.listWatchlist(this.browseLimit);
       const rows = candidates.map((candidate) => this.toPrRow(candidate.pr, candidate));
       return {
         mode,
         rows,
         resultTitle: "Watchlist",
-        detailTitle: "Start Here",
-        detailText: formatWatchlistLandingDetail(this.statusSnapshot),
         message: rows.length > 0 ? `Loaded ${rows.length} watched PR(s).` : "Watchlist is empty.",
         activeUrl: this.rowUrl(rows[0]),
         isLandingView: true,
@@ -811,8 +931,8 @@ export class TuiController {
       const searchQuery = query || "state:open";
       const limits = this.crossSearchLimits();
       const [pullRequests, issues] = await Promise.all([
-        this.service.search(searchQuery, limits.pr),
-        this.service.searchIssues(searchQuery, limits.issue),
+        this.effects.search(searchQuery, limits.pr),
+        this.effects.searchIssues(searchQuery, limits.issue),
       ]);
       const rows = [
         ...pullRequests.map((pr) => this.toPrRow(pr)),
@@ -822,10 +942,6 @@ export class TuiController {
         mode,
         rows,
         resultTitle: query ? `Explore · ${query}` : "Explore",
-        detailTitle: "Start Here",
-        detailText: query
-          ? "Explore mixes cached PRs and issues. Press Enter to inspect the selected row."
-          : formatCrossSearchLandingDetail(this.statusSnapshot),
         message:
           rows.length > 0
             ? `Loaded ${rows.length} ${query ? "cross-search row" : "cached investigation row"}(s).`
@@ -839,16 +955,12 @@ export class TuiController {
 
     if (mode === "pr-search") {
       const searchQuery = query || "state:open";
-      const results = await this.service.search(searchQuery, this.browseLimit);
+      const results = await this.effects.search(searchQuery, this.browseLimit);
       const rows = results.map((pr) => this.toPrRow(pr));
       return {
         mode,
         rows,
         resultTitle: query ? `PRs · ${query}` : "PRs",
-        detailTitle: "Start Here",
-        detailText: query
-          ? "Press Enter to open the selected PR investigation workspace."
-          : formatSearchLandingDetail("pr-search", this.statusSnapshot),
         message:
           rows.length > 0
             ? `Loaded ${rows.length} ${query ? "PR result" : "open PR"}(s).`
@@ -861,16 +973,12 @@ export class TuiController {
     }
 
     const searchQuery = query || "state:open";
-    const issues = await this.service.searchIssues(searchQuery, this.browseLimit);
+    const issues = await this.effects.searchIssues(searchQuery, this.browseLimit);
     const rows = issues.map((issue) => this.toIssueRow(issue));
     return {
       mode,
       rows,
       resultTitle: query ? `Issues · ${query}` : "Issues",
-      detailTitle: "Start Here",
-      detailText: query
-        ? "Press Enter to open the selected issue detail."
-        : formatSearchLandingDetail("issue-search", this.statusSnapshot),
       message:
         rows.length > 0
           ? `Loaded ${rows.length} ${query ? "issue result" : "open issue"}(s).`
@@ -894,60 +1002,62 @@ export class TuiController {
     if (!row) {
       this.loadLandingDetailForCurrentMode();
       this.detailIdentity = null;
-      this.detailAnchorLine = null;
       this.detailAnchorKey = null;
+      this.detailFocusSection = null;
       this.emit();
       return;
     }
 
     const requestId = ++this.detailRequestId;
     if (row.kind === "pr") {
-      const bundle = await this.service.getPrContextBundle(row.pr.prNumber);
+      const bundle = await this.effects.getPrContextBundle(row.pr.prNumber);
       if (requestId !== this.detailRequestId || !bundle) {
         return;
       }
-      const formatted = formatPriorityPrDetail(bundle, focusSection);
-      this.detailTitle = `PR #${bundle.candidate.pr.prNumber}`;
-      this.detailText = formatted.text;
-      this.detailIdentity = `pr:${bundle.candidate.pr.prNumber}`;
-      this.detailStatus = `Freshness: ${this.rowFreshness(row).toUpperCase()}`;
+      this.setDetailPayload({
+        visible: true,
+        payload: { kind: "pr", bundle },
+        identity: `pr:${bundle.candidate.pr.prNumber}`,
+        status: `Freshness: ${this.rowFreshness(row).toUpperCase()}`,
+        focusSection,
+        anchorKey: focusSection
+          ? `pr:${bundle.candidate.pr.prNumber}:${focusSection}:${++this.detailAnchorNonce}`
+          : null,
+      });
       this.context = { kind: "pr", prNumber: bundle.candidate.pr.prNumber };
       this.activeUrl = bundle.candidate.pr.url;
-      if (focusSection) {
-        this.detailAnchorLine = formatted.anchorLine;
-        this.detailAnchorKey = `${this.detailIdentity}:${focusSection}:${++this.detailAnchorNonce}`;
-      } else {
-        this.detailAnchorLine = null;
-        this.detailAnchorKey = null;
-      }
       this.emit();
       return;
     }
 
     if (row.kind === "issue") {
-      const issue = await this.service.showIssue(row.issue.issueNumber);
+      const issue = await this.effects.showIssue(row.issue.issueNumber);
       if (requestId !== this.detailRequestId || !issue) {
         return;
       }
-      this.detailTitle = `Issue #${issue.issueNumber}`;
-      this.detailText = formatIssueDetail(issue);
-      this.detailIdentity = `issue:${issue.issueNumber}`;
-      this.detailStatus = `Freshness: ${this.rowFreshness(row).toUpperCase()}`;
+      this.setDetailPayload({
+        visible: true,
+        payload: { kind: "issue", issue },
+        identity: `issue:${issue.issueNumber}`,
+        status: `Freshness: ${this.rowFreshness(row).toUpperCase()}`,
+        focusSection: null,
+        anchorKey: null,
+      });
       this.context = { kind: "issue", issueNumber: issue.issueNumber };
       this.activeUrl = issue.url;
-      this.detailAnchorLine = null;
-      this.detailAnchorKey = null;
       this.emit();
       return;
     }
 
     if (row.kind === "status" && this.statusSnapshot) {
-      this.detailTitle = "Repository Status";
-      this.detailText = formatStatusDetail(this.statusSnapshot);
-      this.detailStatus = null;
-      this.detailIdentity = "status";
-      this.detailAnchorLine = null;
-      this.detailAnchorKey = null;
+      this.setDetailPayload({
+        visible: true,
+        payload: { kind: "status", status: this.statusSnapshot },
+        identity: "status",
+        status: null,
+        focusSection: null,
+        anchorKey: null,
+      });
       this.activeUrl = null;
       this.emit();
     }
@@ -966,7 +1076,7 @@ export class TuiController {
   private async refreshDetailForPr(prNumber: number, manual = false): Promise<void> {
     await this.runBusy(`Refreshing PR #${prNumber}`, async () => {
       this.syncMode = "detail";
-      await this.service.refreshPrDetail(prNumber);
+      await this.effects.refreshPrDetail(prNumber);
       this.detailFreshness.set(`pr:${prNumber}`, "fresh");
       await this.refreshStatus();
       if (manual && this.showDetail) {
@@ -981,7 +1091,7 @@ export class TuiController {
   private async refreshDetailForIssue(issueNumber: number, manual = false): Promise<void> {
     await this.runBusy(`Refreshing issue #${issueNumber}`, async () => {
       this.syncMode = "detail";
-      await this.service.refreshIssueDetail(issueNumber);
+      await this.effects.refreshIssueDetail(issueNumber);
       this.detailFreshness.set(`issue:${issueNumber}`, "fresh");
       await this.refreshStatus();
       if (manual && this.showDetail) {
@@ -1034,41 +1144,11 @@ export class TuiController {
   }
 
   private loadLandingDetailForCurrentMode(): void {
-    if (this.mode === "inbox") {
-      this.detailTitle = "Start Here";
-      this.detailText = formatInboxLandingDetail(this.statusSnapshot);
-      return;
-    }
-    if (this.mode === "watchlist") {
-      this.detailTitle = "Start Here";
-      this.detailText = formatWatchlistLandingDetail(this.statusSnapshot);
-      return;
-    }
-    if (this.mode === "cross-search") {
-      this.detailTitle = "Start Here";
-      this.detailText = formatCrossSearchLandingDetail(this.statusSnapshot);
-      return;
-    }
-    if (this.mode === "pr-search" || this.mode === "issue-search") {
-      this.detailTitle = "Start Here";
-      this.detailText = formatSearchLandingDetail(this.mode, this.statusSnapshot);
-      return;
-    }
-    if (this.mode === "status" && this.statusSnapshot) {
-      this.detailTitle = "Repository Status";
-      this.detailText = formatStatusDetail(this.statusSnapshot);
-    }
+    this.resetDetailState(this.mode);
   }
 
   private availableFocuses(): TuiFocus[] {
-    const focuses: TuiFocus[] = ["nav", "results"];
-    if (this.showDetail) {
-      focuses.push("detail");
-    }
-    if (this.isQueryMode(this.mode)) {
-      focuses.push("query");
-    }
-    return focuses;
+    return availableFocuses(this.sessionState, this.detailState);
   }
 
   private isListMode(mode: TuiMode): mode is ListMode {
@@ -1295,10 +1375,10 @@ export class TuiController {
     try {
       const summary =
         nextEntity === "prs"
-          ? await this.service.syncPrs({
+          ? await this.effects.syncPrs({
               onProgress: (event) => this.handleMetadataProgress(nextEntity, event),
             })
-          : await this.service.syncIssues({
+          : await this.effects.syncIssues({
               onProgress: (event) => this.handleMetadataProgress(nextEntity, event),
             });
       await this.refreshStatus();
@@ -1406,11 +1486,7 @@ export class TuiController {
       await this.refreshDetailForSelection(true);
       return;
     }
-    this.showDetail = false;
-    this.detailStatus = null;
-    this.detailIdentity = null;
-    this.detailAnchorLine = null;
-    this.detailAnchorKey = null;
+    this.resetDetailState(this.mode);
     if (this.focus === "detail") {
       this.focus = "results";
     }
