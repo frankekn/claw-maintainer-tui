@@ -209,6 +209,30 @@ export type ClusterCandidateStatus =
   | "superseded_candidate"
   | "possible_same_cluster";
 
+export type ClusterFeatureVector = {
+  matchedBy: ClusterMatchSource;
+  linkedIssueOverlap: number;
+  linkedIssueCount: number;
+  totalProdFileCount: number;
+  totalTestFileCount: number;
+  totalOtherFileCount: number;
+  relevantProdFileCount: number;
+  relevantTestFileCount: number;
+  noiseFilesCount: number;
+  semanticScore: number;
+};
+
+export type ClusterDecisionTrace = {
+  phase: "seed" | "candidate" | "rank" | "exclude" | "result";
+  prNumber: number | null;
+  matchedBy: ClusterMatchSource | null;
+  outcome: string;
+  summary: string;
+  featureVector?: ClusterFeatureVector;
+  reasonCodes?: ClusterReasonCode[];
+  excludedReasonCode?: ClusterExcludedReasonCode;
+};
+
 export type ClusterCandidate = {
   prNumber: number;
   title: string;
@@ -229,6 +253,7 @@ export type ClusterCandidate = {
   semanticScore?: number;
   supersededBy?: number;
   reason?: string;
+  featureVector: ClusterFeatureVector;
 };
 
 export type ClusterExcludedCandidate = {
@@ -242,6 +267,7 @@ export type ClusterExcludedCandidate = {
   excludedReasonCode: ClusterExcludedReasonCode;
   semanticScore?: number;
   reason: string;
+  featureVector: ClusterFeatureVector;
 };
 
 export type MergeReadiness =
@@ -281,6 +307,7 @@ export type ClusterPullRequestAnalysis = {
   sameClusterCandidates: ClusterCandidate[];
   nearbyButExcluded: ClusterExcludedCandidate[];
   mergeReadiness: MergeReadiness | null;
+  decisionTrace: ClusterDecisionTrace[];
 };
 
 export type IssueSearchFilters = {

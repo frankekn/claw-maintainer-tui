@@ -6,6 +6,7 @@ import type {
   ClusterReasonCode,
   PullRequestChangedFile,
 } from "../types.js";
+import { withClusterFeatures } from "./cluster-analysis.js";
 import {
   buildCrossReferenceQuery,
   extractSemanticTerms,
@@ -29,6 +30,7 @@ export function annotateRelevantCoverage(
   candidate: ClusterCandidate,
   relevantProdFiles: Set<string>,
   relevantTestFiles: Set<string>,
+  clusterIssueNumbers: number[],
 ): ClusterCandidate {
   const relevantProd = candidate.prodFiles.filter((file) => relevantProdFiles.has(file));
   const relevantTest = candidate.testFiles.filter((file) => relevantTestFiles.has(file));
@@ -38,12 +40,15 @@ export function annotateRelevantCoverage(
     candidate.otherFiles.length -
     relevantProd.length -
     relevantTest.length;
-  return {
-    ...candidate,
-    relevantProdFiles: relevantProd,
-    relevantTestFiles: relevantTest,
-    noiseFilesCount,
-  };
+  return withClusterFeatures(
+    {
+      ...candidate,
+      relevantProdFiles: relevantProd,
+      relevantTestFiles: relevantTest,
+      noiseFilesCount,
+    },
+    clusterIssueNumbers,
+  );
 }
 
 export function buildRelevantPathSets(
@@ -250,6 +255,7 @@ export function buildExcludedCandidate(
     excludedReasonCode,
     semanticScore: candidate.semanticScore,
     reason,
+    featureVector: candidate.featureVector,
   };
 }
 

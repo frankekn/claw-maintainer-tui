@@ -152,6 +152,7 @@ function makeBundle(): PrContextBundle {
       sameClusterCandidates: [],
       nearbyButExcluded: [],
       mergeReadiness: null,
+      decisionTrace: [],
     },
     latestReviewFact: null,
     mergeReadiness: null,

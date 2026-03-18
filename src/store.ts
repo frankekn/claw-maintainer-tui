@@ -17,6 +17,15 @@ import {
   computeSemanticScore,
   rankClusterCandidates,
 } from "./store/cluster-logic.js";
+import {
+  buildClusterDecisionTrace,
+  buildClusterSeed,
+  buildExcludedTrace,
+  linkedIssueResultSummary,
+  semanticOnlyResultSummary,
+  withClusterFeatures,
+} from "./store/cluster-analysis.js";
+import { buildPrContextBundle } from "./store/context-bundle.js";
 import { parseIssueSearchQuery, parseSearchQuery } from "./store/query.js";
 import {
   buildPriorityCandidateBase as buildPriorityCandidateBaseModel,
@@ -33,7 +42,13 @@ import {
   type IssueRow,
   type PrRow,
 } from "./store/read-model.js";
+import {
+  limitRelatedPullRequests,
+  rankSearchDocRows,
+  type SearchDocRow,
+} from "./store/search-workflow.js";
 import { buildIssueFilterClause, buildPrFilterClause } from "./store/search-sql.js";
+import { resolveMergeReadiness as resolveMergeReadinessModel } from "./store/merge-readiness.js";
 import { syncIssuesWorkflow, syncPullRequestsWorkflow } from "./store/sync-workflow.js";
 import { buildCrossReferenceQuery, normalizeSearchText, uniqueStrings } from "./store/text.js";
 import { pullRequestUpsertParams, UPSERT_PULL_REQUEST_SQL } from "./store/upsert.js";
@@ -102,23 +117,6 @@ const DERIVED_LINK_SOURCES: PullRequestLinkSource[] = [
   "title_reference",
 ];
 const SUCCESSFUL_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
-const FAILING_CHECK_CONCLUSIONS = new Set([
-  "FAILURE",
-  "TIMED_OUT",
-  "ACTION_REQUIRED",
-  "STARTUP_FAILURE",
-  "CANCELLED",
-]);
-
-type SearchDocRow = {
-  doc_id: string;
-  pr_number: number;
-  doc_kind: "pr_body" | "comment";
-  title: string;
-  text: string;
-  updated_at: string;
-  score: number;
-};
 
 type IssueDocRow = {
   issue_number: number;
@@ -189,16 +187,6 @@ function describeReasonCodes(codes: ClusterReasonCode[]): string {
     }
   });
   return uniqueStrings(phrases).join(", ");
-}
-
-function dedupeCheckNames(names: string[]): string[] {
-  const counts = new Map<string, number>();
-  for (const name of names) {
-    counts.set(name, (counts.get(name) ?? 0) + 1);
-  }
-  return Array.from(counts.entries())
-    .sort((left, right) => left[0].localeCompare(right[0]))
-    .map(([name, count]) => (count > 1 ? `${name} (x${count})` : name));
 }
 
 function buildSearchDocuments(payload: HydratedPullRequest): SearchDocument[] {
@@ -1413,29 +1401,17 @@ export class PrIndexStore {
         this.buildSearchResultFromPrRow(clusterPr, clusterCandidate.semanticScore ?? 1),
       );
     }
-
-    return {
-      candidate: {
-        ...candidate,
-        pr: payload.pr
-          ? {
-              ...payload.pr,
-              score: candidate.score,
-            }
-          : candidate.pr,
-      },
-      comments: payload.comments,
+    return buildPrContextBundle({
+      candidate,
+      payload,
       linkedIssues,
-      relatedPullRequests: Array.from(relatedPullRequests.values()).sort(
-        (left, right) =>
-          right.updatedAt.localeCompare(left.updatedAt) || right.prNumber - left.prNumber,
-      ),
+      relatedPullRequests: relatedPullRequests.values(),
       cluster,
       latestReviewFact: this.getLatestReviewFact(prNumber, repoKey),
       mergeReadiness: this.resolveMergeReadiness(
         this.buildClusterCandidate(prNumber, "same_cluster_candidate", "linked_issue"),
       ),
-    };
+    });
   }
 
   async search(rawQuery: string, limit = DEFAULT_SEARCH_LIMIT): Promise<SearchResult[]> {
@@ -1455,37 +1431,11 @@ export class PrIndexStore {
 
     const keywordHits = this.searchKeywordDocs(parsed, limit * 5);
     const vectorHits = options.ftsOnly ? [] : await this.searchVectorDocs(parsed, limit * 5);
-    const byDoc = new Map<
-      string,
-      SearchDocRow & {
-        vectorScore: number;
-        textScore: number;
-      }
-    >();
-
-    for (const hit of keywordHits) {
-      byDoc.set(hit.doc_id, { ...hit, vectorScore: 0, textScore: hit.score });
-    }
-    for (const hit of vectorHits) {
-      const existing = byDoc.get(hit.doc_id);
-      if (existing) {
-        existing.vectorScore = hit.score;
-      } else {
-        byDoc.set(hit.doc_id, { ...hit, vectorScore: hit.score, textScore: 0 });
-      }
-    }
-
-    const ranked = Array.from(byDoc.values())
-      .map((row) => ({
-        ...row,
-        score:
-          keywordHits.length > 0
-            ? row.textScore > 0
-              ? row.textScore
-              : row.vectorScore * VECTOR_FALLBACK_WEIGHT
-            : row.vectorScore,
-      }))
-      .sort((a, b) => b.score - a.score);
+    const ranked = rankSearchDocRows({
+      keywordHits,
+      vectorHits,
+      vectorFallbackWeight: VECTOR_FALLBACK_WEIGHT,
+    });
 
     const seen = new Set<number>();
     const results: SearchResult[] = [];
@@ -1529,7 +1479,7 @@ export class PrIndexStore {
     }
     const query = buildCrossReferenceQuery(payload.pr.title, payload.pr.matchedExcerpt);
     const results = await this.searchParsed(parseSearchQuery(query), limit + 1, options);
-    return results.filter((result) => result.prNumber !== prNumber).slice(0, limit);
+    return limitRelatedPullRequests(results, prNumber, limit);
   }
 
   async searchIssues(rawQuery: string, limit = DEFAULT_SEARCH_LIMIT): Promise<IssueSearchResult[]> {
@@ -1803,32 +1753,35 @@ export class PrIndexStore {
     }
     const facts = this.getChangedFilesForPr(prNumber);
     const linkedIssues = this.getLinkedIssuesForPr(prNumber).map((issue) => issue.issueNumber);
-    return {
-      prNumber,
-      title: pr.title,
-      url: pr.url,
-      state: pr.state,
-      updatedAt: pr.updated_at,
-      matchedBy,
-      headSha:
-        (
-          this.db
-            .prepare(`SELECT head_sha FROM pr_fact_snapshots WHERE pr_number = ?`)
-            .get(prNumber) as { head_sha: string } | undefined
-        )?.head_sha ?? null,
-      linkedIssues,
-      prodFiles: facts.filter((file) => file.kind === "prod").map((file) => file.path),
-      testFiles: facts.filter((file) => file.kind === "test").map((file) => file.path),
-      otherFiles: facts.filter((file) => file.kind === "other").map((file) => file.path),
-      relevantProdFiles: [],
-      relevantTestFiles: [],
-      noiseFilesCount: 0,
-      status,
-      reasonCodes,
-      semanticScore,
-      supersededBy,
-      reason,
-    };
+    return withClusterFeatures(
+      {
+        prNumber,
+        title: pr.title,
+        url: pr.url,
+        state: pr.state,
+        updatedAt: pr.updated_at,
+        matchedBy,
+        headSha:
+          (
+            this.db
+              .prepare(`SELECT head_sha FROM pr_fact_snapshots WHERE pr_number = ?`)
+              .get(prNumber) as { head_sha: string } | undefined
+          )?.head_sha ?? null,
+        linkedIssues,
+        prodFiles: facts.filter((file) => file.kind === "prod").map((file) => file.path),
+        testFiles: facts.filter((file) => file.kind === "test").map((file) => file.path),
+        otherFiles: facts.filter((file) => file.kind === "other").map((file) => file.path),
+        relevantProdFiles: [],
+        relevantTestFiles: [],
+        noiseFilesCount: 0,
+        status,
+        reasonCodes,
+        semanticScore,
+        supersededBy,
+        reason,
+      },
+      [],
+    );
   }
 
   private async collectLiveIssueSearchCandidates(
@@ -1887,34 +1840,6 @@ export class PrIndexStore {
     }
     const repo = this.getMeta(META_REPO) ?? "";
     const latestReviewFact = repo ? this.getLatestReviewFact(candidate.prNumber, repo) : null;
-    if (candidate.state !== "open") {
-      return {
-        state: "historical",
-        source: "github",
-        summary: "Pull request is not open.",
-        failingChecks: [],
-        pendingChecks: [],
-        headSha: candidate.headSha,
-        staleReviewFact:
-          latestReviewFact && candidate.headSha && latestReviewFact.headSha !== candidate.headSha
-            ? {
-                headSha: latestReviewFact.headSha,
-                decision: latestReviewFact.decision,
-                recordedAt: latestReviewFact.recordedAt,
-              }
-            : undefined,
-      };
-    }
-    if (latestReviewFact && candidate.headSha && latestReviewFact.headSha === candidate.headSha) {
-      return {
-        state: latestReviewFact.decision,
-        source: "review_fact",
-        summary: latestReviewFact.summary,
-        failingTests: latestReviewFact.failingTests,
-        commands: latestReviewFact.commands,
-        headSha: latestReviewFact.headSha,
-      };
-    }
     const snapshot = this.db
       .prepare(
         `SELECT review_decision, merge_state_status, mergeable, status_rollup_json
@@ -1929,62 +1854,20 @@ export class PrIndexStore {
           status_rollup_json: string;
         }
       | undefined;
-    if (!snapshot) {
-      return {
-        state: "unknown",
-        source: "github",
-        summary: "No GitHub fact snapshot recorded for this pull request.",
-        failingChecks: [],
-        pendingChecks: [],
-        headSha: candidate.headSha,
-      };
-    }
-    const statusChecks = JSON.parse(
-      snapshot.status_rollup_json,
-    ) as PullRequestFactRecord["statusChecks"];
-    const failingChecks = dedupeCheckNames(
-      statusChecks
-        .filter((check) => check.conclusion && FAILING_CHECK_CONCLUSIONS.has(check.conclusion))
-        .map((check) => check.name),
-    );
-    const pendingChecks = dedupeCheckNames(
-      statusChecks.filter((check) => check.status !== "COMPLETED").map((check) => check.name),
-    );
-    let state: MergeReadiness["state"] = "ready";
-    let summary = "GitHub review decision and checks are green.";
-    if (snapshot.review_decision === "CHANGES_REQUESTED") {
-      state = "needs_work";
-      summary = "GitHub review decision is CHANGES_REQUESTED.";
-    } else if (failingChecks.length > 0) {
-      state = "needs_work";
-      summary = "One or more GitHub checks are failing.";
-    } else if (
-      snapshot.mergeable === "CONFLICTING" ||
-      snapshot.merge_state_status === "DIRTY" ||
-      snapshot.merge_state_status === "BLOCKED"
-    ) {
-      state = "needs_work";
-      summary = "GitHub reports the pull request is blocked or conflicting.";
-    } else if (pendingChecks.length > 0) {
-      state = "pending";
-      summary = "GitHub checks are still pending.";
-    }
-    return {
-      state,
-      source: "github",
-      summary,
-      failingChecks,
-      pendingChecks,
-      headSha: candidate.headSha,
-      staleReviewFact:
-        latestReviewFact && candidate.headSha && latestReviewFact.headSha !== candidate.headSha
-          ? {
-              headSha: latestReviewFact.headSha,
-              decision: latestReviewFact.decision,
-              recordedAt: latestReviewFact.recordedAt,
-            }
-          : undefined,
-    };
+    return resolveMergeReadinessModel({
+      candidate,
+      latestReviewFact,
+      githubSnapshot: snapshot
+        ? {
+            reviewDecision: snapshot.review_decision,
+            mergeStateStatus: snapshot.merge_state_status,
+            mergeable: snapshot.mergeable,
+            statusChecks: JSON.parse(
+              snapshot.status_rollup_json,
+            ) as PullRequestFactRecord["statusChecks"],
+          }
+        : null,
+    });
   }
 
   private getLabelsForPr(prNumber: number): string[] {
@@ -2123,6 +2006,15 @@ export class PrIndexStore {
     );
 
     if (seedLinkedIssues.length === 0) {
+      const decisionTrace = [
+        buildClusterDecisionTrace({
+          phase: "seed",
+          prNumber: seed.number,
+          matchedBy: null,
+          outcome: "semantic_only",
+          summary: "Seed PR has no exact linked issues; falling back to semantic-only clustering.",
+        }),
+      ];
       const semanticNumbers = new Map<number, ClusterMatchSource>(localNearbyNumbers);
       if (params.repo && params.source) {
         const liveSemanticNumbers = await this.collectLiveSemanticCandidates(
@@ -2175,51 +2067,71 @@ export class PrIndexStore {
           continue;
         }
         if (candidate.linkedIssues.length > 0) {
-          nearbyButExcluded.push(
-            buildExcludedCandidate(
-              candidate,
-              "different_linked_issue",
-              `different_linked_issue: ${candidate.linkedIssues.map((issue) => `#${issue}`).join(", ")}`,
-            ),
+          const excluded = buildExcludedCandidate(
+            candidate,
+            "different_linked_issue",
+            `different_linked_issue: ${candidate.linkedIssues.map((issue) => `#${issue}`).join(", ")}`,
           );
+          nearbyButExcluded.push(excluded);
+          decisionTrace.push(buildExcludedTrace(excluded));
           continue;
         }
         if (semanticScore >= 0.35) {
-          sameClusterCandidates.push({
-            ...candidate,
-            reason: "semantic-only candidate",
-          });
-        } else {
-          nearbyButExcluded.push(
-            buildExcludedCandidate(
-              candidate,
-              "semantic_weak_match",
-              "semantic_weak_match: semantic overlap too weak",
-            ),
+          const included = withClusterFeatures(
+            {
+              ...candidate,
+              reason: "semantic-only candidate",
+            },
+            [],
           );
+          sameClusterCandidates.push(included);
+          decisionTrace.push(
+            buildClusterDecisionTrace({
+              phase: "candidate",
+              prNumber: included.prNumber,
+              matchedBy: included.matchedBy,
+              outcome: "included",
+              summary: included.reason ?? "Semantic-only candidate retained.",
+              featureVector: included.featureVector,
+              reasonCodes: included.reasonCodes,
+            }),
+          );
+        } else {
+          const excluded = buildExcludedCandidate(
+            candidate,
+            "semantic_weak_match",
+            "semantic_weak_match: semantic overlap too weak",
+          );
+          nearbyButExcluded.push(excluded);
+          decisionTrace.push(buildExcludedTrace(excluded));
         }
       }
+      const orderedCandidates = sameClusterCandidates
+        .sort((left, right) => {
+          if ((right.semanticScore ?? 0) !== (left.semanticScore ?? 0)) {
+            return (right.semanticScore ?? 0) - (left.semanticScore ?? 0);
+          }
+          return right.updatedAt.localeCompare(left.updatedAt);
+        })
+        .slice(0, limit);
+      decisionTrace.push(
+        buildClusterDecisionTrace({
+          phase: "result",
+          prNumber: null,
+          matchedBy: null,
+          outcome: "semantic_only_result",
+          summary: semanticOnlyResultSummary(orderedCandidates.length),
+        }),
+      );
       return {
-        seedPr: {
-          prNumber: seed.number,
-          title: seed.title,
-          url: seed.url,
-          state: seed.state,
-          updatedAt: seed.updated_at,
-        },
+        seedPr: buildClusterSeed(seed),
         clusterBasis: "semantic_only",
         clusterIssueNumbers: [],
         bestBase: null,
-        sameClusterCandidates: sameClusterCandidates
-          .sort((left, right) => {
-            if ((right.semanticScore ?? 0) !== (left.semanticScore ?? 0)) {
-              return (right.semanticScore ?? 0) - (left.semanticScore ?? 0);
-            }
-            return right.updatedAt.localeCompare(left.updatedAt);
-          })
-          .slice(0, limit),
+        sameClusterCandidates: orderedCandidates,
         nearbyButExcluded: nearbyButExcluded.slice(0, limit),
         mergeReadiness: null,
+        decisionTrace,
       };
     }
 
@@ -2261,6 +2173,30 @@ export class PrIndexStore {
         ),
       )
       .filter((candidate): candidate is ClusterCandidate => Boolean(candidate));
+    const decisionTrace = [
+      buildClusterDecisionTrace({
+        phase: "seed",
+        prNumber: seed.number,
+        matchedBy: null,
+        outcome: "linked_issue_seed",
+        summary: `Seed PR links issues ${seedLinkedIssues.map((issue) => `#${issue}`).join(", ")}.`,
+      }),
+      ...rawCandidates.map((candidate) =>
+        buildClusterDecisionTrace({
+          phase: "candidate",
+          prNumber: candidate.prNumber,
+          matchedBy: candidate.matchedBy,
+          outcome: "candidate_generated",
+          summary:
+            candidate.reason ??
+            (candidate.matchedBy === "live_issue_search"
+              ? "Candidate discovered via live issue search."
+              : "Candidate shares the linked issue."),
+          featureVector: candidate.featureVector,
+          reasonCodes: candidate.reasonCodes,
+        }),
+      ),
+    ];
     const relevantPaths = buildRelevantPathSets(params.prNumber, rawCandidates);
     const rankedCandidates = rawCandidates
       .map((candidate) =>
@@ -2268,6 +2204,7 @@ export class PrIndexStore {
           candidate,
           relevantPaths.relevantProdFiles,
           relevantPaths.relevantTestFiles,
+          seedLinkedIssues,
         ),
       )
       .sort((left, right) => rankClusterCandidates(seedLinkedIssues, left, right));
@@ -2280,23 +2217,58 @@ export class PrIndexStore {
       }
       if (index === 0) {
         const reasonCodes = buildBestBaseReasonCodes(candidate, runnerUp);
-        return {
+        const rankedCandidate = {
           ...candidate,
           status: "best_base" as const,
           reasonCodes,
           reason: describeReasonCodes(reasonCodes),
         };
+        decisionTrace.push(
+          buildClusterDecisionTrace({
+            phase: "rank",
+            prNumber: rankedCandidate.prNumber,
+            matchedBy: rankedCandidate.matchedBy,
+            outcome: rankedCandidate.status,
+            summary: rankedCandidate.reason ?? "Selected as best base.",
+            featureVector: rankedCandidate.featureVector,
+            reasonCodes: rankedCandidate.reasonCodes,
+          }),
+        );
+        return rankedCandidate;
       }
       const reasonCodes = buildSupersededReasonCodes(bestBase, candidate);
       if (reasonCodes.length > 0) {
-        return {
+        const rankedCandidate = {
           ...candidate,
           status: "superseded_candidate" as const,
           supersededBy: bestBase.prNumber,
           reasonCodes,
           reason: describeReasonCodes(reasonCodes),
         };
+        decisionTrace.push(
+          buildClusterDecisionTrace({
+            phase: "rank",
+            prNumber: rankedCandidate.prNumber,
+            matchedBy: rankedCandidate.matchedBy,
+            outcome: rankedCandidate.status,
+            summary: rankedCandidate.reason ?? "Candidate superseded by the best base.",
+            featureVector: rankedCandidate.featureVector,
+            reasonCodes: rankedCandidate.reasonCodes,
+          }),
+        );
+        return rankedCandidate;
       }
+      decisionTrace.push(
+        buildClusterDecisionTrace({
+          phase: "rank",
+          prNumber: candidate.prNumber,
+          matchedBy: candidate.matchedBy,
+          outcome: candidate.status,
+          summary: candidate.reason ?? "Candidate kept in same cluster.",
+          featureVector: candidate.featureVector,
+          reasonCodes: candidate.reasonCodes,
+        }),
+      );
       return candidate;
     });
 
@@ -2335,18 +2307,19 @@ export class PrIndexStore {
         candidate,
         relevantPaths.relevantProdFiles,
         relevantPaths.relevantTestFiles,
+        seedLinkedIssues,
       );
       const otherLinkedIssues = annotated.linkedIssues.filter(
         (issue) => !seedLinkedIssues.includes(issue),
       );
       if (otherLinkedIssues.length > 0) {
-        nearbyButExcluded.push(
-          buildExcludedCandidate(
-            annotated,
-            "different_linked_issue",
-            `different_linked_issue: ${otherLinkedIssues.map((issue) => `#${issue}`).join(", ")}`,
-          ),
+        const excluded = buildExcludedCandidate(
+          annotated,
+          "different_linked_issue",
+          `different_linked_issue: ${otherLinkedIssues.map((issue) => `#${issue}`).join(", ")}`,
         );
+        nearbyButExcluded.push(excluded);
+        decisionTrace.push(buildExcludedTrace(excluded));
         continue;
       }
       if (
@@ -2354,41 +2327,47 @@ export class PrIndexStore {
           annotated.relevantProdFiles.length + annotated.relevantTestFiles.length + 2 &&
         annotated.relevantProdFiles.length + annotated.relevantTestFiles.length <= 1
       ) {
-        nearbyButExcluded.push(
-          buildExcludedCandidate(
-            annotated,
-            "noise_dominated",
-            "noise_dominated: unrelated churn outweighs issue-relevant paths",
-          ),
+        const excluded = buildExcludedCandidate(
+          annotated,
+          "noise_dominated",
+          "noise_dominated: unrelated churn outweighs issue-relevant paths",
         );
+        nearbyButExcluded.push(excluded);
+        decisionTrace.push(buildExcludedTrace(excluded));
         continue;
       }
-      nearbyButExcluded.push(
-        buildExcludedCandidate(
-          annotated,
-          "semantic_weak_match",
-          "semantic_weak_match: semantic neighbor without exact issue link",
-        ),
+      const excluded = buildExcludedCandidate(
+        annotated,
+        "semantic_weak_match",
+        "semantic_weak_match: semantic neighbor without exact issue link",
       );
+      nearbyButExcluded.push(excluded);
+      decisionTrace.push(buildExcludedTrace(excluded));
     }
 
+    const resolvedBestBase =
+      sameClusterCandidates.find((candidate) => candidate.status === "best_base") ?? bestBase;
+    decisionTrace.push(
+      buildClusterDecisionTrace({
+        phase: "result",
+        prNumber: resolvedBestBase?.prNumber ?? null,
+        matchedBy: resolvedBestBase?.matchedBy ?? null,
+        outcome: resolvedBestBase ? "linked_issue_result" : "linked_issue_result_empty",
+        summary: linkedIssueResultSummary(seedLinkedIssues, resolvedBestBase),
+        featureVector: resolvedBestBase?.featureVector,
+        reasonCodes: resolvedBestBase?.reasonCodes,
+      }),
+    );
+
     return {
-      seedPr: {
-        prNumber: seed.number,
-        title: seed.title,
-        url: seed.url,
-        state: seed.state,
-        updatedAt: seed.updated_at,
-      },
+      seedPr: buildClusterSeed(seed),
       clusterBasis: "linked_issue",
       clusterIssueNumbers: seedLinkedIssues,
-      bestBase:
-        sameClusterCandidates.find((candidate) => candidate.status === "best_base") ?? bestBase,
+      bestBase: resolvedBestBase,
       sameClusterCandidates,
       nearbyButExcluded: nearbyButExcluded.slice(0, limit),
-      mergeReadiness: this.resolveMergeReadiness(
-        sameClusterCandidates.find((candidate) => candidate.status === "best_base") ?? bestBase,
-      ),
+      mergeReadiness: this.resolveMergeReadiness(resolvedBestBase),
+      decisionTrace,
     };
   }
 

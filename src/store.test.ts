@@ -579,6 +579,13 @@ describe("PrIndexStore", () => {
       "src/agents/pi-extensions/context-pruning/pruner.test.ts",
     ]);
     expect(analysis?.bestBase?.noiseFilesCount).toBe(2);
+    expect(analysis?.bestBase?.featureVector).toMatchObject({
+      matchedBy: "linked_issue",
+      linkedIssueOverlap: 1,
+      relevantProdFileCount: 2,
+      relevantTestFileCount: 2,
+      noiseFilesCount: 2,
+    });
     expect(analysis?.bestBase?.reason).toContain("broader relevant production coverage");
     expect(analysis?.bestBase?.reason).toContain("adds companion tests");
     expect(analysis?.mergeReadiness).toEqual({
@@ -615,6 +622,20 @@ describe("PrIndexStore", () => {
       status: "superseded_candidate",
       supersededBy: 42212,
     });
+    expect(analysis?.decisionTrace).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          phase: "seed",
+          outcome: "linked_issue_seed",
+          prNumber: 41793,
+        }),
+        expect.objectContaining({
+          phase: "result",
+          outcome: "linked_issue_result",
+          prNumber: 42212,
+        }),
+      ]),
+    );
     expect(analysis?.nearbyButExcluded).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -623,6 +644,9 @@ describe("PrIndexStore", () => {
           linkedIssues: [42171],
           excludedReasonCode: "different_linked_issue",
           reason: "different_linked_issue: #42171",
+          featureVector: expect.objectContaining({
+            matchedBy: "local_semantic",
+          }),
         }),
       ]),
     );
@@ -674,6 +698,23 @@ describe("PrIndexStore", () => {
           matchedBy: "local_semantic",
           status: "possible_same_cluster",
           reason: "semantic-only candidate",
+          featureVector: expect.objectContaining({
+            matchedBy: "local_semantic",
+            semanticScore: expect.any(Number),
+          }),
+        }),
+      ]),
+    );
+    expect(analysis?.decisionTrace).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          phase: "seed",
+          outcome: "semantic_only",
+          prNumber: 34019,
+        }),
+        expect.objectContaining({
+          phase: "result",
+          outcome: "semantic_only_result",
         }),
       ]),
     );
@@ -1019,6 +1060,7 @@ describe("PrIndexStore", () => {
       expect(bundle?.cluster?.sameClusterCandidates).toEqual(
         expect.arrayContaining([expect.objectContaining({ prNumber: 50031 })]),
       );
+      expect(bundle?.cluster?.decisionTrace.length).toBeGreaterThan(0);
       expect(bundle?.comments[0]?.excerpt).toContain("retry and backoff");
       expect(bundle?.latestReviewFact?.summary).toContain("Contract coverage still fails");
       expect(bundle?.mergeReadiness).toMatchObject({

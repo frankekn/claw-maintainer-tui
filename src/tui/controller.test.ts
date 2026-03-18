@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { TuiController } from "./controller.js";
 import type {
   AttentionState,
+  ClusterFeatureVector,
   ClusterPullRequestAnalysis,
   IssueSearchResult,
   PrContextBundle,
@@ -12,6 +13,19 @@ import type {
   SyncSummary,
 } from "../types.js";
 import type { TuiDataService, TuiRateLimitSnapshot } from "./types.js";
+
+const defaultFeatureVector: ClusterFeatureVector = {
+  matchedBy: "linked_issue",
+  linkedIssueOverlap: 1,
+  linkedIssueCount: 1,
+  totalProdFileCount: 1,
+  totalTestFileCount: 1,
+  totalOtherFileCount: 0,
+  relevantProdFileCount: 1,
+  relevantTestFileCount: 1,
+  noiseFilesCount: 0,
+  semanticScore: 0.91,
+};
 
 function makePr(prNumber: number, overrides: Partial<SearchResult> = {}): SearchResult {
   return {
@@ -128,10 +142,12 @@ function makeCluster(prNumber: number): ClusterPullRequestAnalysis {
         status: "best_base",
         reasonCodes: ["broader_relevant_prod_coverage"],
         reason: "broader relevant production coverage",
+        featureVector: defaultFeatureVector,
       },
     ],
     nearbyButExcluded: [],
     mergeReadiness: null,
+    decisionTrace: [],
   };
 }
 
