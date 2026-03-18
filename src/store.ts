@@ -19,6 +19,11 @@ import {
 } from "./store/cluster-logic.js";
 import { parseIssueSearchQuery, parseSearchQuery } from "./store/query.js";
 import {
+  buildPriorityCandidateBase as buildPriorityCandidateBaseModel,
+  enrichPriorityCandidate as enrichPriorityCandidateModel,
+  freshnessReason as computeFreshnessReason,
+} from "./store/priority.js";
+import {
   getChangedFilesForPr,
   getIssueRow,
   getLabelsForIssue,
@@ -29,6 +34,7 @@ import {
   type PrRow,
 } from "./store/read-model.js";
 import { buildIssueFilterClause, buildPrFilterClause } from "./store/search-sql.js";
+import { syncIssuesWorkflow, syncPullRequestsWorkflow } from "./store/sync-workflow.js";
 import { buildCrossReferenceQuery, normalizeSearchText, uniqueStrings } from "./store/text.js";
 import { pullRequestUpsertParams, UPSERT_PULL_REQUEST_SQL } from "./store/upsert.js";
 import {
@@ -740,54 +746,18 @@ export class PrIndexStore {
   }
 
   private freshnessReason(updatedAt: string): PriorityReason | null {
-    const ageMs = Date.now() - new Date(updatedAt).getTime();
-    if (ageMs < 24 * 60 * 60 * 1000) {
-      return { type: "freshness", label: "updated in the last 24h", points: 10 };
-    }
-    if (ageMs < 72 * 60 * 60 * 1000) {
-      return { type: "freshness", label: "updated in the last 72h", points: 6 };
-    }
-    if (ageMs < 7 * 24 * 60 * 60 * 1000) {
-      return { type: "freshness", label: "updated in the last 7d", points: 3 };
-    }
-    return null;
+    return computeFreshnessReason(updatedAt);
   }
 
   private buildPriorityCandidateBase(pr: PrRow, repo: string): PriorityCandidate {
     const attentionState = this.getAttentionState(repo, pr.number);
-    const reasons: PriorityReason[] = [];
-    let score = 0;
-
-    if (attentionState === "watch") {
-      reasons.push({ type: "watch", label: "watchlist pin", points: 30 });
-      score += 30;
-    }
-    const freshness = this.freshnessReason(pr.updated_at);
-    if (freshness) {
-      reasons.push(freshness);
-      score += freshness.points;
-    }
-    if (reasons.length === 0) {
-      reasons.push({ type: "freshness", label: "open PR fallback", points: 0 });
-    }
-    if (pr.is_draft) {
-      score -= 6;
-    }
-
-    const searchResult = this.buildSearchResultFromPrRow(pr, score);
     const labels = this.getLabelsForPr(pr.number);
-    return {
-      pr: searchResult,
+    return buildPriorityCandidateBaseModel({
+      pr: this.buildSearchResultFromPrRow(pr, 0),
       attentionState,
-      score,
-      reasons,
-      linkedIssueCount: 0,
-      relatedPullRequestCount: 0,
-      badges: {
-        draft: Boolean(pr.is_draft),
-        maintainer: labels.includes("maintainer"),
-      },
-    };
+      labels,
+      isDraft: Boolean(pr.is_draft),
+    });
   }
 
   private async enrichPriorityCandidate(
@@ -811,52 +781,11 @@ export class PrIndexStore {
     }
     relatedNumbers.delete(candidate.pr.prNumber);
 
-    const linkedIssueCount = linkedIssues.length;
-    const relatedPullRequestCount = relatedNumbers.size;
-    const reasons = [...candidate.reasons];
-    let score = candidate.score;
-
-    if (linkedIssueCount > 0) {
-      const points = Math.min(24, 12 + Math.max(0, linkedIssueCount - 1) * 4);
-      reasons.push({
-        type: "linked_issue",
-        label: `links ${linkedIssueCount} issue${linkedIssueCount === 1 ? "" : "s"}`,
-        points,
-      });
-      score += points;
-    }
-    if (relatedPullRequestCount > 0) {
-      const points = Math.min(16, 10 + Math.max(0, relatedPullRequestCount - 1) * 3);
-      reasons.push({
-        type: "related_pr",
-        label: `connects to ${relatedPullRequestCount} related PR${relatedPullRequestCount === 1 ? "" : "s"}`,
-        points,
-      });
-      score += points;
-    }
-    if (linkedIssueCount > 0 && relatedPullRequestCount > 0) {
-      reasons.push({
-        type: "hub_bonus",
-        label: "connects issues and related PR work",
-        points: 8,
-      });
-      score += 8;
-    }
-
-    const orderedReasons = reasons
-      .slice()
-      .sort((left, right) => right.points - left.points || left.label.localeCompare(right.label));
-    return {
-      ...candidate,
-      pr: {
-        ...candidate.pr,
-        score,
-      },
-      score,
-      reasons: orderedReasons,
-      linkedIssueCount,
-      relatedPullRequestCount,
-    };
+    return enrichPriorityCandidateModel({
+      candidate,
+      linkedIssueCount: linkedIssues.length,
+      relatedPullRequestCount: relatedNumbers.size,
+    });
   }
 
   private getStoredUpdatedAt(prNumber: number): string | null {
@@ -1235,114 +1164,25 @@ export class PrIndexStore {
     onProgress?: (event: SyncProgressEvent) => void;
   }): Promise<SyncSummary> {
     await this.init();
-    const mode = params.full || !this.getMeta(META_LAST_SYNC_WATERMARK) ? "full" : "incremental";
-    const watermark = this.getMeta(META_LAST_SYNC_WATERMARK);
     const repoName = `${params.repo.owner}/${params.repo.name}`;
-    this.setMeta(META_REPO, repoName);
-
-    const toProcess: number[] = [];
-    const shallowPullRequests: HydratedPullRequest[] = [];
-    const summaryPullRequests: PullRequestRecord[] = [];
-    let skippedPrs = 0;
-    let processedPrs = 0;
-    const emitProgress = (
-      phase: SyncProgressEvent["phase"],
-      currentId: number | null = null,
-      currentTitle: string | null = null,
-    ) => {
-      params.onProgress?.({
-        entity: "prs",
-        phase,
-        processed: processedPrs,
-        skipped: skippedPrs,
-        queued: Math.max(
-          0,
-          shallowPullRequests.length + summaryPullRequests.length + toProcess.length - processedPrs,
-        ),
-        totalKnown:
-          mode === "incremental"
-            ? shallowPullRequests.length + summaryPullRequests.length + toProcess.length
-            : null,
-        currentId,
-        currentTitle,
-      });
-    };
-
-    if (mode === "full") {
-      for await (const pr of params.source.listAllPullRequests(params.repo)) {
-        emitProgress("discovering", pr.number, pr.title);
-        const existingUpdatedAt = this.getStoredUpdatedAt(pr.number);
-        if (existingUpdatedAt === pr.updatedAt) {
-          skippedPrs += 1;
-          emitProgress("discovering", pr.number, pr.title);
-          continue;
-        }
-        if (params.hydrateAll) {
-          toProcess.push(pr.number);
-        } else {
-          shallowPullRequests.push({ pr, comments: [] });
-        }
-      }
-    } else if (watermark) {
-      if (params.source.listChangedPullRequestsSince) {
-        summaryPullRequests.push(
-          ...(await params.source.listChangedPullRequestsSince(params.repo, watermark)),
-        );
-      } else {
-        toProcess.push(
-          ...(await params.source.listChangedPullRequestNumbersSince(params.repo, watermark)),
-        );
-      }
-    }
-
-    for (const payload of shallowPullRequests) {
-      await this.upsertHydratedPullRequest(payload, { indexVectors: false });
-      processedPrs += 1;
-      emitProgress("syncing", payload.pr.number, payload.pr.title);
-    }
-    for (const pr of summaryPullRequests) {
-      this.upsertPullRequestSummary(pr);
-      processedPrs += 1;
-      emitProgress("syncing", pr.number, pr.title);
-    }
-
-    const tasks = toProcess.map((prNumber) => async () => {
-      const hydrated = await params.source.hydratePullRequest(params.repo, prNumber);
-      await this.upsertHydratedPullRequest(hydrated, { indexVectors: false });
-      processedPrs += 1;
-      emitProgress("syncing", hydrated.pr.number, hydrated.pr.title);
-      return prNumber;
-    });
-
-    const result = await runTasksWithConcurrency({
-      tasks,
-      limit: this.syncConcurrency,
-      errorMode: "stop",
-    });
-    if (result.hasError) {
-      throw result.firstError;
-    }
-
-    const syncedAt = isoNow();
-    this.setMeta(META_LAST_SYNC_AT, syncedAt);
-    this.setMeta(META_LAST_SYNC_WATERMARK, syncedAt);
-    emitProgress("complete");
-
-    return {
-      mode,
-      entity: "prs",
-      repo: repoName,
-      processedPrs,
-      processedIssues: 0,
-      skippedPrs,
-      skippedIssues: 0,
-      docCount: this.countRows("search_docs"),
-      commentCount: this.countRows("pr_comments"),
-      labelCount: this.countRows("pr_labels"),
+    return syncPullRequestsWorkflow({
+      ...params,
+      syncConcurrency: this.syncConcurrency,
+      lastSyncWatermark: this.getMeta(META_LAST_SYNC_WATERMARK),
+      repoName,
       vectorAvailable: this.vectorAvailable,
-      lastSyncAt: syncedAt,
-      lastSyncWatermark: syncedAt,
-    };
+      getStoredUpdatedAt: (prNumber) => this.getStoredUpdatedAt(prNumber),
+      upsertHydratedPullRequest: (payload, options) =>
+        this.upsertHydratedPullRequest(payload, options),
+      upsertPullRequestSummary: (pr) => this.upsertPullRequestSummary(pr),
+      setMeta: (key, value) => this.setMeta(key, value),
+      countRows: (table) => this.countRows(table),
+      metaKeys: {
+        repo: META_REPO,
+        lastSyncAt: META_LAST_SYNC_AT,
+        lastSyncWatermark: META_LAST_SYNC_WATERMARK,
+      },
+    });
   }
 
   async syncIssues(params: {
@@ -1352,97 +1192,23 @@ export class PrIndexStore {
     onProgress?: (event: SyncProgressEvent) => void;
   }): Promise<SyncSummary> {
     await this.init();
-    const mode =
-      params.full || !this.getMeta(META_ISSUE_LAST_SYNC_WATERMARK) ? "full" : "incremental";
-    const watermark = this.getMeta(META_ISSUE_LAST_SYNC_WATERMARK);
     const repoName = `${params.repo.owner}/${params.repo.name}`;
-    this.setMeta(META_REPO, repoName);
-
-    const toProcess: number[] = [];
-    const shallowIssues: IssueRecord[] = [];
-    let skippedIssues = 0;
-    let processedIssues = 0;
-    const emitProgress = (
-      phase: SyncProgressEvent["phase"],
-      currentId: number | null = null,
-      currentTitle: string | null = null,
-    ) => {
-      params.onProgress?.({
-        entity: "issues",
-        phase,
-        processed: processedIssues,
-        skipped: skippedIssues,
-        queued: Math.max(0, shallowIssues.length + toProcess.length - processedIssues),
-        totalKnown: mode === "incremental" ? shallowIssues.length + toProcess.length : null,
-        currentId,
-        currentTitle,
-      });
-    };
-
-    if (mode === "full") {
-      for await (const issue of params.source.listAllIssues(params.repo)) {
-        emitProgress("discovering", issue.number, issue.title);
-        const existingUpdatedAt = this.getStoredIssueUpdatedAt(issue.number);
-        if (existingUpdatedAt === issue.updatedAt) {
-          skippedIssues += 1;
-          emitProgress("discovering", issue.number, issue.title);
-          continue;
-        }
-        shallowIssues.push(issue);
-      }
-    } else if (watermark) {
-      if (params.source.listChangedIssuesSince) {
-        shallowIssues.push(...(await params.source.listChangedIssuesSince(params.repo, watermark)));
-      } else {
-        toProcess.push(
-          ...(await params.source.listChangedIssueNumbersSince(params.repo, watermark)),
-        );
-      }
-    }
-
-    for (const issue of shallowIssues) {
-      this.upsertIssue(issue);
-      processedIssues += 1;
-      emitProgress("syncing", issue.number, issue.title);
-    }
-
-    const tasks = toProcess.map((issueNumber) => async () => {
-      const issue = await params.source.getIssue(params.repo, issueNumber);
-      this.upsertIssue(issue);
-      processedIssues += 1;
-      emitProgress("syncing", issue.number, issue.title);
-      return issueNumber;
-    });
-
-    const result = await runTasksWithConcurrency({
-      tasks,
-      limit: this.syncConcurrency,
-      errorMode: "stop",
-    });
-    if (result.hasError) {
-      throw result.firstError;
-    }
-
-    const syncedAt = isoNow();
-    this.setMeta(META_ISSUE_LAST_SYNC_AT, syncedAt);
-    this.setMeta(META_ISSUE_LAST_SYNC_WATERMARK, syncedAt);
-    emitProgress("complete");
-
-    return {
-      mode,
-      entity: "issues",
-      repo: repoName,
-      processedPrs: 0,
-      processedIssues,
-      skippedPrs: 0,
-      skippedIssues,
-      docCount: this.countRows("search_docs"),
-      commentCount: this.countRows("pr_comments"),
-      labelCount: this.countRows("issue_labels"),
+    return syncIssuesWorkflow({
+      ...params,
+      syncConcurrency: this.syncConcurrency,
+      lastSyncWatermark: this.getMeta(META_ISSUE_LAST_SYNC_WATERMARK),
+      repoName,
       vectorAvailable: this.vectorAvailable,
-      lastSyncAt: syncedAt,
-      lastSyncWatermark: syncedAt,
-    };
+      getStoredIssueUpdatedAt: (issueNumber) => this.getStoredIssueUpdatedAt(issueNumber),
+      upsertIssue: (issue) => this.upsertIssue(issue),
+      setMeta: (key, value) => this.setMeta(key, value),
+      countRows: (table) => this.countRows(table),
+      metaKeys: {
+        repo: META_REPO,
+        lastSyncAt: META_ISSUE_LAST_SYNC_AT,
+        lastSyncWatermark: META_ISSUE_LAST_SYNC_WATERMARK,
+      },
+    });
   }
 
   private countRows(table: string): number {
