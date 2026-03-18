@@ -59,6 +59,8 @@ function createControllerStub() {
     subscribe: vi.fn(() => () => {}),
     getRenderModel: vi.fn(() => renderModel),
     initialize: vi.fn(async () => {}),
+    reportError: vi.fn(),
+    dispose: vi.fn(),
   };
 }
 
@@ -149,5 +151,42 @@ describe("BlessedTuiRenderer", () => {
 
     expect(controller.dispatch).toHaveBeenCalledTimes(1);
     expect(controller.dispatch).toHaveBeenCalledWith({ type: "toggle_detail" });
+  });
+
+  it("reports async dispatch failures instead of leaking them", async () => {
+    const controller = createControllerStub();
+    controller.dispatch.mockRejectedValue(new Error("detail boom"));
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness;
+    renderers.push(harness);
+
+    await harness.handleKeypress("", { name: "enter" } as blessed.Widgets.Events.IKeyEventArg);
+
+    expect(controller.reportError).toHaveBeenCalledWith("detail boom", "UI action");
+  });
+
+  it("stops the spinner and disposes the controller when destroyed", async () => {
+    const controller = createControllerStub();
+    controller.getRenderModel.mockReturnValue({
+      ...renderModel,
+      busy: true,
+      header: {
+        ...renderModel.header,
+        busyMessage: "Working",
+      },
+    });
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness & {
+      screen: blessed.Widgets.Screen;
+      spinnerInterval: NodeJS.Timeout | null;
+    };
+    renderers.push(harness);
+    const runPromise = renderer.run();
+    await Promise.resolve();
+    harness.screen.destroy();
+    await runPromise;
+
+    expect(harness.spinnerInterval).toBeNull();
+    expect(controller.dispose).toHaveBeenCalledTimes(1);
   });
 });

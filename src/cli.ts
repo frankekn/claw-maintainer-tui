@@ -2,38 +2,50 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import * as path from "node:path";
 import { GhCliPullRequestDataSource, parseRepoRef } from "./github.js";
+import { isoNow } from "./lib/time.js";
+import { ensurePullRequestFacts } from "./pr-facts.js";
 import {
   benchmarkSemanticDataset,
   bootstrapSemanticDataset,
   previewNextSemanticReview,
   recordSemanticReview,
 } from "./semantic.js";
-import { ensurePullRequestFacts } from "./pr-facts.js";
 import { PrIndexStore } from "./store.js";
 import { runTui } from "./tui/index.js";
 import type {
   PullRequestReviewFact,
+  PullRequestShowResult,
   ReviewFactDecision,
+  SearchResult,
   SemanticQuerySourceKind,
+  SyncSummary,
 } from "./types.js";
 
-type Command =
-  | "sync"
-  | "sync-issues"
-  | "search"
-  | "issue-search"
-  | "show"
-  | "issue-show"
-  | "status"
-  | "tui"
-  | "xref-issue"
-  | "xref-pr"
-  | "cluster-pr"
-  | "review-fact-record"
-  | "review-fact-import"
-  | "semantic-bootstrap"
-  | "semantic-review"
-  | "semantic-benchmark";
+const COMMAND_USAGE = {
+  sync: "sync [--full] [--hydrate-all] [--fts-only] [--repo owner/name] [--db path]",
+  "sync-issues": "sync-issues [--full] [--repo owner/name] [--db path]",
+  search: "search <query> [--limit N] [--repo owner/name] [--db path]",
+  "issue-search": "issue-search <query> [--limit N] [--repo owner/name] [--db path]",
+  show: "show <pr-number> [--repo owner/name] [--db path]",
+  "issue-show": "issue-show <issue-number> [--repo owner/name] [--db path]",
+  status: "status [--repo owner/name] [--db path]",
+  tui: "tui [--fts-only] [--repo owner/name] [--db path]",
+  "xref-issue": "xref-issue <issue-number> [--limit N] [--repo owner/name] [--db path]",
+  "xref-pr": "xref-pr <pr-number> [--limit N] [--repo owner/name] [--db path]",
+  "cluster-pr": "cluster-pr <pr-number> [--limit N] [--refresh] [--repo owner/name] [--db path]",
+  "review-fact-record":
+    "review-fact record --pr <number> --head <sha> --decision ready|needs_work|blocked --summary <text> [--command <cmd>]... [--failing-test <name>]... [--source <name>] [--repo owner/name] [--db path]",
+  "review-fact-import":
+    "review-fact import <json-file> [--source <name>] [--repo owner/name] [--db path]",
+  "semantic-bootstrap":
+    "semantic-bootstrap [--repo owner/name] [--db path] [--dataset path] [--limit N] [--seed N] [--source-kind all|title|body|comment]",
+  "semantic-review":
+    "semantic-review [--repo owner/name] [--db path] [--dataset path] [--split dev|holdout] [--query-id id --primary N --related 12:2,13:1 | --drop]",
+  "semantic-benchmark":
+    "semantic-benchmark [--repo owner/name] [--db path] [--dataset path] [--split dev|holdout|all] [--limit N] [--fts-only]",
+} as const;
+
+type Command = keyof typeof COMMAND_USAGE;
 
 type ParsedArgs = {
   command: Command;
@@ -65,25 +77,29 @@ type ParsedArgs = {
   refresh: boolean;
 };
 
+type CommandContext = {
+  args: ParsedArgs;
+  repo: ReturnType<typeof parseRepoRef>;
+  store: PrIndexStore;
+  source: GhCliPullRequestDataSource;
+};
+
+type CommandHandler = (context: CommandContext) => Promise<number>;
+
+class CliUsageError extends Error {
+  constructor(
+    readonly output: string,
+    readonly exitCode: number,
+    readonly stream: "stdout" | "stderr",
+  ) {
+    super(output);
+  }
+}
+
 function usage(): string {
   return [
     "Usage:",
-    "  clawlens sync [--full] [--hydrate-all] [--fts-only] [--repo owner/name] [--db path]",
-    "  clawlens sync-issues [--full] [--repo owner/name] [--db path]",
-    "  clawlens search <query> [--limit N] [--repo owner/name] [--db path]",
-    "  clawlens issue-search <query> [--limit N] [--repo owner/name] [--db path]",
-    "  clawlens show <pr-number> [--repo owner/name] [--db path]",
-    "  clawlens issue-show <issue-number> [--repo owner/name] [--db path]",
-    "  clawlens status [--repo owner/name] [--db path]",
-    "  clawlens tui [--fts-only] [--repo owner/name] [--db path]",
-    "  clawlens xref-issue <issue-number> [--limit N] [--repo owner/name] [--db path]",
-    "  clawlens xref-pr <pr-number> [--limit N] [--repo owner/name] [--db path]",
-    "  clawlens cluster-pr <pr-number> [--limit N] [--refresh] [--repo owner/name] [--db path]",
-    "  clawlens review-fact record --pr <number> --head <sha> --decision ready|needs_work|blocked --summary <text> [--command <cmd>]... [--failing-test <name>]... [--source <name>] [--repo owner/name] [--db path]",
-    "  clawlens review-fact import <json-file> [--source <name>] [--repo owner/name] [--db path]",
-    "  clawlens semantic-bootstrap [--repo owner/name] [--db path] [--dataset path] [--limit N] [--seed N] [--source-kind all|title|body|comment]",
-    "  clawlens semantic-review [--repo owner/name] [--db path] [--dataset path] [--split dev|holdout] [--query-id id --primary N --related 12:2,13:1 | --drop]",
-    "  clawlens semantic-benchmark [--repo owner/name] [--db path] [--dataset path] [--split dev|holdout|all] [--limit N] [--fts-only]",
+    ...Object.values(COMMAND_USAGE).map((line) => `  clawlens ${line}`),
     "",
     "During development you can still run the same commands via `pnpm clawlens ...`.",
   ].join("\n");
@@ -113,42 +129,35 @@ function parseRelated(value: string): Array<{ prNumber: number; grade: 1 | 2 }> 
   });
 }
 
-function parseArgs(argv: string[]): ParsedArgs {
-  let [commandRaw, ...rest] = argv;
+function parseCommand(commandRaw: string | undefined, rest: string[]): Command {
+  if (!commandRaw) {
+    throw new CliUsageError(usage(), 0, "stdout");
+  }
   if (commandRaw === "review-fact") {
     const action = rest.shift();
     if (action === "record") {
-      commandRaw = "review-fact-record";
-    } else if (action === "import") {
-      commandRaw = "review-fact-import";
+      return "review-fact-record";
+    }
+    if (action === "import") {
+      return "review-fact-import";
     }
   }
-  if (
-    !commandRaw ||
-    ![
-      "sync",
-      "sync-issues",
-      "search",
-      "issue-search",
-      "show",
-      "issue-show",
-      "status",
-      "tui",
-      "xref-issue",
-      "xref-pr",
-      "cluster-pr",
-      "review-fact-record",
-      "review-fact-import",
-      "semantic-bootstrap",
-      "semantic-review",
-      "semantic-benchmark",
-    ].includes(commandRaw)
-  ) {
-    throw new Error(usage());
+  if (commandRaw in COMMAND_USAGE) {
+    return commandRaw as Command;
+  }
+  throw new CliUsageError(usage(), 1, "stderr");
+}
+
+function parseArgs(argv: string[]): ParsedArgs {
+  if (argv.length === 0 || argv.includes("--help") || argv.includes("-h")) {
+    throw new CliUsageError(usage(), 0, "stdout");
   }
 
+  const [commandRaw, ...restInput] = argv;
+  const rest = [...restInput];
+  const command = parseCommand(commandRaw, rest);
   const args: ParsedArgs = {
-    command: commandRaw as Command,
+    command,
     repo: "openclaw/openclaw",
     full: false,
     hydrateAll: false,
@@ -326,6 +335,12 @@ function formatLabels(labels: string[]): string {
   return labels.length > 0 ? labels.join(", ") : "(none)";
 }
 
+function printLines(lines: string[]): void {
+  for (const line of lines) {
+    console.log(line);
+  }
+}
+
 function normalizeReviewFactRecord(
   value: unknown,
   defaults: { repo: string; source: string },
@@ -356,92 +371,128 @@ function normalizeReviewFactRecord(
       return Array.isArray(tests) ? tests.map((item) => String(item)) : [];
     })(),
     source: String(row.source ?? defaults.source).trim() || defaults.source,
-    recordedAt:
-      typeof row.recordedAt === "string" && row.recordedAt
-        ? row.recordedAt
-        : new Date().toISOString(),
+    recordedAt: typeof row.recordedAt === "string" && row.recordedAt ? row.recordedAt : isoNow(),
   };
 }
 
-export async function runCli(argv = process.argv.slice(2)): Promise<number> {
-  const args = parseArgs(argv);
-  const repo = parseRepoRef(args.repo);
-  const store = new PrIndexStore({
-    dbPath: args.dbPath!,
-    enableVector: !args.ftsOnly && args.command !== "cluster-pr",
-  });
-  const source = new GhCliPullRequestDataSource();
+function printSyncSummary(summary: SyncSummary, options: { includeDocs: boolean }): number {
+  printLines([
+    `repo: ${summary.repo}`,
+    `entity: ${summary.entity}`,
+    `mode: ${summary.mode}`,
+    `processed_prs: ${summary.processedPrs}`,
+    `processed_issues: ${summary.processedIssues}`,
+    `skipped_prs: ${summary.skippedPrs}`,
+    `skipped_issues: ${summary.skippedIssues}`,
+    ...(options.includeDocs
+      ? [`docs: ${summary.docCount}`, `comments: ${summary.commentCount}`]
+      : []),
+    `labels: ${summary.labelCount}`,
+    ...(options.includeDocs ? [`vector_available: ${summary.vectorAvailable}`] : []),
+    `last_sync_at: ${summary.lastSyncAt}`,
+  ]);
+  return 0;
+}
 
-  if (args.command === "sync") {
-    const summary = await store.sync({
-      repo,
-      source,
-      full: args.full,
-      hydrateAll: args.hydrateAll,
-    });
-    console.log(`repo: ${summary.repo}`);
-    console.log(`entity: ${summary.entity}`);
-    console.log(`mode: ${summary.mode}`);
-    console.log(`processed_prs: ${summary.processedPrs}`);
-    console.log(`processed_issues: ${summary.processedIssues}`);
-    console.log(`skipped_prs: ${summary.skippedPrs}`);
-    console.log(`skipped_issues: ${summary.skippedIssues}`);
-    console.log(`docs: ${summary.docCount}`);
-    console.log(`comments: ${summary.commentCount}`);
-    console.log(`labels: ${summary.labelCount}`);
-    console.log(`vector_available: ${summary.vectorAvailable}`);
-    console.log(`last_sync_at: ${summary.lastSyncAt}`);
+function printPullRequestShow(payload: PullRequestShowResult): number {
+  if (!payload.pr) {
+    return 1;
+  }
+  printLines([
+    `#${payload.pr.prNumber} ${payload.pr.title}`,
+    `state: ${payload.pr.state}`,
+    `author: ${payload.pr.author}`,
+    `updated_at: ${payload.pr.updatedAt}`,
+    `labels: ${formatLabels(payload.pr.labels)}`,
+    `url: ${payload.pr.url}`,
+    "",
+    payload.pr.matchedExcerpt,
+  ]);
+  if (payload.comments.length > 0) {
+    console.log("");
+    console.log("comments:");
+    for (const comment of payload.comments) {
+      console.log(`- [${comment.kind}] ${comment.author} ${comment.createdAt}`);
+      console.log(`  ${comment.excerpt}`);
+    }
+  }
+  return 0;
+}
+
+function printSearchResults(results: SearchResult[]): number {
+  if (results.length === 0) {
+    console.log("No results.");
     return 0;
   }
-
-  if (args.command === "sync-issues") {
-    const summary = await store.syncIssues({
-      repo,
-      source,
-      full: args.full,
-    });
-    console.log(`repo: ${summary.repo}`);
-    console.log(`entity: ${summary.entity}`);
-    console.log(`mode: ${summary.mode}`);
-    console.log(`processed_prs: ${summary.processedPrs}`);
-    console.log(`processed_issues: ${summary.processedIssues}`);
-    console.log(`skipped_prs: ${summary.skippedPrs}`);
-    console.log(`skipped_issues: ${summary.skippedIssues}`);
-    console.log(`labels: ${summary.labelCount}`);
-    console.log(`last_sync_at: ${summary.lastSyncAt}`);
-    return 0;
+  for (const result of results) {
+    printLines([
+      `#${result.prNumber} ${result.title}`,
+      `score: ${result.score.toFixed(3)} | state: ${result.state} | author: ${result.author}`,
+      `labels: ${formatLabels(result.labels)}`,
+      `updated_at: ${result.updatedAt}`,
+      `match: ${result.matchedDocKind}`,
+      `url: ${result.url}`,
+      result.matchedExcerpt,
+      "",
+    ]);
   }
+  return 0;
+}
 
-  if (args.command === "status") {
+const commandHandlers: Record<Command, CommandHandler> = {
+  sync: async ({ args, repo, source, store }) =>
+    printSyncSummary(
+      await store.sync({
+        repo,
+        source,
+        full: args.full,
+        hydrateAll: args.hydrateAll,
+      }),
+      { includeDocs: true },
+    ),
+
+  "sync-issues": async ({ args, repo, source, store }) =>
+    printSyncSummary(
+      await store.syncIssues({
+        repo,
+        source,
+        full: args.full,
+      }),
+      { includeDocs: false },
+    ),
+
+  status: async ({ args, store }) => {
     const status = await store.status();
-    console.log(`repo: ${status.repo || args.repo}`);
-    console.log(`db: ${args.dbPath}`);
-    console.log(`last_sync_at: ${status.lastSyncAt ?? "(never)"}`);
-    console.log(`last_sync_watermark: ${status.lastSyncWatermark ?? "(never)"}`);
-    console.log(`issue_last_sync_at: ${status.issueLastSyncAt ?? "(never)"}`);
-    console.log(`issue_last_sync_watermark: ${status.issueLastSyncWatermark ?? "(never)"}`);
-    console.log(`prs: ${status.prCount}`);
-    console.log(`issues: ${status.issueCount}`);
-    console.log(`labels: ${status.labelCount}`);
-    console.log(`issue_labels: ${status.issueLabelCount}`);
-    console.log(`comments: ${status.commentCount}`);
-    console.log(`docs: ${status.docCount}`);
-    console.log(`vector_available: ${status.vectorAvailable}`);
-    console.log(`vector_error: ${status.vectorError ?? "(none)"}`);
-    console.log(`embedding_model: ${status.embeddingModel}`);
+    printLines([
+      `repo: ${status.repo || args.repo}`,
+      `db: ${args.dbPath}`,
+      `last_sync_at: ${status.lastSyncAt ?? "(never)"}`,
+      `last_sync_watermark: ${status.lastSyncWatermark ?? "(never)"}`,
+      `issue_last_sync_at: ${status.issueLastSyncAt ?? "(never)"}`,
+      `issue_last_sync_watermark: ${status.issueLastSyncWatermark ?? "(never)"}`,
+      `prs: ${status.prCount}`,
+      `issues: ${status.issueCount}`,
+      `labels: ${status.labelCount}`,
+      `issue_labels: ${status.issueLabelCount}`,
+      `comments: ${status.commentCount}`,
+      `docs: ${status.docCount}`,
+      `vector_available: ${status.vectorAvailable}`,
+      `vector_error: ${status.vectorError ?? "(none)"}`,
+      `embedding_model: ${status.embeddingModel}`,
+    ]);
     return 0;
-  }
+  },
 
-  if (args.command === "tui") {
+  tui: async ({ args }) => {
     await runTui({
       repo: args.repo,
       dbPath: args.dbPath!,
       ftsOnly: args.ftsOnly,
     });
     return 0;
-  }
+  },
 
-  if (args.command === "semantic-bootstrap") {
+  "semantic-bootstrap": async ({ args, store }) => {
     const summary = await bootstrapSemanticDataset({
       store,
       datasetPath: args.datasetPath!,
@@ -449,15 +500,17 @@ export async function runCli(argv = process.argv.slice(2)): Promise<number> {
       seed: args.seed,
       sourceKinds: args.sourceKind === "all" ? undefined : [args.sourceKind],
     });
-    console.log(`dataset: ${summary.datasetPath}`);
-    console.log(`queries: ${summary.queryCount}`);
-    console.log(`judgments: ${summary.judgmentCount}`);
-    console.log(`dev_queries: ${summary.splitCounts.dev}`);
-    console.log(`holdout_queries: ${summary.splitCounts.holdout}`);
+    printLines([
+      `dataset: ${summary.datasetPath}`,
+      `queries: ${summary.queryCount}`,
+      `judgments: ${summary.judgmentCount}`,
+      `dev_queries: ${summary.splitCounts.dev}`,
+      `holdout_queries: ${summary.splitCounts.holdout}`,
+    ]);
     return 0;
-  }
+  },
 
-  if (args.command === "semantic-review") {
+  "semantic-review": async ({ args, store }) => {
     if (!args.queryId) {
       const preview = await previewNextSemanticReview({
         store,
@@ -469,12 +522,14 @@ export async function runCli(argv = process.argv.slice(2)): Promise<number> {
         console.log("No pending semantic review queries.");
         return 0;
       }
-      console.log(`query_id: ${preview.query.queryId}`);
-      console.log(`split: ${preview.query.split}`);
-      console.log(`source_kind: ${preview.query.sourceKind}`);
-      console.log(`source_ref: ${preview.query.sourceRef}`);
-      console.log(`source_pr: ${preview.query.sourcePrNumber}`);
-      console.log(`query: ${preview.query.query}`);
+      printLines([
+        `query_id: ${preview.query.queryId}`,
+        `split: ${preview.query.split}`,
+        `source_kind: ${preview.query.sourceKind}`,
+        `source_ref: ${preview.query.sourceRef}`,
+        `source_pr: ${preview.query.sourcePrNumber}`,
+        `query: ${preview.query.query}`,
+      ]);
       if (preview.judgments.length > 0) {
         console.log("draft_judgments:");
         for (const judgment of preview.judgments) {
@@ -499,12 +554,11 @@ export async function runCli(argv = process.argv.slice(2)): Promise<number> {
       note: args.note,
       drop: args.drop,
     });
-    console.log(`updated_query: ${args.queryId}`);
-    console.log(`action: ${args.drop ? "dropped" : "reviewed"}`);
+    printLines([`updated_query: ${args.queryId}`, `action: ${args.drop ? "dropped" : "reviewed"}`]);
     return 0;
-  }
+  },
 
-  if (args.command === "semantic-benchmark") {
+  "semantic-benchmark": async ({ args, store }) => {
     const report = await benchmarkSemanticDataset({
       store,
       datasetPath: args.datasetPath!,
@@ -512,14 +566,16 @@ export async function runCli(argv = process.argv.slice(2)): Promise<number> {
       limit: args.limit,
       mode: args.ftsOnly ? "fts" : "hybrid",
     });
-    console.log(`split: ${report.split}`);
-    console.log(`mode: ${report.mode}`);
-    console.log(`queries: ${report.overall.queryCount}`);
-    console.log(`mrr: ${report.overall.mrr.toFixed(4)}`);
-    console.log(`ndcg_at_5: ${report.overall.ndcgAt5.toFixed(4)}`);
-    console.log(`recall_at_1: ${report.overall.recallAt1.toFixed(4)}`);
-    console.log(`recall_at_5: ${report.overall.recallAt5.toFixed(4)}`);
-    console.log(`recall_at_10: ${report.overall.recallAt10.toFixed(4)}`);
+    printLines([
+      `split: ${report.split}`,
+      `mode: ${report.mode}`,
+      `queries: ${report.overall.queryCount}`,
+      `mrr: ${report.overall.mrr.toFixed(4)}`,
+      `ndcg_at_5: ${report.overall.ndcgAt5.toFixed(4)}`,
+      `recall_at_1: ${report.overall.recallAt1.toFixed(4)}`,
+      `recall_at_5: ${report.overall.recallAt5.toFixed(4)}`,
+      `recall_at_10: ${report.overall.recallAt10.toFixed(4)}`,
+    ]);
     for (const [sourceKind, metrics] of Object.entries(report.bySourceKind)) {
       if (!metrics) {
         continue;
@@ -529,59 +585,47 @@ export async function runCli(argv = process.argv.slice(2)): Promise<number> {
       );
     }
     return 0;
-  }
+  },
 
-  if (args.command === "show") {
+  show: async ({ args, store }) => {
     const payload = await store.show(args.prNumber!);
     if (!payload.pr) {
       console.log(`PR #${args.prNumber} not found in local index.`);
       return 1;
     }
-    console.log(`#${payload.pr.prNumber} ${payload.pr.title}`);
-    console.log(`state: ${payload.pr.state}`);
-    console.log(`author: ${payload.pr.author}`);
-    console.log(`updated_at: ${payload.pr.updatedAt}`);
-    console.log(`labels: ${formatLabels(payload.pr.labels)}`);
-    console.log(`url: ${payload.pr.url}`);
-    console.log("");
-    console.log(payload.pr.matchedExcerpt);
-    if (payload.comments.length > 0) {
-      console.log("");
-      console.log("comments:");
-      for (const comment of payload.comments) {
-        console.log(`- [${comment.kind}] ${comment.author} ${comment.createdAt}`);
-        console.log(`  ${comment.excerpt}`);
-      }
-    }
-    return 0;
-  }
+    return printPullRequestShow(payload);
+  },
 
-  if (args.command === "issue-show") {
+  "issue-show": async ({ args, store }) => {
     const issue = await store.showIssue(args.prNumber!);
     if (!issue) {
       console.log(`Issue #${args.prNumber} not found in local index.`);
       return 1;
     }
-    console.log(`#${issue.issueNumber} ${issue.title}`);
-    console.log(`state: ${issue.state}`);
-    console.log(`author: ${issue.author}`);
-    console.log(`updated_at: ${issue.updatedAt}`);
-    console.log(`labels: ${formatLabels(issue.labels)}`);
-    console.log(`url: ${issue.url}`);
-    console.log("");
-    console.log(issue.matchedExcerpt);
+    printLines([
+      `#${issue.issueNumber} ${issue.title}`,
+      `state: ${issue.state}`,
+      `author: ${issue.author}`,
+      `updated_at: ${issue.updatedAt}`,
+      `labels: ${formatLabels(issue.labels)}`,
+      `url: ${issue.url}`,
+      "",
+      issue.matchedExcerpt,
+    ]);
     return 0;
-  }
+  },
 
-  if (args.command === "xref-issue") {
+  "xref-issue": async ({ args, store }) => {
     const result = await store.crossReferenceIssueToPullRequests(args.prNumber!, args.limit);
     if (!result.issue) {
       console.log(`Issue #${args.prNumber} not found in local index.`);
       return 1;
     }
-    console.log(`issue: #${result.issue.issueNumber} ${result.issue.title}`);
-    console.log(`url: ${result.issue.url}`);
-    console.log("");
+    printLines([
+      `issue: #${result.issue.issueNumber} ${result.issue.title}`,
+      `url: ${result.issue.url}`,
+      "",
+    ]);
     if (result.pullRequests.length === 0) {
       console.log("No related pull requests found.");
       return 0;
@@ -591,17 +635,19 @@ export async function runCli(argv = process.argv.slice(2)): Promise<number> {
       console.log(`- #${pr.prNumber} score:${pr.score.toFixed(3)} ${pr.title}`);
     }
     return 0;
-  }
+  },
 
-  if (args.command === "xref-pr") {
+  "xref-pr": async ({ args, store }) => {
     const result = await store.crossReferencePullRequestToIssues(args.prNumber!, args.limit);
     if (!result.pullRequest) {
       console.log(`PR #${args.prNumber} not found in local index.`);
       return 1;
     }
-    console.log(`pull_request: #${result.pullRequest.prNumber} ${result.pullRequest.title}`);
-    console.log(`url: ${result.pullRequest.url}`);
-    console.log("");
+    printLines([
+      `pull_request: #${result.pullRequest.prNumber} ${result.pullRequest.title}`,
+      `url: ${result.pullRequest.url}`,
+      "",
+    ]);
     if (result.issues.length === 0) {
       console.log("No related issues found.");
       return 0;
@@ -611,9 +657,9 @@ export async function runCli(argv = process.argv.slice(2)): Promise<number> {
       console.log(`- #${issue.issueNumber} score:${issue.score.toFixed(3)} ${issue.title}`);
     }
     return 0;
-  }
+  },
 
-  if (args.command === "cluster-pr") {
+  "cluster-pr": async ({ args, repo, source, store }) => {
     await ensurePullRequestFacts(store, source, repo, args.prNumber!, args.refresh);
     await store.ensureDerivedIssueLinksBackfilled();
     const refreshed = await store.clusterPullRequest({
@@ -628,20 +674,22 @@ export async function runCli(argv = process.argv.slice(2)): Promise<number> {
       console.log(`PR #${args.prNumber} not found in local index.`);
       return 1;
     }
-    console.log(`seed_pr: #${refreshed.seedPr.prNumber} ${refreshed.seedPr.title}`);
-    console.log(`url: ${refreshed.seedPr.url}`);
-    console.log(`cluster_basis: ${refreshed.clusterBasis}`);
-    console.log(
+    printLines([
+      `seed_pr: #${refreshed.seedPr.prNumber} ${refreshed.seedPr.title}`,
+      `url: ${refreshed.seedPr.url}`,
+      `cluster_basis: ${refreshed.clusterBasis}`,
       `cluster_issues: ${
         refreshed.clusterIssueNumbers.length > 0
           ? refreshed.clusterIssueNumbers.map((issueNumber) => `#${issueNumber}`).join(", ")
           : "(none)"
       }`,
-    );
-    console.log("");
+      "",
+    ]);
     if (refreshed.bestBase) {
-      console.log(`best_base: #${refreshed.bestBase.prNumber} ${refreshed.bestBase.title}`);
-      console.log(`best_base_reason: ${refreshed.bestBase.reason ?? "highest ranked candidate"}`);
+      printLines([
+        `best_base: #${refreshed.bestBase.prNumber} ${refreshed.bestBase.title}`,
+        `best_base_reason: ${refreshed.bestBase.reason ?? "highest ranked candidate"}`,
+      ]);
     } else {
       console.log("best_base: (none)");
     }
@@ -680,9 +728,11 @@ export async function runCli(argv = process.argv.slice(2)): Promise<number> {
     }
     console.log("");
     if (refreshed.mergeReadiness) {
-      console.log(`merge_readiness: ${refreshed.mergeReadiness.state}`);
-      console.log(`merge_readiness_source: ${refreshed.mergeReadiness.source}`);
-      console.log(`merge_readiness_summary: ${refreshed.mergeReadiness.summary}`);
+      printLines([
+        `merge_readiness: ${refreshed.mergeReadiness.state}`,
+        `merge_readiness_source: ${refreshed.mergeReadiness.source}`,
+        `merge_readiness_summary: ${refreshed.mergeReadiness.summary}`,
+      ]);
       if (refreshed.mergeReadiness.source === "review_fact") {
         if (refreshed.mergeReadiness.failingTests.length > 0) {
           console.log("failing_tests:");
@@ -711,9 +761,9 @@ export async function runCli(argv = process.argv.slice(2)): Promise<number> {
       }
     }
     return 0;
-  }
+  },
 
-  if (args.command === "review-fact-record") {
+  "review-fact-record": async ({ args, store }) => {
     await store.recordReviewFact({
       repo: args.repo,
       prNumber: args.prNumber!,
@@ -723,15 +773,17 @@ export async function runCli(argv = process.argv.slice(2)): Promise<number> {
       commands: args.reviewFactCommands,
       failingTests: args.reviewFactFailingTests,
       source: args.reviewFactSource,
-      recordedAt: new Date().toISOString(),
+      recordedAt: isoNow(),
     });
-    console.log(`recorded_review_fact: #${args.prNumber}`);
-    console.log(`decision: ${args.reviewFactDecision}`);
-    console.log(`source: ${args.reviewFactSource}`);
+    printLines([
+      `recorded_review_fact: #${args.prNumber}`,
+      `decision: ${args.reviewFactDecision}`,
+      `source: ${args.reviewFactSource}`,
+    ]);
     return 0;
-  }
+  },
 
-  if (args.command === "review-fact-import") {
+  "review-fact-import": async ({ args, store }) => {
     const raw = await readFile(args.reviewFactPath!, "utf8");
     const parsed = JSON.parse(raw) as unknown;
     const records = Array.isArray(parsed) ? parsed : [parsed];
@@ -745,44 +797,51 @@ export async function runCli(argv = process.argv.slice(2)): Promise<number> {
     }
     console.log(`imported_review_facts: ${records.length}`);
     return 0;
-  }
+  },
 
-  if (args.command === "issue-search") {
+  "issue-search": async ({ args, store }) => {
     const results = await store.searchIssues(args.query!, args.limit);
     if (results.length === 0) {
       console.log("No results.");
       return 0;
     }
     for (const result of results) {
-      console.log(`#${result.issueNumber} ${result.title}`);
-      console.log(
+      printLines([
+        `#${result.issueNumber} ${result.title}`,
         `score: ${result.score.toFixed(3)} | state: ${result.state} | author: ${result.author}`,
-      );
-      console.log(`labels: ${formatLabels(result.labels)}`);
-      console.log(`updated_at: ${result.updatedAt}`);
-      console.log(`url: ${result.url}`);
-      console.log(result.matchedExcerpt);
-      console.log("");
+        `labels: ${formatLabels(result.labels)}`,
+        `updated_at: ${result.updatedAt}`,
+        `url: ${result.url}`,
+        result.matchedExcerpt,
+        "",
+      ]);
     }
     return 0;
-  }
+  },
 
-  const results = await store.search(args.query!, args.limit);
-  if (results.length === 0) {
-    console.log("No results.");
-    return 0;
+  search: async ({ args, store }) =>
+    printSearchResults(await store.search(args.query!, args.limit)),
+};
+
+export async function runCli(argv = process.argv.slice(2)): Promise<number> {
+  try {
+    const args = parseArgs(argv);
+    const repo = parseRepoRef(args.repo);
+    const store = new PrIndexStore({
+      dbPath: args.dbPath!,
+      enableVector: !args.ftsOnly && args.command !== "cluster-pr",
+    });
+    const source = new GhCliPullRequestDataSource();
+    return await commandHandlers[args.command]({ args, repo, store, source });
+  } catch (error) {
+    if (error instanceof CliUsageError) {
+      if (error.stream === "stdout") {
+        console.log(error.output);
+      } else {
+        console.error(error.output);
+      }
+      return error.exitCode;
+    }
+    throw error;
   }
-  for (const result of results) {
-    console.log(`#${result.prNumber} ${result.title}`);
-    console.log(
-      `score: ${result.score.toFixed(3)} | state: ${result.state} | author: ${result.author}`,
-    );
-    console.log(`labels: ${formatLabels(result.labels)}`);
-    console.log(`updated_at: ${result.updatedAt}`);
-    console.log(`match: ${result.matchedDocKind}`);
-    console.log(`url: ${result.url}`);
-    console.log(result.matchedExcerpt);
-    console.log("");
-  }
-  return 0;
 }

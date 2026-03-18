@@ -4,6 +4,7 @@ import type {
   ClusterExcludedCandidate,
   ClusterPullRequestAnalysis,
   IssueSearchResult,
+  PullRequestShowResult,
   PrContextBundle,
   PriorityCandidate,
   SearchResult,
@@ -146,6 +147,29 @@ export type TuiSessionState = {
   history: TuiViewSnapshot[];
 };
 
+export type SearchMode = "cross-search" | "pr-search" | "issue-search";
+export type PriorityMode = "inbox" | "watchlist";
+export type ListMode = SearchMode | PriorityMode;
+export type MetadataEntity = "prs" | "issues";
+
+export type ListLoadResult = {
+  mode: ListMode;
+  rows: TuiResultRow[];
+  resultTitle: string;
+  message: string;
+  activeUrl: string | null;
+  isLandingView: boolean;
+};
+
+export type LoadedDetailResult = {
+  payload: TuiDetailPayload;
+  identity: string | null;
+  status: string | null;
+  context: { kind: "pr"; prNumber: number } | { kind: "issue"; issueNumber: number } | null;
+  activeUrl: string | null;
+  focusSection: TuiDetailSection | null;
+};
+
 export type TuiCommand =
   | { type: "focus_next" }
   | { type: "focus_results" }
@@ -235,16 +259,7 @@ export interface TuiDataService {
   searchIssues(query: string, limit: number): Promise<IssueSearchResult[]>;
   getPrContextBundle(prNumber: number): Promise<PrContextBundle | null>;
   setPrAttentionState(prNumber: number, state: AttentionState | null): Promise<void>;
-  show(prNumber: number): Promise<{
-    pr: SearchResult | null;
-    comments: Array<{
-      kind: string;
-      author: string;
-      createdAt: string;
-      url: string;
-      excerpt: string;
-    }>;
-  }>;
+  show(prNumber: number): Promise<PullRequestShowResult>;
   showIssue(issueNumber: number): Promise<IssueSearchResult | null>;
   xrefIssue(
     issueNumber: number,

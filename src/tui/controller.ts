@@ -1,12 +1,21 @@
 import { buildStatusRows } from "./format.js";
 import { TuiEffects } from "./effects.js";
+import { buildListSummary, currentBrowseCapacity, resolveListRows } from "./listing.js";
+import {
+  computePrFreshness,
+  rowFreshness,
+  rowIdentity,
+  rowIdentityForAny,
+  rowUrl,
+  selectedRowIdentity,
+} from "./rows.js";
 import type {
   ListLoadResult,
   ListMode,
   MetadataEntity,
   PriorityMode,
   SearchMode,
-} from "./effects.js";
+} from "./types.js";
 import { buildRenderModel } from "./presenter.js";
 import {
   availableFocuses,
@@ -32,7 +41,6 @@ import type {
   TuiDetailSection,
   TuiFocus,
   TuiFreshness,
-  TuiListSummary,
   TuiMode,
   TuiRenderModel,
   TuiResultRow,
@@ -48,12 +56,8 @@ type ControllerOptions = {
   resultLimit?: number;
 };
 
-const DEFAULT_PAGE_SIZE = 20;
-const CROSS_SEARCH_PAGE_SIZE = {
-  pr: 10,
-  issue: 10,
-} as const;
 const PRIORITY_SCAN_LIMIT = 300;
+const DEFAULT_PAGE_SIZE = 20;
 const ENTRY_STALE_MS = 10 * 60 * 1000;
 const IDLE_INTERVAL_MS = 5 * 60 * 1000;
 const IDLE_TIMEOUT_MS = 30 * 1000;
@@ -99,6 +103,7 @@ export class TuiController {
   private idleRefreshTimer: NodeJS.Timeout | null = null;
   private replayTimer: NodeJS.Timeout | null = null;
   private lastInteractionAt = Date.now();
+  private disposed = false;
 
   constructor(
     service: TuiEffects | ConstructorParameters<typeof TuiEffects>[0],
@@ -130,7 +135,11 @@ export class TuiController {
       busyMessage: this.busyMessage,
       errorMessage: this.errorMessage,
       actions: this.buildActions(),
-      listSummary: this.buildListSummary(),
+      listSummary: buildListSummary({
+        mode: this.mode,
+        rows: this.rows,
+        browseLimit: this.browseLimit,
+      }),
       canLoadMore: this.canLoadMore(),
     });
   }
@@ -292,6 +301,31 @@ export class TuiController {
     this.scheduleAutoSync("inbox");
     this.ensureIdleRefreshTimer();
     this.emit();
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.detailRequestId += 1;
+    this.listRequestId += 1;
+    this.detailAutoRefreshInFlight = false;
+    if (this.idleRefreshTimer) {
+      clearInterval(this.idleRefreshTimer);
+      this.idleRefreshTimer = null;
+    }
+    if (this.replayTimer) {
+      clearTimeout(this.replayTimer);
+      this.replayTimer = null;
+    }
+  }
+
+  reportError(message: string, context = "Operation"): void {
+    this.errorMessage = message;
+    this.message = `${context} failed.`;
+    this.emit();
+  }
+
+  async replayActiveList(): Promise<void> {
+    await this.refreshActiveListPreservingUi();
   }
 
   noteInteraction(): void {
@@ -518,7 +552,7 @@ export class TuiController {
       return;
     }
     await this.runBusy(`Searching ${this.modeLabel(mode)}`, async () => {
-      const result = await this.resolveListRows(mode, this.query);
+      const result = await this.resolveRows(mode, this.query);
       if (requestId !== this.listRequestId || this.mode !== mode) {
         return;
       }
@@ -670,6 +704,7 @@ export class TuiController {
     this.resultTitle = snapshot.session.resultTitle;
     this.context = snapshot.session.context;
     this.isLandingView = snapshot.session.isLandingView;
+    this.browseLimit = snapshot.session.browseLimit;
     this.setDetailPayload(snapshot.detail);
     this.errorMessage = null;
     this.focus = "results";
@@ -780,57 +815,6 @@ export class TuiController {
     }
   }
 
-  private buildListSummary(): TuiListSummary | null {
-    const count = this.rows.length;
-    if (this.mode === "status") {
-      return { yieldLabel: `${count} metrics`, confidenceLabel: null, coverageLabel: null };
-    }
-    if (this.mode === "inbox" || this.mode === "watchlist") {
-      const prRows = this.rows.filter(
-        (row): row is Extract<TuiResultRow, { kind: "pr" }> => row.kind === "pr",
-      );
-      const linkedCount = prRows.filter((row) => (row.priority?.linkedIssueCount ?? 0) > 0).length;
-      const relatedCount = prRows.filter(
-        (row) => (row.priority?.relatedPullRequestCount ?? 0) > 0,
-      ).length;
-      return {
-        yieldLabel: `${count} PR${count === 1 ? "" : "s"}${count >= this.browseLimit ? ` · ${this.browseLimit} shown` : ""}`,
-        confidenceLabel: `issue-linked ${linkedCount} · related ${relatedCount}`,
-        coverageLabel: this.mode === "watchlist" ? "local watch state" : "priority queue",
-      };
-    }
-
-    const prRows = this.rows.filter(
-      (row): row is Extract<TuiResultRow, { kind: "pr" }> => row.kind === "pr",
-    );
-    const issueRows = this.rows.filter(
-      (row): row is Extract<TuiResultRow, { kind: "issue" }> => row.kind === "issue",
-    );
-    const scores = [
-      ...prRows.map((row) => row.pr.score),
-      ...issueRows.map((row) => row.issue.score),
-    ];
-    const confidenceLabel =
-      scores.length > 0
-        ? `avg ${(scores.reduce((sum, score) => sum + score, 0) / scores.length).toFixed(3)} · top ${Math.max(...scores).toFixed(3)}`
-        : null;
-    if (this.mode === "cross-search") {
-      return {
-        yieldLabel: `${count} hits`,
-        confidenceLabel: `PR ${prRows.length} · Issue ${issueRows.length}`,
-        coverageLabel: null,
-      };
-    }
-    if (this.mode === "pr-search" || this.mode === "issue-search") {
-      return {
-        yieldLabel: `${count} hits${count >= this.browseLimit ? ` · ${this.browseLimit} shown` : ""}`,
-        confidenceLabel,
-        coverageLabel: null,
-      };
-    }
-    return null;
-  }
-
   private action(
     slot: number,
     id: TuiActionId,
@@ -868,7 +852,7 @@ export class TuiController {
     this.message = `Loading ${this.modeLabel(mode)}...`;
     this.emit();
     try {
-      const result = await this.resolveListRows(mode, "");
+      const result = await this.resolveRows(mode, "");
       if (requestId !== this.listRequestId || this.mode !== mode) {
         return;
       }
@@ -894,100 +878,20 @@ export class TuiController {
     this.resetDetailState(result.mode);
   }
 
-  private async resolveListRows(mode: ListMode, query: string): Promise<ListLoadResult> {
-    if (mode === "inbox") {
-      const candidates = await this.effects.listPriorityQueue({
-        limit: this.browseLimit,
-        scanLimit: PRIORITY_SCAN_LIMIT,
-      });
-      const rows = candidates.map((candidate) => this.toPrRow(candidate.pr, candidate));
-      return {
-        mode,
-        rows,
-        resultTitle: "Inbox",
-        message:
-          rows.length > 0
-            ? `Loaded ${rows.length} prioritized PR(s).`
-            : "No prioritized PRs found.",
-        activeUrl: this.rowUrl(rows[0]),
-        isLandingView: true,
-      };
-    }
-
-    if (mode === "watchlist") {
-      const candidates = await this.effects.listWatchlist(this.browseLimit);
-      const rows = candidates.map((candidate) => this.toPrRow(candidate.pr, candidate));
-      return {
-        mode,
-        rows,
-        resultTitle: "Watchlist",
-        message: rows.length > 0 ? `Loaded ${rows.length} watched PR(s).` : "Watchlist is empty.",
-        activeUrl: this.rowUrl(rows[0]),
-        isLandingView: true,
-      };
-    }
-
-    if (mode === "cross-search") {
-      const searchQuery = query || "state:open";
-      const limits = this.crossSearchLimits();
-      const [pullRequests, issues] = await Promise.all([
-        this.effects.search(searchQuery, limits.pr),
-        this.effects.searchIssues(searchQuery, limits.issue),
-      ]);
-      const rows = [
-        ...pullRequests.map((pr) => this.toPrRow(pr)),
-        ...issues.map((issue) => this.toIssueRow(issue)),
-      ];
-      return {
-        mode,
-        rows,
-        resultTitle: query ? `Explore · ${query}` : "Explore",
-        message:
-          rows.length > 0
-            ? `Loaded ${rows.length} ${query ? "cross-search row" : "cached investigation row"}(s).`
-            : query
-              ? "No cross-search results."
-              : "No cached rows found.",
-        activeUrl: this.rowUrl(rows[0]),
-        isLandingView: !query,
-      };
-    }
-
-    if (mode === "pr-search") {
-      const searchQuery = query || "state:open";
-      const results = await this.effects.search(searchQuery, this.browseLimit);
-      const rows = results.map((pr) => this.toPrRow(pr));
-      return {
-        mode,
-        rows,
-        resultTitle: query ? `PRs · ${query}` : "PRs",
-        message:
-          rows.length > 0
-            ? `Loaded ${rows.length} ${query ? "PR result" : "open PR"}(s).`
-            : query
-              ? "No PR results."
-              : "No open PRs found.",
-        activeUrl: this.rowUrl(rows[0]),
-        isLandingView: !query,
-      };
-    }
-
-    const searchQuery = query || "state:open";
-    const issues = await this.effects.searchIssues(searchQuery, this.browseLimit);
-    const rows = issues.map((issue) => this.toIssueRow(issue));
-    return {
+  private async resolveRows(mode: ListMode, query: string): Promise<ListLoadResult> {
+    return resolveListRows({
       mode,
-      rows,
-      resultTitle: query ? `Issues · ${query}` : "Issues",
-      message:
-        rows.length > 0
-          ? `Loaded ${rows.length} ${query ? "issue result" : "open issue"}(s).`
-          : query
-            ? "No issue results."
-            : "No open issues found.",
-      activeUrl: this.rowUrl(rows[0]),
-      isLandingView: !query,
-    };
+      query,
+      browseLimit: this.browseLimit,
+      listPriorityQueue: (options) => this.effects.listPriorityQueue(options),
+      listWatchlist: (limit) => this.effects.listWatchlist(limit),
+      search: (searchQuery, limit) => this.effects.search(searchQuery, limit),
+      searchIssues: (searchQuery, limit) => this.effects.searchIssues(searchQuery, limit),
+      toPrRow: (pr, priority = null) => this.toPrRow(pr, priority),
+      toIssueRow: (issue) => this.toIssueRow(issue),
+      rowUrl: (row) => this.rowUrl(row),
+      priorityScanLimit: PRIORITY_SCAN_LIMIT,
+    });
   }
 
   private async refreshDetailForSelection(
@@ -1009,57 +913,71 @@ export class TuiController {
     }
 
     const requestId = ++this.detailRequestId;
-    if (row.kind === "pr") {
-      const bundle = await this.effects.getPrContextBundle(row.pr.prNumber);
-      if (requestId !== this.detailRequestId || !bundle) {
+    this.detailAutoRefreshInFlight = true;
+    this.emit();
+    try {
+      if (row.kind === "pr") {
+        const bundle = await this.effects.getPrContextBundle(row.pr.prNumber);
+        if (requestId !== this.detailRequestId || !bundle) {
+          return;
+        }
+        this.setDetailPayload({
+          visible: true,
+          payload: { kind: "pr", bundle },
+          identity: `pr:${bundle.candidate.pr.prNumber}`,
+          status: `Freshness: ${this.rowFreshness(row).toUpperCase()}`,
+          focusSection,
+          anchorKey: focusSection
+            ? `pr:${bundle.candidate.pr.prNumber}:${focusSection}:${++this.detailAnchorNonce}`
+            : null,
+        });
+        this.context = { kind: "pr", prNumber: bundle.candidate.pr.prNumber };
+        this.activeUrl = bundle.candidate.pr.url;
+        this.emit();
         return;
       }
-      this.setDetailPayload({
-        visible: true,
-        payload: { kind: "pr", bundle },
-        identity: `pr:${bundle.candidate.pr.prNumber}`,
-        status: `Freshness: ${this.rowFreshness(row).toUpperCase()}`,
-        focusSection,
-        anchorKey: focusSection
-          ? `pr:${bundle.candidate.pr.prNumber}:${focusSection}:${++this.detailAnchorNonce}`
-          : null,
-      });
-      this.context = { kind: "pr", prNumber: bundle.candidate.pr.prNumber };
-      this.activeUrl = bundle.candidate.pr.url;
-      this.emit();
-      return;
-    }
 
-    if (row.kind === "issue") {
-      const issue = await this.effects.showIssue(row.issue.issueNumber);
-      if (requestId !== this.detailRequestId || !issue) {
+      if (row.kind === "issue") {
+        const issue = await this.effects.showIssue(row.issue.issueNumber);
+        if (requestId !== this.detailRequestId || !issue) {
+          return;
+        }
+        this.setDetailPayload({
+          visible: true,
+          payload: { kind: "issue", issue },
+          identity: `issue:${issue.issueNumber}`,
+          status: `Freshness: ${this.rowFreshness(row).toUpperCase()}`,
+          focusSection: null,
+          anchorKey: null,
+        });
+        this.context = { kind: "issue", issueNumber: issue.issueNumber };
+        this.activeUrl = issue.url;
+        this.emit();
         return;
       }
-      this.setDetailPayload({
-        visible: true,
-        payload: { kind: "issue", issue },
-        identity: `issue:${issue.issueNumber}`,
-        status: `Freshness: ${this.rowFreshness(row).toUpperCase()}`,
-        focusSection: null,
-        anchorKey: null,
-      });
-      this.context = { kind: "issue", issueNumber: issue.issueNumber };
-      this.activeUrl = issue.url;
-      this.emit();
-      return;
-    }
 
-    if (row.kind === "status" && this.statusSnapshot) {
-      this.setDetailPayload({
-        visible: true,
-        payload: { kind: "status", status: this.statusSnapshot },
-        identity: "status",
-        status: null,
-        focusSection: null,
-        anchorKey: null,
-      });
-      this.activeUrl = null;
-      this.emit();
+      if (row.kind === "status" && this.statusSnapshot) {
+        this.setDetailPayload({
+          visible: true,
+          payload: { kind: "status", status: this.statusSnapshot },
+          identity: "status",
+          status: null,
+          focusSection: null,
+          anchorKey: null,
+        });
+        this.activeUrl = null;
+        this.emit();
+      }
+    } catch (error) {
+      if (requestId !== this.detailRequestId) {
+        return;
+      }
+      this.reportError(error instanceof Error ? error.message : String(error), "Detail load");
+    } finally {
+      if (requestId === this.detailRequestId) {
+        this.detailAutoRefreshInFlight = false;
+        this.emit();
+      }
     }
   }
 
@@ -1165,24 +1083,11 @@ export class TuiController {
     return mode === "cross-search" || mode === "pr-search" || mode === "issue-search";
   }
 
-  private crossSearchLimits(): { pr: number; issue: number } {
-    const pages = Math.max(1, Math.ceil(this.browseLimit / DEFAULT_PAGE_SIZE));
-    return {
-      pr: CROSS_SEARCH_PAGE_SIZE.pr * pages,
-      issue: CROSS_SEARCH_PAGE_SIZE.issue * pages,
-    };
-  }
-
-  private currentBrowseCapacity(): number {
-    if (this.mode === "cross-search") {
-      const limits = this.crossSearchLimits();
-      return limits.pr + limits.issue;
-    }
-    return this.browseLimit;
-  }
-
   private canLoadMore(): boolean {
-    return this.isListMode(this.mode) && this.rows.length >= this.currentBrowseCapacity();
+    return (
+      this.isListMode(this.mode) &&
+      this.rows.length >= currentBrowseCapacity(this.mode, this.browseLimit)
+    );
   }
 
   async loadMore(): Promise<void> {
@@ -1202,53 +1107,27 @@ export class TuiController {
   }
 
   private prFreshness(updatedAt: string, key: string): TuiFreshness {
-    const session = this.detailFreshness.get(key);
-    if (session) {
-      return session;
-    }
-    const ageMs = Date.now() - new Date(updatedAt).getTime();
-    if (ageMs < 12 * 60 * 60 * 1000) {
-      return "fresh";
-    }
-    if (ageMs > 7 * 24 * 60 * 60 * 1000) {
-      return "stale";
-    }
-    return "partial";
+    return computePrFreshness({
+      updatedAt,
+      key,
+      detailFreshness: this.detailFreshness,
+    });
   }
 
   private rowFreshness(row: Extract<TuiResultRow, { kind: "pr" | "issue" }>): TuiFreshness {
-    return row.freshness;
+    return rowFreshness(row);
   }
 
   private rowIdentity(row: Extract<TuiResultRow, { kind: "pr" | "issue" }>): string {
-    return row.kind === "pr" ? `pr:${row.pr.prNumber}` : `issue:${row.issue.issueNumber}`;
+    return rowIdentity(row);
   }
 
   private rowUrl(row: TuiResultRow | undefined): string | null {
-    if (!row) {
-      return null;
-    }
-    if (row.kind === "pr") {
-      return row.pr.url;
-    }
-    if (row.kind === "issue") {
-      return row.issue.url;
-    }
-    return null;
+    return rowUrl(row);
   }
 
   private selectedRowIdentity(): string | null {
-    const row = this.rows[this.selectedIndex];
-    if (!row) {
-      return null;
-    }
-    if (row.kind === "pr") {
-      return `pr:${row.pr.prNumber}`;
-    }
-    if (row.kind === "issue") {
-      return `issue:${row.issue.issueNumber}`;
-    }
-    return row.kind;
+    return selectedRowIdentity(this.rows, this.selectedIndex);
   }
 
   private restoreSelection(selectionIdentity: string | null): void {
@@ -1270,13 +1149,7 @@ export class TuiController {
   }
 
   private rowIdentityForAny(row: TuiResultRow): string | null {
-    if (row.kind === "pr") {
-      return `pr:${row.pr.prNumber}`;
-    }
-    if (row.kind === "issue") {
-      return `issue:${row.issue.issueNumber}`;
-    }
-    return row.kind;
+    return rowIdentityForAny(row);
   }
 
   private scheduleAutoSync(mode: ListMode): void {
@@ -1467,15 +1340,15 @@ export class TuiController {
   }
 
   private async refreshActiveListPreservingUi(): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
     if (!this.isListMode(this.mode)) {
       return;
     }
     const selectionIdentity = this.selectedRowIdentity();
     const requestId = ++this.listRequestId;
-    const result = await this.resolveListRows(
-      this.mode,
-      this.isQueryMode(this.mode) ? this.query : "",
-    );
+    const result = await this.resolveRows(this.mode, this.isQueryMode(this.mode) ? this.query : "");
     if (requestId !== this.listRequestId || this.mode !== result.mode) {
       return;
     }
@@ -1499,6 +1372,9 @@ export class TuiController {
   }
 
   private emit(): void {
+    if (this.disposed) {
+      return;
+    }
     for (const listener of this.listeners) {
       listener();
     }

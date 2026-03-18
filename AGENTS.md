@@ -8,14 +8,15 @@
 
 Use Node `>=22` and `pnpm@10`.
 
-- `pnpm clawlens --help` runs the CLI through `tsx`.
+- `pnpm clawlens --help` prints CLI usage through `tsx` and should exit `0`.
 - `pnpm clawlens sync --full --repo openclaw/openclaw` refreshes a local PR index.
 - `pnpm test` runs the Vitest suite.
 - `pnpm typecheck` runs strict TypeScript checks with `tsc --noEmit`.
+- `pnpm verify` runs typecheck, tests, and format check.
 - `pnpm format` checks formatting with `oxfmt`.
 - `pnpm format:fix` rewrites files to the repo format.
 
-Documented commands were verified in this workspace; currently `pnpm test` has one existing timeout in `src/semantic.test.ts`, while `pnpm typecheck` and `pnpm format` pass.
+Documented commands were verified in this workspace. `pnpm test`, `pnpm typecheck`, and `pnpm format` currently pass.
 
 ## Coding Style & Naming Conventions
 

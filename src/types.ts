@@ -122,6 +122,19 @@ export type SearchResult = {
   matchedExcerpt: string;
 };
 
+export type PullRequestShowComment = {
+  kind: string;
+  author: string;
+  createdAt: string;
+  url: string;
+  excerpt: string;
+};
+
+export type PullRequestShowResult = {
+  pr: SearchResult | null;
+  comments: PullRequestShowComment[];
+};
+
 export type PriorityReasonType =
   | "watch"
   | "freshness"

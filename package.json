@@ -10,6 +10,7 @@
     "clawlens": "tsx bin/clawlens.ts",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "verify": "pnpm typecheck && pnpm test && pnpm format",
     "format": "oxfmt --check .",
     "format:fix": "oxfmt --write ."
   },

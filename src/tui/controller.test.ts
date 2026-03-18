@@ -190,6 +190,7 @@ class FakeTuiDataService implements TuiDataService {
   blockSyncPrs = false;
   blockPriorityQueue = false;
   blockPrContextBundle = false;
+  detailErrorMessage: string | null = null;
   private syncPrsRelease: (() => void) | null = null;
   private refreshPrRelease: (() => void) | null = null;
   private priorityQueueRelease: (() => void) | null = null;
@@ -247,6 +248,9 @@ class FakeTuiDataService implements TuiDataService {
   }
 
   async getPrContextBundle(prNumber: number) {
+    if (this.detailErrorMessage) {
+      throw new Error(this.detailErrorMessage);
+    }
     if (this.blockPrContextBundle) {
       await new Promise<void>((resolve) => {
         this.prContextBundleRelease = resolve;
@@ -471,7 +475,7 @@ describe("TuiController", () => {
     await flushMicrotasks();
 
     service.blockPriorityQueue = true;
-    const replayPromise = (controller as any).refreshActiveListPreservingUi();
+    const replayPromise = controller.replayActiveList();
     await flushMicrotasks();
 
     await controller.openSelected();
@@ -568,6 +572,61 @@ describe("TuiController", () => {
     expect(service.priorityQueueCalls.at(-1)).toEqual({ limit: 40, scanLimit: 300 });
   });
 
+  it("restores browse limit when navigating back", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.loadMore();
+    controller.activateMode("watchlist");
+    await flushMicrotasks();
+    controller.goBack();
+
+    const model = controller.getRenderModel();
+    expect(model.resultsPane.rows).toHaveLength(40);
+    expect(model.resultsPane.summary?.yieldLabel).toBe("40 PRs · 40 shown");
+  });
+
+  it("sorts cross-search rows by score before entity type", async () => {
+    const service = new FakeTuiDataService();
+    service.search = vi.fn(async () => [makePr(41793, { score: 0.1 })]);
+    service.searchIssues = vi.fn(async () => [makeIssue(41789, { score: 0.9 })]);
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    controller.activateMode("cross-search");
+    await flushMicrotasks();
+
+    const rows = controller.getRenderModel().resultsPane.rows;
+    expect(rows[0]?.kind).toBe("issue");
+    expect(rows[1]?.kind).toBe("pr");
+  });
+
+  it("surfaces detail load failures instead of rejecting the action", async () => {
+    const service = new FakeTuiDataService();
+    service.detailErrorMessage = "detail boom";
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await expect(controller.openSelected()).resolves.toBeUndefined();
+
+    const model = controller.getRenderModel();
+    expect(model.header.errorMessage).toBe("detail boom");
+    expect(model.footer.message).toBe("detail boom");
+    expect(model.header.detailAutoRefreshInFlight).toBe(false);
+  });
+
   it("queues overlapping sync actions without blocking the UI", async () => {
     vi.useFakeTimers();
     const service = new FakeTuiDataService();
@@ -650,5 +709,24 @@ describe("TuiController", () => {
     expect(controller.getRenderModel().footer.message).toContain("Syncing PR metadata: 1/2");
 
     service.releaseSyncPrs();
+  });
+
+  it("disposes timers and suppresses follow-up emits", async () => {
+    vi.useFakeTimers();
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+    const listener = vi.fn();
+    controller.subscribe(listener);
+
+    await controller.initialize();
+    listener.mockClear();
+    controller.dispose();
+    vi.advanceTimersByTime(10 * 60 * 1000);
+
+    expect(listener).not.toHaveBeenCalled();
   });
 });

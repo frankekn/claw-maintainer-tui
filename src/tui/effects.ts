@@ -6,30 +6,7 @@ import type {
   SyncProgressEvent,
   SyncSummary,
 } from "../types.js";
-import type { TuiDataService, TuiDetailPayload, TuiDetailSection, TuiResultRow } from "./types.js";
-
-export type SearchMode = "cross-search" | "pr-search" | "issue-search";
-export type PriorityMode = "inbox" | "watchlist";
-export type ListMode = SearchMode | PriorityMode;
-export type MetadataEntity = "prs" | "issues";
-
-export type ListLoadResult = {
-  mode: ListMode;
-  rows: TuiResultRow[];
-  resultTitle: string;
-  message: string;
-  activeUrl: string | null;
-  isLandingView: boolean;
-};
-
-export type LoadedDetailResult = {
-  payload: TuiDetailPayload;
-  identity: string | null;
-  status: string | null;
-  context: { kind: "pr"; prNumber: number } | { kind: "issue"; issueNumber: number } | null;
-  activeUrl: string | null;
-  focusSection: TuiDetailSection | null;
-};
+import type { TuiDataService } from "./types.js";
 
 export class TuiEffects {
   constructor(private readonly service: TuiDataService) {}

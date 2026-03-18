@@ -42,6 +42,8 @@ export class BlessedTuiRenderer {
   private layoutMode: TuiLayoutMode = "single-pane";
   private lastSubmitKeyName: "enter" | "return" | null = null;
   private lastSubmitKeyAt = 0;
+  private unsubscribe: (() => void) | null = null;
+  private destroyed = false;
 
   constructor(private readonly controller: TuiController) {
     this.headerBox = blessed.box({
@@ -120,19 +122,22 @@ export class BlessedTuiRenderer {
   }
 
   async run(): Promise<void> {
-    this.controller.subscribe(() => {
+    this.unsubscribe = this.controller.subscribe(() => {
       this.render(this.controller.getRenderModel());
     });
     this.render(this.controller.getRenderModel());
     await this.controller.initialize();
     this.screen.render();
     await new Promise<void>((resolve) => {
-      this.screen.once("destroy", () => resolve());
+      this.screen.once("destroy", () => {
+        this.shutdown();
+        resolve();
+      });
     });
   }
 
   private bindKeys(): void {
-    this.screen.key(["C-c"], () => this.screen.destroy());
+    this.screen.key(["C-c"], () => this.destroyScreen());
     this.screen.on("keypress", (ch, key) => {
       void this.handleKeypress(ch, key);
     });
@@ -344,35 +349,42 @@ export class BlessedTuiRenderer {
     }
     this.controller.noteInteraction();
     const action = resolveKeyAction(this.controller.getRenderModel(), ch, key);
-    switch (action.kind) {
-      case "command":
-        await this.controller.dispatch(action.command);
-        return;
-      case "detail-scroll":
-        this.detailBox.scroll(action.delta);
-        this.screen.render();
-        return;
-      case "detail-page":
-        this.detailBox.scroll((Number(this.detailBox.height) || 10) * action.delta);
-        this.screen.render();
-        return;
-      case "detail-home":
-        this.detailBox.setScroll(0);
-        this.screen.render();
-        return;
-      case "detail-end":
-        this.detailBox.setScrollPerc(100);
-        this.screen.render();
-        return;
-      case "quit":
-        this.screen.destroy();
-        return;
-      case "open-url":
-        await this.openActiveUrl();
-        return;
-      case "noop":
-      default:
-        return;
+    try {
+      switch (action.kind) {
+        case "command":
+          await this.controller.dispatch(action.command);
+          return;
+        case "detail-scroll":
+          this.detailBox.scroll(action.delta);
+          this.screen.render();
+          return;
+        case "detail-page":
+          this.detailBox.scroll((Number(this.detailBox.height) || 10) * action.delta);
+          this.screen.render();
+          return;
+        case "detail-home":
+          this.detailBox.setScroll(0);
+          this.screen.render();
+          return;
+        case "detail-end":
+          this.detailBox.setScrollPerc(100);
+          this.screen.render();
+          return;
+        case "quit":
+          this.destroyScreen();
+          return;
+        case "open-url":
+          await this.openActiveUrl();
+          return;
+        case "noop":
+        default:
+          return;
+      }
+    } catch (error) {
+      this.controller.reportError(
+        error instanceof Error ? error.message : String(error),
+        "UI action",
+      );
     }
   }
 
@@ -383,9 +395,31 @@ export class BlessedTuiRenderer {
     }
     try {
       await execFileAsync("open", [url]);
-    } catch {
+    } catch (error) {
+      this.controller.reportError(
+        error instanceof Error ? error.message : String(error),
+        "Open URL",
+      );
+    }
+  }
+
+  private destroyScreen(): void {
+    if (this.destroyed) {
       return;
     }
+    this.shutdown();
+    this.screen.destroy();
+  }
+
+  private shutdown(): void {
+    if (this.destroyed) {
+      return;
+    }
+    this.destroyed = true;
+    this.stopSpinner();
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+    this.controller.dispose();
   }
 
   private isDuplicateSubmitKey(key: blessed.Widgets.Events.IKeyEventArg): boolean {

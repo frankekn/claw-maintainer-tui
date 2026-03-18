@@ -2,9 +2,35 @@ import * as path from "node:path";
 import { runTasksWithConcurrency } from "./lib/concurrency.js";
 import { buildFtsQuery, bm25RankToScore } from "./lib/hybrid.js";
 import { ensureDir, hashText } from "./lib/internal.js";
+import { collectLinkedIssuesFromPrText } from "./lib/pull-request-facts.js";
 import { loadSqliteVecExtension } from "./lib/sqlite-vec.js";
 import { requireNodeSqlite } from "./lib/sqlite.js";
 import { truncateUtf16Safe } from "./lib/text.js";
+import { isoNow } from "./lib/time.js";
+import {
+  annotateRelevantCoverage,
+  buildBestBaseReasonCodes,
+  buildExcludedCandidate,
+  buildLiveSemanticQueries,
+  buildRelevantPathSets,
+  buildSupersededReasonCodes,
+  computeSemanticScore,
+  rankClusterCandidates,
+} from "./store/cluster-logic.js";
+import { parseIssueSearchQuery, parseSearchQuery } from "./store/query.js";
+import {
+  getChangedFilesForPr,
+  getIssueRow,
+  getLabelsForIssue,
+  getLabelsForPr,
+  getLinkedIssuesForPr,
+  getPrRow,
+  type IssueRow,
+  type PrRow,
+} from "./store/read-model.js";
+import { buildIssueFilterClause, buildPrFilterClause } from "./store/search-sql.js";
+import { buildCrossReferenceQuery, normalizeSearchText, uniqueStrings } from "./store/text.js";
+import { pullRequestUpsertParams, UPSERT_PULL_REQUEST_SQL } from "./store/upsert.js";
 import {
   createLocalEmbeddingProvider,
   DEFAULT_GH_INTEL_LOCAL_MODEL,
@@ -14,7 +40,6 @@ import type {
   AttentionState,
   ClusterCandidate,
   ClusterExcludedCandidate,
-  ClusterExcludedReasonCode,
   ClusterMatchSource,
   ClusterPullRequestAnalysis,
   ClusterReasonCode,
@@ -32,6 +57,7 @@ import type {
   PullRequestLinkedIssue,
   PullRequestRecord,
   PullRequestReviewFact,
+  PullRequestShowResult,
   PrContextBundle,
   PriorityCandidate,
   PriorityReason,
@@ -56,18 +82,6 @@ const EMBEDDING_CACHE_TABLE = "embedding_cache";
 const DEFAULT_SYNC_CONCURRENCY = 4;
 const DEFAULT_SEARCH_LIMIT = 20;
 const VECTOR_FALLBACK_WEIGHT = 0.05;
-const XREF_STOP_WORDS = new Set([
-  "after",
-  "again",
-  "content",
-  "issue",
-  "message",
-  "still",
-  "their",
-  "there",
-  "users",
-  "using",
-]);
 const META_LAST_SYNC_AT = "last_sync_at";
 const META_LAST_SYNC_WATERMARK = "last_sync_watermark";
 const META_ISSUE_LAST_SYNC_AT = "issue_last_sync_at";
@@ -90,22 +104,6 @@ const FAILING_CHECK_CONCLUSIONS = new Set([
   "CANCELLED",
 ]);
 
-type PrRow = {
-  number: number;
-  title: string;
-  body: string;
-  state: "open" | "closed" | "merged";
-  is_draft: number;
-  author: string;
-  base_ref: string;
-  head_ref: string;
-  url: string;
-  created_at: string;
-  updated_at: string;
-  closed_at: string | null;
-  merged_at: string | null;
-};
-
 type SearchDocRow = {
   doc_id: string;
   pr_number: number;
@@ -114,18 +112,6 @@ type SearchDocRow = {
   text: string;
   updated_at: string;
   score: number;
-};
-
-type IssueRow = {
-  number: number;
-  title: string;
-  body: string;
-  state: "open" | "closed";
-  author: string;
-  url: string;
-  created_at: string;
-  updated_at: string;
-  closed_at: string | null;
 };
 
 type IssueDocRow = {
@@ -169,102 +155,6 @@ function toVectorBlob(values: number[]): Buffer {
   return Buffer.from(new Float32Array(values).buffer);
 }
 
-function normalizeSearchText(value: string): string {
-  return value.replace(/\r\n/g, "\n").trim();
-}
-
-function buildCrossReferenceQuery(title: string, body: string): string {
-  const normalizedBody = normalizeSearchText(body);
-  const firstSentence = normalizedBody
-    .split(/[\n.!?]+/g)
-    .map((value) => value.trim())
-    .find(Boolean);
-  const source =
-    firstSentence && firstSentence.length >= 24 ? firstSentence : title || normalizedBody;
-  const terms = Array.from(
-    new Set(
-      (source.match(/[\p{L}\p{N}_]+/gu) ?? [])
-        .map((value) => value.trim())
-        .filter((value) => value.length >= 5 && !XREF_STOP_WORDS.has(value.toLowerCase())),
-    ),
-  )
-    .sort((left, right) => right.length - left.length || left.localeCompare(right))
-    .slice(0, 4);
-  if (terms.length > 0) {
-    return terms.join(" ");
-  }
-  return normalizeSearchText(title) || normalizedBody;
-}
-
-function isoNow(): string {
-  return new Date().toISOString();
-}
-
-function uniqueSorted(values: string[]): string[] {
-  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean))).sort((a, b) =>
-    a.localeCompare(b),
-  );
-}
-
-function addIssueLink(
-  out: Map<number, PullRequestLinkedIssue>,
-  issueNumber: number,
-  linkSource: PullRequestLinkSource,
-): void {
-  if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
-    return;
-  }
-  const existing = out.get(issueNumber);
-  if (!existing || linkSource === "closing_reference") {
-    out.set(issueNumber, { issueNumber, linkSource });
-  }
-}
-
-function parseIssueLinksFromPrText(title: string, body: string): PullRequestLinkedIssue[] {
-  const out = new Map<number, PullRequestLinkedIssue>();
-  for (const match of title.matchAll(/\[issue\s+#(\d+)\]/gi)) {
-    addIssueLink(out, Number(match[1]), "title_reference");
-  }
-  for (const match of body.matchAll(/\bsource issue\s*#(\d+)\b/gi)) {
-    addIssueLink(out, Number(match[1]), "source_issue_marker");
-  }
-  for (const match of body.matchAll(/\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s+#(\d+)\b/gi)) {
-    addIssueLink(out, Number(match[1]), "body_reference");
-  }
-  return Array.from(out.values()).sort((a, b) => a.issueNumber - b.issueNumber);
-}
-
-function setContainsAll(left: Set<string>, right: Set<string>): boolean {
-  for (const value of right) {
-    if (!left.has(value)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-function uniqueStrings(values: string[]): string[] {
-  return Array.from(new Set(values.filter(Boolean))).sort((left, right) =>
-    left.localeCompare(right),
-  );
-}
-
-function getFileStem(filePath: string): string {
-  const baseName = path.basename(filePath).toLowerCase();
-  return baseName.replace(/\.(test|spec)(?=\.[^.]+$)/, "").replace(/\.[^.]+$/, "");
-}
-
-function isCompanionTest(prodPath: string, testPath: string): boolean {
-  const prodStem = getFileStem(prodPath);
-  const testStem = getFileStem(testPath);
-  if (!prodStem || !testStem || prodStem !== testStem) {
-    return false;
-  }
-  const prodDir = path.dirname(prodPath);
-  const testDir = path.dirname(testPath);
-  return testDir === prodDir || testDir.endsWith(prodDir) || prodDir.endsWith(testDir);
-}
-
 function describeReasonCodes(codes: ClusterReasonCode[]): string {
   const phrases = codes.flatMap((code) => {
     switch (code) {
@@ -305,21 +195,6 @@ function dedupeCheckNames(names: string[]): string[] {
     .map(([name, count]) => (count > 1 ? `${name} (x${count})` : name));
 }
 
-function normalizeClusterSearchTitle(title: string): string {
-  return title.replace(/^[a-z0-9_-]+(?:\([^)]*\))?:\s*/i, "").trim();
-}
-
-function extractSemanticTerms(...values: string[]): string[] {
-  return Array.from(
-    new Set(
-      values
-        .flatMap((value) => normalizeSearchText(value).match(/[\p{L}\p{N}_-]+/gu) ?? [])
-        .map((value) => value.toLowerCase())
-        .filter((value) => value.length >= 4 && !XREF_STOP_WORDS.has(value)),
-    ),
-  ).sort((left, right) => right.length - left.length || left.localeCompare(right));
-}
-
 function buildSearchDocuments(payload: HydratedPullRequest): SearchDocument[] {
   const docs: SearchDocument[] = [];
   const prTitle = payload.pr.title.trim();
@@ -355,155 +230,6 @@ function buildSearchDocuments(payload: HydratedPullRequest): SearchDocument[] {
     });
   }
   return docs;
-}
-
-function parseQuotedValue(value: string): string {
-  const trimmed = value.trim();
-  if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) {
-    return trimmed.slice(1, -1);
-  }
-  return trimmed;
-}
-
-export function parseSearchQuery(raw: string): ParsedSearchQuery {
-  let remaining = raw.trim();
-  const filters: SearchFilters = { labels: [] };
-
-  remaining = remaining.replace(/#(\d+)/g, (_, value: string) => {
-    filters.prNumber = Number(value);
-    return " ";
-  });
-
-  remaining = remaining.replace(/label:(".*?"|\S+)/g, (_, value: string) => {
-    filters.labels.push(parseQuotedValue(value));
-    return " ";
-  });
-
-  remaining = remaining.replace(/state:(open|closed|merged|all)\b/gi, (_, value: string) => {
-    filters.state = value.toLowerCase() as SearchFilters["state"];
-    return " ";
-  });
-
-  remaining = remaining.replace(/author:(\S+)/gi, (_, value: string) => {
-    filters.author = value.trim();
-    return " ";
-  });
-
-  remaining = remaining.replace(/branch:(\S+)/gi, (_, value: string) => {
-    filters.branch = value.trim();
-    return " ";
-  });
-
-  filters.labels = uniqueSorted(filters.labels);
-  return {
-    raw,
-    text: remaining.replace(/\s+/g, " ").trim(),
-    filters,
-  };
-}
-
-export function parseIssueSearchQuery(raw: string): {
-  raw: string;
-  text: string;
-  filters: IssueSearchFilters;
-} {
-  let remaining = raw.trim();
-  const filters: IssueSearchFilters = { labels: [] };
-
-  remaining = remaining.replace(/#(\d+)/g, (_, value: string) => {
-    filters.issueNumber = Number(value);
-    return " ";
-  });
-
-  remaining = remaining.replace(/label:(".*?"|\S+)/g, (_, value: string) => {
-    filters.labels.push(parseQuotedValue(value));
-    return " ";
-  });
-
-  remaining = remaining.replace(/state:(open|closed|all)\b/gi, (_, value: string) => {
-    filters.state = value.toLowerCase() as IssueSearchFilters["state"];
-    return " ";
-  });
-
-  remaining = remaining.replace(/author:(\S+)/gi, (_, value: string) => {
-    filters.author = value.trim();
-    return " ";
-  });
-
-  filters.labels = uniqueSorted(filters.labels);
-  return {
-    raw,
-    text: remaining.replace(/\s+/g, " ").trim(),
-    filters,
-  };
-}
-
-function buildPrFilterClause(
-  filters: SearchFilters,
-  prAlias: string,
-): { sql: string; params: Array<string | number> } {
-  const clauses: string[] = [];
-  const params: Array<string | number> = [];
-
-  if (filters.prNumber !== undefined) {
-    clauses.push(`${prAlias}.number = ?`);
-    params.push(filters.prNumber);
-  }
-  if (filters.state && filters.state !== "all") {
-    clauses.push(`${prAlias}.state = ?`);
-    params.push(filters.state);
-  }
-  if (filters.author) {
-    clauses.push(`${prAlias}.author = ?`);
-    params.push(filters.author);
-  }
-  if (filters.branch) {
-    clauses.push(`${prAlias}.head_ref = ?`);
-    params.push(filters.branch);
-  }
-  for (const label of filters.labels) {
-    clauses.push(
-      `EXISTS (SELECT 1 FROM pr_labels label_filter WHERE label_filter.pr_number = ${prAlias}.number AND label_filter.label_name = ?)`,
-    );
-    params.push(label);
-  }
-
-  return {
-    sql: clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "",
-    params,
-  };
-}
-
-function buildIssueFilterClause(
-  filters: IssueSearchFilters,
-  issueAlias: string,
-): { sql: string; params: Array<string | number> } {
-  const clauses: string[] = [];
-  const params: Array<string | number> = [];
-
-  if (filters.issueNumber !== undefined) {
-    clauses.push(`${issueAlias}.number = ?`);
-    params.push(filters.issueNumber);
-  }
-  if (filters.state && filters.state !== "all") {
-    clauses.push(`${issueAlias}.state = ?`);
-    params.push(filters.state);
-  }
-  if (filters.author) {
-    clauses.push(`${issueAlias}.author = ?`);
-    params.push(filters.author);
-  }
-  for (const label of filters.labels) {
-    clauses.push(
-      `EXISTS (SELECT 1 FROM issue_labels label_filter WHERE label_filter.issue_number = ${issueAlias}.number AND label_filter.label_name = ?)`,
-    );
-    params.push(label);
-  }
-
-  return {
-    sql: clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "",
-    params,
-  };
 }
 
 export class PrIndexStore {
@@ -806,7 +532,7 @@ export class PrIndexStore {
 
   private upsertDerivedIssueLinksForPr(prNumber: number, title: string, body: string): void {
     this.clearIssueLinksForSources(prNumber, DERIVED_LINK_SOURCES);
-    for (const issue of parseIssueLinksFromPrText(title, body)) {
+    for (const issue of collectLinkedIssuesFromPrText(title, body)) {
       this.db
         .prepare(
           `INSERT INTO pr_linked_issues (pr_number, issue_number, link_source) VALUES (?, ?, ?)`,
@@ -1356,41 +1082,7 @@ export class PrIndexStore {
 
     this.db.exec("BEGIN");
     try {
-      this.db
-        .prepare(
-          `INSERT INTO prs (
-            number, title, body, state, is_draft, author, base_ref, head_ref, url,
-            created_at, updated_at, closed_at, merged_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(number) DO UPDATE SET
-            title = excluded.title,
-            body = excluded.body,
-            state = excluded.state,
-            is_draft = excluded.is_draft,
-            author = excluded.author,
-            base_ref = excluded.base_ref,
-            head_ref = excluded.head_ref,
-            url = excluded.url,
-            created_at = excluded.created_at,
-            updated_at = excluded.updated_at,
-            closed_at = excluded.closed_at,
-            merged_at = excluded.merged_at`,
-        )
-        .run(
-          mergedRecord.number,
-          mergedRecord.title,
-          mergedRecord.body,
-          mergedRecord.state,
-          mergedRecord.isDraft ? 1 : 0,
-          mergedRecord.author,
-          mergedRecord.baseRef,
-          mergedRecord.headRef,
-          mergedRecord.url,
-          mergedRecord.createdAt,
-          mergedRecord.updatedAt,
-          mergedRecord.closedAt,
-          mergedRecord.mergedAt,
-        );
+      this.db.prepare(UPSERT_PULL_REQUEST_SQL).run(...pullRequestUpsertParams(mergedRecord));
 
       this.upsertDerivedIssueLinksForPr(mergedRecord.number, mergedRecord.title, mergedRecord.body);
 
@@ -1456,41 +1148,7 @@ export class PrIndexStore {
 
       this.db.exec("BEGIN");
       try {
-        this.db
-          .prepare(
-            `INSERT INTO prs (
-              number, title, body, state, is_draft, author, base_ref, head_ref, url,
-              created_at, updated_at, closed_at, merged_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(number) DO UPDATE SET
-              title = excluded.title,
-              body = excluded.body,
-              state = excluded.state,
-              is_draft = excluded.is_draft,
-              author = excluded.author,
-              base_ref = excluded.base_ref,
-              head_ref = excluded.head_ref,
-              url = excluded.url,
-              created_at = excluded.created_at,
-              updated_at = excluded.updated_at,
-              closed_at = excluded.closed_at,
-              merged_at = excluded.merged_at`,
-          )
-          .run(
-            payload.pr.number,
-            payload.pr.title,
-            payload.pr.body,
-            payload.pr.state,
-            payload.pr.isDraft ? 1 : 0,
-            payload.pr.author,
-            payload.pr.baseRef,
-            payload.pr.headRef,
-            payload.pr.url,
-            payload.pr.createdAt,
-            payload.pr.updatedAt,
-            payload.pr.closedAt,
-            payload.pr.mergedAt,
-          );
+        this.db.prepare(UPSERT_PULL_REQUEST_SQL).run(...pullRequestUpsertParams(payload.pr));
 
         this.upsertDerivedIssueLinksForPr(payload.pr.number, payload.pr.title, payload.pr.body);
 
@@ -2294,45 +1952,19 @@ export class PrIndexStore {
   }
 
   private getPrRow(prNumber: number): PrRow | null {
-    return (
-      (this.db.prepare("SELECT * FROM prs WHERE number = ?").get(prNumber) as PrRow | undefined) ??
-      null
-    );
+    return getPrRow(this.db, prNumber);
   }
 
   private getIssueRow(issueNumber: number): IssueRow | null {
-    return (
-      (this.db.prepare("SELECT * FROM issues WHERE number = ?").get(issueNumber) as
-        | IssueRow
-        | undefined) ?? null
-    );
+    return getIssueRow(this.db, issueNumber);
   }
 
   private getLinkedIssuesForPr(prNumber: number): PullRequestLinkedIssue[] {
-    const rows = this.db
-      .prepare(
-        `SELECT issue_number, link_source
-           FROM pr_linked_issues
-          WHERE pr_number = ?
-          ORDER BY issue_number ASC, link_source ASC`,
-      )
-      .all(prNumber) as Array<{ issue_number: number; link_source: PullRequestLinkSource }>;
-    const out = new Map<number, PullRequestLinkedIssue>();
-    for (const row of rows) {
-      addIssueLink(out, row.issue_number, row.link_source);
-    }
-    return Array.from(out.values()).sort((a, b) => a.issueNumber - b.issueNumber);
+    return getLinkedIssuesForPr(this.db, prNumber);
   }
 
   private getChangedFilesForPr(prNumber: number): PullRequestChangedFile[] {
-    return this.db
-      .prepare(
-        `SELECT path, kind
-           FROM pr_changed_files
-          WHERE pr_number = ?
-          ORDER BY path ASC`,
-      )
-      .all(prNumber) as PullRequestChangedFile[];
+    return getChangedFilesForPr(this.db, prNumber);
   }
 
   private findPullRequestsByLinkedIssues(issueNumbers: number[]): number[] {
@@ -2433,217 +2065,6 @@ export class PrIndexStore {
     };
   }
 
-  private annotateRelevantCoverage(
-    candidate: ClusterCandidate,
-    relevantProdFiles: Set<string>,
-    relevantTestFiles: Set<string>,
-  ): ClusterCandidate {
-    const relevantProd = candidate.prodFiles.filter((file) => relevantProdFiles.has(file));
-    const relevantTest = candidate.testFiles.filter((file) => relevantTestFiles.has(file));
-    const noiseFilesCount =
-      candidate.prodFiles.length +
-      candidate.testFiles.length +
-      candidate.otherFiles.length -
-      relevantProd.length -
-      relevantTest.length;
-    return {
-      ...candidate,
-      relevantProdFiles: relevantProd,
-      relevantTestFiles: relevantTest,
-      noiseFilesCount,
-    };
-  }
-
-  private buildRelevantPathSets(
-    seedPrNumber: number,
-    candidates: ClusterCandidate[],
-  ): {
-    relevantProdFiles: Set<string>;
-    relevantTestFiles: Set<string>;
-  } {
-    const prodCounts = new Map<string, number>();
-    const testCounts = new Map<string, number>();
-    const seedCandidate =
-      candidates.find((candidate) => candidate.prNumber === seedPrNumber) ?? null;
-
-    for (const candidate of candidates) {
-      for (const file of candidate.prodFiles) {
-        prodCounts.set(file, (prodCounts.get(file) ?? 0) + 1);
-      }
-      for (const file of candidate.testFiles) {
-        testCounts.set(file, (testCounts.get(file) ?? 0) + 1);
-      }
-    }
-
-    const relevantProdFiles = new Set(
-      candidates.flatMap((candidate) =>
-        candidate.prodFiles.filter(
-          (file) =>
-            (prodCounts.get(file) ?? 0) >= 2 ||
-            seedCandidate?.prodFiles.includes(file) ||
-            candidates.some((otherCandidate) =>
-              otherCandidate.testFiles.some((testFile) => isCompanionTest(file, testFile)),
-            ),
-        ),
-      ),
-    );
-    const relevantTestFiles = new Set(
-      candidates.flatMap((candidate) =>
-        candidate.testFiles.filter((file) => {
-          const candidateRelevantProdCount = candidate.prodFiles.filter((prodFile) =>
-            relevantProdFiles.has(prodFile),
-          ).length;
-          return (
-            (testCounts.get(file) ?? 0) >= 2 ||
-            Array.from(relevantProdFiles).some((prodFile) => isCompanionTest(prodFile, file)) ||
-            (candidateRelevantProdCount > 0 &&
-              candidate.testFiles.length <= Math.max(2, candidateRelevantProdCount * 2))
-          );
-        }),
-      ),
-    );
-
-    return { relevantProdFiles, relevantTestFiles };
-  }
-
-  private buildBestBaseReasonCodes(
-    bestBase: ClusterCandidate,
-    runnerUp: ClusterCandidate | null,
-  ): ClusterReasonCode[] {
-    if (!runnerUp) {
-      return ["only_exact_linked_pr"];
-    }
-    const out: ClusterReasonCode[] = [];
-    if (bestBase.relevantProdFiles.length > runnerUp.relevantProdFiles.length) {
-      out.push("broader_relevant_prod_coverage");
-    }
-    if (bestBase.relevantTestFiles.length > runnerUp.relevantTestFiles.length) {
-      out.push("adds_companion_tests");
-    }
-    if (bestBase.noiseFilesCount < runnerUp.noiseFilesCount) {
-      out.push("less_unrelated_churn");
-    }
-    return out.length > 0 ? out : ["same_linked_issue"];
-  }
-
-  private buildSupersededReasonCodes(
-    bestBase: ClusterCandidate,
-    candidate: ClusterCandidate,
-  ): ClusterReasonCode[] {
-    const out: ClusterReasonCode[] = [];
-    const bestRelevantProdSet = new Set(bestBase.relevantProdFiles);
-    const candidateRelevantProdSet = new Set(candidate.relevantProdFiles);
-    const bestRelevantTestSet = new Set(bestBase.relevantTestFiles);
-    const candidateRelevantTestSet = new Set(candidate.relevantTestFiles);
-
-    if (
-      candidate.relevantProdFiles.length > 0 &&
-      bestBase.relevantProdFiles.length > candidate.relevantProdFiles.length &&
-      setContainsAll(bestRelevantProdSet, candidateRelevantProdSet)
-    ) {
-      out.push("narrower_relevant_prod_coverage");
-    }
-    if (
-      bestBase.relevantTestFiles.length > candidate.relevantTestFiles.length &&
-      setContainsAll(bestRelevantTestSet, candidateRelevantTestSet)
-    ) {
-      out.push("fewer_companion_tests");
-    }
-    if (candidate.noiseFilesCount > bestBase.noiseFilesCount) {
-      out.push("more_unrelated_churn");
-    }
-    return out;
-  }
-
-  private rankClusterCandidates(
-    clusterIssueNumbers: number[],
-    left: ClusterCandidate,
-    right: ClusterCandidate,
-  ): number {
-    const leftIssueMatches = left.linkedIssues.filter((issue) =>
-      clusterIssueNumbers.includes(issue),
-    ).length;
-    const rightIssueMatches = right.linkedIssues.filter((issue) =>
-      clusterIssueNumbers.includes(issue),
-    ).length;
-    if (leftIssueMatches !== rightIssueMatches) {
-      return rightIssueMatches - leftIssueMatches;
-    }
-    const stateRank = (value: ClusterCandidate["state"]): number =>
-      value === "open" ? 2 : value === "merged" ? 1 : 0;
-    const leftState = stateRank(left.state);
-    const rightState = stateRank(right.state);
-    if (leftState !== rightState) {
-      return rightState - leftState;
-    }
-    if (left.relevantProdFiles.length !== right.relevantProdFiles.length) {
-      return right.relevantProdFiles.length - left.relevantProdFiles.length;
-    }
-    if (left.relevantTestFiles.length !== right.relevantTestFiles.length) {
-      return right.relevantTestFiles.length - left.relevantTestFiles.length;
-    }
-    if (left.noiseFilesCount !== right.noiseFilesCount) {
-      return left.noiseFilesCount - right.noiseFilesCount;
-    }
-    const updatedCompare = right.updatedAt.localeCompare(left.updatedAt);
-    if (updatedCompare !== 0) {
-      return updatedCompare;
-    }
-    return right.prNumber - left.prNumber;
-  }
-
-  private computeSemanticScore(seed: PrRow, candidate: PrRow): number {
-    const seedTerms = extractSemanticTerms(
-      normalizeClusterSearchTitle(seed.title),
-      seed.body,
-    ).slice(0, 6);
-    if (seedTerms.length === 0) {
-      return 0;
-    }
-    const candidateTerms = new Set(
-      extractSemanticTerms(normalizeClusterSearchTitle(candidate.title), candidate.body),
-    );
-    const matchedTerms = seedTerms.filter((term) => candidateTerms.has(term)).length;
-    const seedFiles = new Set(
-      this.getChangedFilesForPr(seed.number)
-        .filter((file) => file.kind !== "other")
-        .map((file) => getFileStem(file.path)),
-    );
-    const candidateFiles = new Set(
-      this.getChangedFilesForPr(candidate.number)
-        .filter((file) => file.kind !== "other")
-        .map((file) => getFileStem(file.path)),
-    );
-    let fileOverlap = 0;
-    if (seedFiles.size > 0 && candidateFiles.size > 0) {
-      let overlap = 0;
-      for (const file of seedFiles) {
-        if (candidateFiles.has(file)) {
-          overlap += 1;
-        }
-      }
-      fileOverlap = overlap / Math.max(seedFiles.size, candidateFiles.size);
-    }
-    return Math.min(
-      1,
-      matchedTerms / Math.max(2, Math.min(6, seedTerms.length)) + fileOverlap * 0.3,
-    );
-  }
-
-  private buildLiveSemanticQueries(seed: PrRow): string[] {
-    const titleQuery = normalizeClusterSearchTitle(seed.title);
-    const crossReferenceQuery = buildCrossReferenceQuery(seed.title, seed.body);
-    const firstSentenceQuery = extractSemanticTerms(
-      normalizeSearchText(seed.body)
-        .split(/[\n.!?]+/g)
-        .map((value) => value.trim())
-        .find((value) => value.length >= 20) ?? "",
-    )
-      .slice(0, 6)
-      .join(" ");
-    return uniqueStrings([crossReferenceQuery, titleQuery, firstSentenceQuery]).slice(0, 3);
-  }
-
   private async collectLiveIssueSearchCandidates(
     repo: RepoRef,
     source: PullRequestDataSource,
@@ -2678,7 +2099,7 @@ export class PrIndexStore {
     if (!source.searchPullRequestNumbers) {
       return out;
     }
-    for (const query of this.buildLiveSemanticQueries(seed)) {
+    for (const query of buildLiveSemanticQueries(seed)) {
       for (const state of ["open", "closed"] as const) {
         const numbers = await source.searchPullRequestNumbers(repo, query, {
           state,
@@ -2692,25 +2113,6 @@ export class PrIndexStore {
       }
     }
     return out;
-  }
-
-  private buildExcludedCandidate(
-    candidate: ClusterCandidate,
-    excludedReasonCode: ClusterExcludedReasonCode,
-    reason: string,
-  ): ClusterExcludedCandidate {
-    return {
-      prNumber: candidate.prNumber,
-      title: candidate.title,
-      url: candidate.url,
-      state: candidate.state,
-      updatedAt: candidate.updatedAt,
-      matchedBy: candidate.matchedBy,
-      linkedIssues: candidate.linkedIssues,
-      excludedReasonCode,
-      semanticScore: candidate.semanticScore,
-      reason,
-    };
   }
 
   private resolveMergeReadiness(candidate: ClusterCandidate | null): MergeReadiness | null {
@@ -2820,29 +2222,14 @@ export class PrIndexStore {
   }
 
   private getLabelsForPr(prNumber: number): string[] {
-    const rows = this.db
-      .prepare("SELECT label_name FROM pr_labels WHERE pr_number = ? ORDER BY label_name ASC")
-      .all(prNumber) as Array<{ label_name: string }>;
-    return rows.map((row) => row.label_name);
+    return getLabelsForPr(this.db, prNumber);
   }
 
   private getLabelsForIssue(issueNumber: number): string[] {
-    const rows = this.db
-      .prepare("SELECT label_name FROM issue_labels WHERE issue_number = ? ORDER BY label_name ASC")
-      .all(issueNumber) as Array<{ label_name: string }>;
-    return rows.map((row) => row.label_name);
+    return getLabelsForIssue(this.db, issueNumber);
   }
 
-  async show(prNumber: number): Promise<{
-    pr: SearchResult | null;
-    comments: Array<{
-      kind: string;
-      author: string;
-      createdAt: string;
-      url: string;
-      excerpt: string;
-    }>;
-  }> {
+  async show(prNumber: number): Promise<PullRequestShowResult> {
     await this.init();
     const pr = this.getPrRow(prNumber);
     if (!pr) {
@@ -2998,7 +2385,18 @@ export class PrIndexStore {
         if (!candidateRow) {
           continue;
         }
-        const semanticScore = this.computeSemanticScore(seed, candidateRow);
+        const semanticScore = computeSemanticScore({
+          seed: {
+            title: seed.title,
+            body: seed.body,
+            changedFiles: this.getChangedFilesForPr(seed.number),
+          },
+          candidate: {
+            title: candidateRow.title,
+            body: candidateRow.body,
+            changedFiles: this.getChangedFilesForPr(candidateRow.number),
+          },
+        });
         const candidate = this.buildClusterCandidate(
           prNumber,
           "possible_same_cluster",
@@ -3012,7 +2410,7 @@ export class PrIndexStore {
         }
         if (candidate.linkedIssues.length > 0) {
           nearbyButExcluded.push(
-            this.buildExcludedCandidate(
+            buildExcludedCandidate(
               candidate,
               "different_linked_issue",
               `different_linked_issue: ${candidate.linkedIssues.map((issue) => `#${issue}`).join(", ")}`,
@@ -3027,7 +2425,7 @@ export class PrIndexStore {
           });
         } else {
           nearbyButExcluded.push(
-            this.buildExcludedCandidate(
+            buildExcludedCandidate(
               candidate,
               "semantic_weak_match",
               "semantic_weak_match: semantic overlap too weak",
@@ -3097,16 +2495,16 @@ export class PrIndexStore {
         ),
       )
       .filter((candidate): candidate is ClusterCandidate => Boolean(candidate));
-    const relevantPaths = this.buildRelevantPathSets(params.prNumber, rawCandidates);
+    const relevantPaths = buildRelevantPathSets(params.prNumber, rawCandidates);
     const rankedCandidates = rawCandidates
       .map((candidate) =>
-        this.annotateRelevantCoverage(
+        annotateRelevantCoverage(
           candidate,
           relevantPaths.relevantProdFiles,
           relevantPaths.relevantTestFiles,
         ),
       )
-      .sort((left, right) => this.rankClusterCandidates(seedLinkedIssues, left, right));
+      .sort((left, right) => rankClusterCandidates(seedLinkedIssues, left, right));
 
     const bestBase = rankedCandidates[0] ?? null;
     const runnerUp = rankedCandidates[1] ?? null;
@@ -3115,7 +2513,7 @@ export class PrIndexStore {
         return candidate;
       }
       if (index === 0) {
-        const reasonCodes = this.buildBestBaseReasonCodes(candidate, runnerUp);
+        const reasonCodes = buildBestBaseReasonCodes(candidate, runnerUp);
         return {
           ...candidate,
           status: "best_base" as const,
@@ -3123,7 +2521,7 @@ export class PrIndexStore {
           reason: describeReasonCodes(reasonCodes),
         };
       }
-      const reasonCodes = this.buildSupersededReasonCodes(bestBase, candidate);
+      const reasonCodes = buildSupersededReasonCodes(bestBase, candidate);
       if (reasonCodes.length > 0) {
         return {
           ...candidate,
@@ -3167,7 +2565,7 @@ export class PrIndexStore {
       if (!candidate) {
         continue;
       }
-      const annotated = this.annotateRelevantCoverage(
+      const annotated = annotateRelevantCoverage(
         candidate,
         relevantPaths.relevantProdFiles,
         relevantPaths.relevantTestFiles,
@@ -3177,7 +2575,7 @@ export class PrIndexStore {
       );
       if (otherLinkedIssues.length > 0) {
         nearbyButExcluded.push(
-          this.buildExcludedCandidate(
+          buildExcludedCandidate(
             annotated,
             "different_linked_issue",
             `different_linked_issue: ${otherLinkedIssues.map((issue) => `#${issue}`).join(", ")}`,
@@ -3191,7 +2589,7 @@ export class PrIndexStore {
         annotated.relevantProdFiles.length + annotated.relevantTestFiles.length <= 1
       ) {
         nearbyButExcluded.push(
-          this.buildExcludedCandidate(
+          buildExcludedCandidate(
             annotated,
             "noise_dominated",
             "noise_dominated: unrelated churn outweighs issue-relevant paths",
@@ -3200,7 +2598,7 @@ export class PrIndexStore {
         continue;
       }
       nearbyButExcluded.push(
-        this.buildExcludedCandidate(
+        buildExcludedCandidate(
           annotated,
           "semantic_weak_match",
           "semantic_weak_match: semantic neighbor without exact issue link",

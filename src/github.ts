@@ -1,5 +1,11 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import {
+  classifyChangedFileKind,
+  collectLinkedIssuesFromPrText,
+  mergeClosingReferenceIssues,
+} from "./lib/pull-request-facts.js";
+import { isoNow } from "./lib/time.js";
 import type {
   HydratedPullRequest,
   IssueDataSource,
@@ -240,53 +246,6 @@ function toReviewCommentRecord(value: RestReviewComment): PullRequestCommentReco
   };
 }
 
-function addLinkedIssue(
-  out: Map<number, PullRequestLinkedIssue>,
-  issueNumber: number,
-  linkSource: PullRequestLinkSource,
-): void {
-  if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
-    return;
-  }
-  const existing = out.get(issueNumber);
-  if (!existing || linkSource === "closing_reference") {
-    out.set(issueNumber, { issueNumber, linkSource });
-  }
-}
-
-function collectLinkedIssues(title: string, body: string): PullRequestLinkedIssue[] {
-  const out = new Map<number, PullRequestLinkedIssue>();
-  for (const match of title.matchAll(/\[issue\s+#(\d+)\]/gi)) {
-    addLinkedIssue(out, Number(match[1]), "title_reference");
-  }
-  for (const match of body.matchAll(/\bsource issue\s*#(\d+)\b/gi)) {
-    addLinkedIssue(out, Number(match[1]), "source_issue_marker");
-  }
-  for (const match of body.matchAll(/\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s+#(\d+)\b/gi)) {
-    addLinkedIssue(out, Number(match[1]), "body_reference");
-  }
-  return Array.from(out.values()).sort((a, b) => a.issueNumber - b.issueNumber);
-}
-
-function classifyChangedFileKind(filePath: string): PullRequestChangedFileKind {
-  const normalized = filePath.trim();
-  if (
-    /(^|\/)(test|tests|__tests__)\//i.test(normalized) ||
-    /\.(test|spec)\.[^/.]+$/i.test(normalized)
-  ) {
-    return "test";
-  }
-  if (
-    !normalized ||
-    /(^|\/)(docs|doc|fixtures|examples|scripts|\.github)\//i.test(normalized) ||
-    /(^|\/)(readme|changelog|license)(\.[^/]+)?$/i.test(normalized) ||
-    /\.(md|mdx|txt|json|ya?ml|toml|lock)$/i.test(normalized)
-  ) {
-    return "other";
-  }
-  return "prod";
-}
-
 function collectStatusCheckCandidates(value: unknown): unknown[] {
   if (Array.isArray(value)) {
     return value;
@@ -332,19 +291,12 @@ function normalizeStatusCheck(value: unknown): PullRequestStatusCheck | null {
 export function normalizePullRequestFactRecord(value: RestPullRequestView): PullRequestFactRecord {
   const title = value.title?.trim() ?? "";
   const body = value.body ?? "";
-  const linkedIssues = new Map<number, PullRequestLinkedIssue>();
-  for (const issue of collectLinkedIssues(title, body)) {
-    linkedIssues.set(issue.issueNumber, issue);
-  }
-  for (const issue of value.closingIssuesReferences ?? []) {
-    const issueNumber = issue?.number;
-    if (typeof issueNumber === "number") {
-      linkedIssues.set(issueNumber, {
-        issueNumber,
-        linkSource: "closing_reference",
-      });
-    }
-  }
+  const linkedIssues = mergeClosingReferenceIssues(
+    collectLinkedIssuesFromPrText(title, body),
+    (value.closingIssuesReferences ?? [])
+      .map((issue) => issue?.number)
+      .filter((issueNumber): issueNumber is number => typeof issueNumber === "number"),
+  );
   const changedFiles: PullRequestChangedFile[] = (value.files ?? [])
     .map((item) => item?.path?.trim() ?? "")
     .filter(Boolean)
@@ -362,9 +314,9 @@ export function normalizePullRequestFactRecord(value: RestPullRequestView): Pull
     statusChecks: statusChecksRaw
       .map(normalizeStatusCheck)
       .filter((item): item is PullRequestStatusCheck => Boolean(item)),
-    linkedIssues: Array.from(linkedIssues.values()).sort((a, b) => a.issueNumber - b.issueNumber),
+    linkedIssues,
     changedFiles,
-    fetchedAt: new Date().toISOString(),
+    fetchedAt: isoNow(),
   };
 }
 
