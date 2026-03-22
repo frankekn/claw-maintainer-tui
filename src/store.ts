@@ -773,7 +773,7 @@ export class PrIndexStore {
 
   private async enrichPriorityCandidate(
     candidate: PriorityCandidate,
-    options: { relatedLimit?: number; clusterLimit?: number } = {},
+    options: { relatedLimit?: number; clusterLimit?: number; repoKey?: string } = {},
   ): Promise<PriorityCandidate> {
     const linkedIssues = this.getLinkedIssuesForPr(candidate.pr.prNumber);
     const relatedPullRequests = await this.findRelatedPullRequests(
@@ -785,6 +785,7 @@ export class PrIndexStore {
       prNumber: candidate.pr.prNumber,
       limit: options.clusterLimit ?? 5,
       ftsOnly: true,
+      repoKey: options.repoKey,
     });
     const relatedNumbers = new Set<number>(relatedPullRequests.map((pr) => pr.prNumber));
     for (const clusterCandidate of cluster?.sameClusterCandidates ?? []) {
@@ -844,7 +845,10 @@ export class PrIndexStore {
     const enriched = new Map<number, PriorityCandidate>();
     const result = await runTasksWithConcurrency({
       tasks: topForEnrichment.map((candidate) => async () => {
-        enriched.set(candidate.pr.prNumber, await this.enrichPriorityCandidate(candidate));
+        enriched.set(
+          candidate.pr.prNumber,
+          await this.enrichPriorityCandidate(candidate, { repoKey: params.repoKey }),
+        );
         return candidate.pr.prNumber;
       }),
       limit: 6,
@@ -1348,6 +1352,7 @@ export class PrIndexStore {
     }
     const candidate = await this.enrichPriorityCandidate(
       this.buildPriorityCandidateBase(pr, repoKey),
+      { repoKey },
     );
     if (!this.isVisibleOnPrioritySurfaces(repoKey, candidate.pr.prNumber)) {
       return null;
@@ -1451,6 +1456,7 @@ export class PrIndexStore {
             prNumber: candidate.pr.prNumber,
             limit: 12,
             ftsOnly: true,
+            repoKey,
           }),
         );
         return candidate.pr.prNumber;
@@ -1689,7 +1695,7 @@ export class PrIndexStore {
     const result = await runTasksWithConcurrency({
       tasks: rows.map(
         (row) => async () =>
-          this.enrichPriorityCandidate(this.buildPriorityCandidateBase(row, repoKey)),
+          this.enrichPriorityCandidate(this.buildPriorityCandidateBase(row, repoKey), { repoKey }),
       ),
       limit: 6,
       errorMode: "stop",
@@ -1721,6 +1727,7 @@ export class PrIndexStore {
     const payload = await this.show(prNumber);
     const candidate = await this.enrichPriorityCandidate(
       this.buildPriorityCandidateBase(pr, repoKey),
+      { repoKey },
     );
     const linkedIssues = this.getLinkedIssuesForPr(prNumber)
       .map((issue) => this.getIssueRow(issue.issueNumber))
@@ -1742,6 +1749,7 @@ export class PrIndexStore {
         prNumber,
         limit: 5,
         ftsOnly: true,
+        repoKey,
       }),
     );
     const relatedPullRequests = new Map<number, SearchResult>();
@@ -1778,6 +1786,7 @@ export class PrIndexStore {
       latestReviewFact: this.getLatestReviewFact(prNumber, repoKey),
       mergeReadiness: this.resolveMergeReadiness(
         this.buildClusterCandidate(prNumber, "same_cluster_candidate", "linked_issue"),
+        repoKey,
       ),
     });
   }
@@ -2408,11 +2417,14 @@ export class PrIndexStore {
     };
   }
 
-  private resolveMergeReadiness(candidate: ClusterCandidate | null): MergeReadiness | null {
+  private resolveMergeReadiness(
+    candidate: ClusterCandidate | null,
+    repoKey: string | null = null,
+  ): MergeReadiness | null {
     if (!candidate) {
       return null;
     }
-    const repo = this.getMeta(META_REPO) ?? "";
+    const repo = repoKey ?? this.getMeta(META_REPO) ?? "";
     const latestReviewFact = repo ? this.getLatestReviewFact(candidate.prNumber, repo) : null;
     const snapshot = this.db
       .prepare(
@@ -2550,6 +2562,7 @@ export class PrIndexStore {
     limit?: number;
     ftsOnly?: boolean;
     repo?: RepoRef;
+    repoKey?: string;
     source?: PullRequestDataSource;
     refresh?: boolean;
   }): Promise<ClusterPullRequestAnalysis | null> {
@@ -2681,7 +2694,10 @@ export class PrIndexStore {
       bestBase,
       sameClusterCandidates,
       nearbyButExcluded,
-      mergeReadiness: this.resolveMergeReadiness(bestBase),
+      mergeReadiness: this.resolveMergeReadiness(
+        bestBase,
+        params.repoKey ?? (params.repo ? this.repoKey(params.repo) : null),
+      ),
       decisionTrace,
       limit,
     });

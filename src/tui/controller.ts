@@ -1211,7 +1211,9 @@ export class TuiController {
   }
 
   private canLoadMore(): boolean {
-    return canLoadMoreRows(this.mode, this.rows, this.browseLimit);
+    return canLoadMoreRows(this.mode, this.rows, this.browseLimit, {
+      priorityScanLimit: PRIORITY_SCAN_LIMIT,
+    });
   }
 
   async loadMore(): Promise<void> {
@@ -1462,7 +1464,9 @@ export class TuiController {
       clearTimeout(this.replayTimer);
     }
     this.replayTimer = setTimeout(() => {
-      void this.refreshActiveListPreservingUi();
+      void this.refreshActiveListPreservingUi().catch((error) => {
+        this.reportError(error instanceof Error ? error.message : String(error), "Replay refresh");
+      });
     }, REPLAY_DEBOUNCE_MS);
     this.replayTimer.unref?.();
   }

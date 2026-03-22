@@ -136,18 +136,24 @@ export class BlessedTuiRenderer {
   }
 
   async run(): Promise<void> {
-    this.unsubscribe = this.controller.subscribe(() => {
-      this.render(this.controller.getRenderModel());
-    });
-    this.render(this.controller.getRenderModel());
-    await this.controller.initialize();
-    this.screen.render();
-    await new Promise<void>((resolve) => {
+    const destroyed = new Promise<void>((resolve) => {
       this.screen.once("destroy", () => {
         this.shutdown();
         resolve();
       });
     });
+    this.unsubscribe = this.controller.subscribe(() => {
+      this.render(this.controller.getRenderModel());
+    });
+    this.render(this.controller.getRenderModel());
+    try {
+      await this.controller.initialize();
+      this.screen.render();
+      await destroyed;
+    } catch (error) {
+      this.destroyScreen();
+      throw error;
+    }
   }
 
   private bindKeys(): void {

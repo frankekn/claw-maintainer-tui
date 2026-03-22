@@ -732,6 +732,66 @@ describe("TuiController", () => {
     expect(loadMore?.enabled).toBe(true);
   });
 
+  it("keeps inbox pagination enabled when collapsed clusters compress visible rows", async () => {
+    const service = new FakeTuiDataService();
+    service.listPriorityInbox = vi.fn(async ({ limit }) =>
+      limit <= 20
+        ? [{ kind: "cluster" as const, cluster: makePriorityCluster([41793, 42212]) }]
+        : [
+            { kind: "cluster" as const, cluster: makePriorityCluster([41793, 42212]) },
+            { kind: "cluster" as const, cluster: makePriorityCluster([43001, 43002]) },
+          ],
+    );
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+
+    const initialLoadMore = controller
+      .getRenderModel()
+      .footer.actions.find((action) => action.id === "load-more");
+    expect(initialLoadMore?.enabled).toBe(true);
+
+    await controller.loadMore();
+
+    expect(controller.getRenderModel().resultsPane.rows).toHaveLength(2);
+  });
+
+  it("catches replay refresh failures instead of leaving unhandled rejections", async () => {
+    vi.useFakeTimers();
+    let controller: TuiController | null = null;
+    try {
+      const service = new FakeTuiDataService();
+      controller = new TuiController(service, {
+        repo: "openclaw/openclaw",
+        dbPath: "/tmp/clawlens.sqlite",
+        ftsOnly: false,
+      });
+
+      await controller.initialize();
+      vi.spyOn(service, "listPriorityInbox").mockRejectedValue(new Error("replay boom"));
+
+      (
+        controller as unknown as {
+          scheduleListReplay: () => void;
+        }
+      ).scheduleListReplay();
+
+      await vi.advanceTimersByTimeAsync(200);
+      await flushMicrotasks();
+
+      const model = controller.getRenderModel();
+      expect(model.header.errorMessage).toBe("replay boom");
+      expect(model.footer.message).toBe("replay boom");
+    } finally {
+      controller?.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it("surfaces detail load failures instead of rejecting the action", async () => {
     const service = new FakeTuiDataService();
     service.detailErrorMessage = "detail boom";

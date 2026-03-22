@@ -1669,4 +1669,52 @@ describe("PrIndexStore", () => {
       bundle?.cluster?.sameClusterCandidates.some((candidate) => candidate.prNumber === 50041),
     ).toBe(false);
   });
+
+  it("uses the requested repo when resolving merge readiness inside a shared db", async () => {
+    const store = await createStore();
+    const otherRepo: RepoRef = { owner: "frankekn", name: "other-repo" };
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([
+        makePullRequest(50060, {
+          title: "fix: use requested repo for readiness",
+          body: "Closes #42060\nResolve merge readiness using the requested repo context.",
+        }),
+      ]),
+      full: true,
+      hydrateAll: true,
+    });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(50060, {
+        headSha: "head-50060",
+      }),
+    );
+    await store.recordReviewFact(
+      makeReviewFact(50060, {
+        repo: "openclaw/openclaw",
+        headSha: "head-50060",
+        summary: "Repo A review fact should win.",
+      }),
+    );
+
+    await store.sync({
+      repo: otherRepo,
+      source: new FakePullRequestDataSource([
+        makePullRequest(60060, {
+          title: "feat: unrelated shared db repo",
+          body: "Closes #62060\nMove shared-db meta to a different repo after repo A is stored.",
+        }),
+      ]),
+      full: true,
+      hydrateAll: true,
+    });
+
+    const bundle = await store.getPrContextBundle(repo, 50060);
+
+    expect(bundle?.latestReviewFact?.repo).toBe("openclaw/openclaw");
+    expect(bundle?.mergeReadiness).toMatchObject({
+      source: "review_fact",
+      summary: "Repo A review fact should win.",
+    });
+  });
 });

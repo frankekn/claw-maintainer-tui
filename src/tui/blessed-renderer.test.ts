@@ -204,4 +204,20 @@ describe("BlessedTuiRenderer", () => {
     expect(harness.spinnerInterval).toBeNull();
     expect(controller.dispose).toHaveBeenCalledTimes(1);
   });
+
+  it("cleans up the screen when initialize fails", async () => {
+    const controller = createControllerStub();
+    controller.initialize.mockRejectedValue(new Error("init boom"));
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness & {
+      screen: blessed.Widgets.Screen;
+    };
+    renderers.push(harness);
+    const destroySpy = vi.spyOn(harness.screen, "destroy");
+
+    await expect(renderer.run()).rejects.toThrow("init boom");
+
+    expect(destroySpy).toHaveBeenCalledTimes(1);
+    expect(controller.dispose).toHaveBeenCalledTimes(1);
+  });
 });
