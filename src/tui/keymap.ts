@@ -101,6 +101,9 @@ export function resolveKeyAction(
   if (key.name === "c") {
     return { kind: "command", command: { type: "jump_detail_section", section: "cluster" } };
   }
+  if (key.name === "e") {
+    return { kind: "command", command: { type: "expand_cluster" } };
+  }
   if (key.name === "v") {
     return { kind: "command", command: { type: "mark_seen" } };
   }

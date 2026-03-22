@@ -24,6 +24,14 @@ export class StoreBackedTuiDataService implements TuiDataService {
     return this.store.status();
   }
 
+  listPriorityInbox(options: { limit: number; scanLimit?: number }) {
+    return this.store.listPriorityInbox({
+      repo: this.repo,
+      limit: options.limit,
+      scanLimit: options.scanLimit,
+    });
+  }
+
   listPriorityQueue(options: { limit: number; scanLimit?: number }) {
     return this.store.listPriorityQueue({
       repo: this.repo,

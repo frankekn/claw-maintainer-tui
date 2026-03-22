@@ -16,14 +16,13 @@ import {
 } from "./store/cluster-logic.js";
 import {
   buildClusterDecisionTrace,
-  buildClusterSeed,
   buildExcludedTrace,
-  linkedIssueResultSummary,
-  semanticOnlyResultSummary,
   withClusterFeatures,
 } from "./store/cluster-analysis.js";
 import { buildPrContextBundle } from "./store/context-bundle.js";
 import {
+  buildLinkedIssueClusterResult,
+  buildSemanticOnlyClusterResult,
   classifyNearbyExcludedCandidate,
   evaluateSemanticOnlyCandidate,
   orderSemanticOnlyCandidates,
@@ -85,6 +84,8 @@ import type {
   PullRequestShowResult,
   PrContextBundle,
   PriorityCandidate,
+  PriorityClusterSummary,
+  PriorityInboxItem,
   PriorityReason,
   PriorityAttentionState,
   ReviewFactDecision,
@@ -722,6 +723,14 @@ export class PrIndexStore {
     });
   }
 
+  private comparePriorityCandidates(left: PriorityCandidate, right: PriorityCandidate): number {
+    return (
+      right.score - left.score ||
+      right.pr.updatedAt.localeCompare(left.pr.updatedAt) ||
+      right.pr.prNumber - left.pr.prNumber
+    );
+  }
+
   private async enrichPriorityCandidate(
     candidate: PriorityCandidate,
     options: { relatedLimit?: number; clusterLimit?: number } = {},
@@ -748,6 +757,66 @@ export class PrIndexStore {
       linkedIssueCount: linkedIssues.length,
       relatedPullRequestCount: relatedNumbers.size,
     });
+  }
+
+  private async collectPrioritizedOpenCandidates(params: {
+    repoKey: string;
+    limit: number;
+    scanLimit?: number;
+  }): Promise<PriorityCandidate[]> {
+    const scanLimit = Math.max(params.limit, params.scanLimit ?? 300);
+    const recentOpen = this.db
+      .prepare(
+        `SELECT *
+           FROM prs
+          WHERE state = 'open'
+          ORDER BY updated_at DESC, number DESC
+          LIMIT ?`,
+      )
+      .all(scanLimit) as PrRow[];
+    const watchedOpen = this.db
+      .prepare(
+        `SELECT p.*
+           FROM prs p
+           JOIN pr_triage_state t
+             ON t.repo = ?
+            AND t.pr_number = p.number
+          WHERE p.state = 'open'
+            AND t.attention_state = 'watch'
+          ORDER BY p.updated_at DESC, p.number DESC`,
+      )
+      .all(params.repoKey) as PrRow[];
+
+    const byNumber = new Map<number, PrRow>();
+    for (const row of recentOpen) {
+      byNumber.set(row.number, row);
+    }
+    for (const row of watchedOpen) {
+      byNumber.set(row.number, row);
+    }
+
+    const baseline = Array.from(byNumber.values())
+      .map((row) => this.buildPriorityCandidateBase(row, params.repoKey))
+      .filter((candidate) => candidate.attentionState !== "ignore")
+      .sort((left, right) => this.comparePriorityCandidates(left, right));
+
+    const topForEnrichment = baseline.slice(0, Math.min(80, baseline.length));
+    const enriched = new Map<number, PriorityCandidate>();
+    const result = await runTasksWithConcurrency({
+      tasks: topForEnrichment.map((candidate) => async () => {
+        enriched.set(candidate.pr.prNumber, await this.enrichPriorityCandidate(candidate));
+        return candidate.pr.prNumber;
+      }),
+      limit: 6,
+      errorMode: "stop",
+    });
+    if (result.hasError) {
+      throw result.firstError;
+    }
+
+    return baseline
+      .map((candidate) => enriched.get(candidate.pr.prNumber) ?? candidate)
+      .sort((left, right) => this.comparePriorityCandidates(left, right));
   }
 
   private getStoredUpdatedAt(prNumber: number): string | null {
@@ -1212,69 +1281,342 @@ export class PrIndexStore {
     await this.init();
     await this.ensureDerivedIssueLinksBackfilled();
     const repoKey = this.repoKey(params.repo);
-    const scanLimit = Math.max(params.limit, params.scanLimit ?? 300);
-    const recentOpen = this.db
-      .prepare(
-        `SELECT *
-           FROM prs
-          WHERE state = 'open'
-          ORDER BY updated_at DESC, number DESC
-          LIMIT ?`,
-      )
-      .all(scanLimit) as PrRow[];
-    const watchedOpen = this.db
-      .prepare(
-        `SELECT p.*
-           FROM prs p
-           JOIN pr_triage_state t
-             ON t.repo = ?
-            AND t.pr_number = p.number
-          WHERE p.state = 'open'
-            AND t.attention_state = 'watch'
-          ORDER BY p.updated_at DESC, p.number DESC`,
-      )
-      .all(repoKey) as PrRow[];
+    return (
+      await this.collectPrioritizedOpenCandidates({
+        repoKey,
+        limit: params.limit,
+        scanLimit: params.scanLimit,
+      })
+    ).slice(0, params.limit);
+  }
 
-    const byNumber = new Map<number, PrRow>();
-    for (const row of recentOpen) {
-      byNumber.set(row.number, row);
+  private async getOrBuildPriorityCandidate(
+    prNumber: number,
+    repoKey: string,
+    cache: Map<number, PriorityCandidate>,
+  ): Promise<PriorityCandidate | null> {
+    const cached = cache.get(prNumber);
+    if (cached) {
+      return cached;
     }
-    for (const row of watchedOpen) {
-      byNumber.set(row.number, row);
+    const pr = this.getPrRow(prNumber);
+    if (!pr || pr.state !== "open") {
+      return null;
     }
+    const candidate = await this.enrichPriorityCandidate(
+      this.buildPriorityCandidateBase(pr, repoKey),
+    );
+    cache.set(prNumber, candidate);
+    return candidate;
+  }
 
-    const baseline = Array.from(byNumber.values())
-      .map((row) => this.buildPriorityCandidateBase(row, repoKey))
-      .filter((candidate) => candidate.attentionState !== "ignore")
+  private buildPriorityClusterSummary(params: {
+    clusterKey: string;
+    basis: PriorityClusterSummary["basis"];
+    issueNumbers: number[];
+    openMembers: PriorityCandidate[];
+    allStateRows: Array<Pick<ClusterCandidate, "prNumber" | "state" | "updatedAt">>;
+    representativeHints: Set<number>;
+  }): PriorityClusterSummary {
+    const openMembers = [...params.openMembers].sort((left, right) =>
+      this.comparePriorityCandidates(left, right),
+    );
+    const hintedRepresentative =
+      openMembers.find((candidate) => params.representativeHints.has(candidate.pr.prNumber)) ??
+      null;
+    const representative = hintedRepresentative ?? openMembers[0]!;
+    const mergedRows = params.allStateRows
+      .filter((row) => row.state === "merged")
       .sort(
         (left, right) =>
-          right.score - left.score ||
-          right.pr.updatedAt.localeCompare(left.pr.updatedAt) ||
-          right.pr.prNumber - left.pr.prNumber,
+          right.updatedAt.localeCompare(left.updatedAt) || right.prNumber - left.prNumber,
       );
+    const openPrCount = params.allStateRows.filter((row) => row.state === "open").length;
+    const mergedPrCount = mergedRows.length;
+    const totalPrCount = params.allStateRows.length;
+    const solvedByPrNumber = mergedRows[0]?.prNumber ?? null;
 
-    const topForEnrichment = baseline.slice(0, Math.min(80, baseline.length));
-    const enriched = new Map<number, PriorityCandidate>();
-    const result = await runTasksWithConcurrency({
-      tasks: topForEnrichment.map((candidate) => async () => {
-        enriched.set(candidate.pr.prNumber, await this.enrichPriorityCandidate(candidate));
+    let recommendation: PriorityClusterSummary["recommendation"];
+    let statusLabel: string;
+    let statusReason: string;
+    let score = representative.score;
+
+    if (solvedByPrNumber !== null) {
+      recommendation = "merged_exists";
+      statusLabel = "merged exists";
+      statusReason = `Merged PR #${solvedByPrNumber} already covers this cluster.`;
+      score -= 18;
+    } else if (openPrCount > 1) {
+      recommendation = "open_variants";
+      statusLabel = `${openPrCount} open variants`;
+      statusReason = `${openPrCount} open PRs are competing in the same cluster.`;
+      score += Math.min(12, 4 + Math.max(0, openPrCount - 2) * 2);
+    } else {
+      recommendation = "semantic_family";
+      statusLabel = "semantic family";
+      statusReason = "Strong semantic overlap groups these PRs together.";
+      score -= 6;
+    }
+
+    return {
+      clusterKey: params.clusterKey,
+      basis: params.basis,
+      representative,
+      openMembers,
+      score,
+      totalPrCount,
+      openPrCount,
+      mergedPrCount,
+      linkedIssueCount: params.issueNumbers.length,
+      clusterIssueNumbers: [...params.issueNumbers].sort((left, right) => left - right),
+      statusLabel,
+      statusReason,
+      recommendation,
+      solvedByPrNumber,
+    };
+  }
+
+  async listPriorityInbox(params: {
+    repo: RepoRef | string;
+    limit: number;
+    scanLimit?: number;
+  }): Promise<PriorityInboxItem[]> {
+    await this.init();
+    await this.ensureDerivedIssueLinksBackfilled();
+    const repoKey = this.repoKey(params.repo);
+    const prioritized = await this.collectPrioritizedOpenCandidates({
+      repoKey,
+      limit: params.limit,
+      scanLimit: params.scanLimit,
+    });
+    const seedWindow = prioritized.slice(
+      0,
+      Math.min(prioritized.length, Math.max(params.limit * 4, 60)),
+    );
+    const candidateCache = new Map<number, PriorityCandidate>(
+      prioritized.map((candidate) => [candidate.pr.prNumber, candidate]),
+    );
+    const analysisByNumber = new Map<number, ClusterPullRequestAnalysis | null>();
+    const analysisResult = await runTasksWithConcurrency({
+      tasks: seedWindow.map((candidate) => async () => {
+        analysisByNumber.set(
+          candidate.pr.prNumber,
+          await this.clusterPullRequest({
+            prNumber: candidate.pr.prNumber,
+            limit: 12,
+            ftsOnly: true,
+          }),
+        );
         return candidate.pr.prNumber;
       }),
       limit: 6,
       errorMode: "stop",
     });
-    if (result.hasError) {
-      throw result.firstError;
+    if (analysisResult.hasError) {
+      throw analysisResult.firstError;
     }
 
-    return baseline
-      .map((candidate) => enriched.get(candidate.pr.prNumber) ?? candidate)
-      .sort(
-        (left, right) =>
-          right.score - left.score ||
-          right.pr.updatedAt.localeCompare(left.pr.updatedAt) ||
-          right.pr.prNumber - left.pr.prNumber,
-      )
+    const exactGroups = new Map<string, { issueNumbers: number[]; openNumbers: Set<number> }>();
+    const semanticAdjacent = new Map<number, Set<number>>();
+    const semanticMergedBySeed = new Map<
+      number,
+      Array<Pick<ClusterCandidate, "prNumber" | "state" | "updatedAt">>
+    >();
+
+    for (const candidate of seedWindow) {
+      const analysis = analysisByNumber.get(candidate.pr.prNumber);
+      if (!analysis) {
+        continue;
+      }
+      if (analysis.clusterBasis === "linked_issue" && analysis.clusterIssueNumbers.length > 0) {
+        const clusterKey = `issue:${[...analysis.clusterIssueNumbers].sort((left, right) => left - right).join(",")}`;
+        const group = exactGroups.get(clusterKey) ?? {
+          issueNumbers: [...analysis.clusterIssueNumbers],
+          openNumbers: new Set<number>(),
+        };
+        group.openNumbers.add(candidate.pr.prNumber);
+        for (const clusterCandidate of analysis.sameClusterCandidates) {
+          if (clusterCandidate.state === "open") {
+            group.openNumbers.add(clusterCandidate.prNumber);
+          }
+        }
+        exactGroups.set(clusterKey, group);
+        continue;
+      }
+
+      if (analysis.clusterBasis === "semantic_only") {
+        const mergedRows = analysis.sameClusterCandidates
+          .filter((clusterCandidate) => clusterCandidate.state === "merged")
+          .map((clusterCandidate) => ({
+            prNumber: clusterCandidate.prNumber,
+            state: clusterCandidate.state,
+            updatedAt: clusterCandidate.updatedAt,
+          }));
+        if (mergedRows.length > 0) {
+          semanticMergedBySeed.set(candidate.pr.prNumber, mergedRows);
+        }
+        for (const clusterCandidate of analysis.sameClusterCandidates) {
+          if (clusterCandidate.state !== "open") {
+            continue;
+          }
+          const existing = semanticAdjacent.get(candidate.pr.prNumber) ?? new Set<number>();
+          existing.add(clusterCandidate.prNumber);
+          semanticAdjacent.set(candidate.pr.prNumber, existing);
+          const reverse = semanticAdjacent.get(clusterCandidate.prNumber) ?? new Set<number>();
+          reverse.add(candidate.pr.prNumber);
+          semanticAdjacent.set(clusterCandidate.prNumber, reverse);
+        }
+      }
+    }
+
+    const consumedOpenNumbers = new Set<number>();
+    const clusterSummaries: PriorityClusterSummary[] = [];
+
+    for (const [clusterKey, group] of exactGroups) {
+      const allNumbers = new Set(this.findPullRequestsByLinkedIssues(group.issueNumbers));
+      const allRows = Array.from(allNumbers)
+        .map((prNumber) => this.getPrRow(prNumber))
+        .filter((row): row is PrRow => Boolean(row));
+      if (allRows.length <= 1) {
+        continue;
+      }
+      const openMembers = (
+        await Promise.all(
+          allRows
+            .filter((row) => row.state === "open")
+            .map((row) => this.getOrBuildPriorityCandidate(row.number, repoKey, candidateCache)),
+        )
+      ).filter((candidate): candidate is PriorityCandidate => Boolean(candidate));
+      const unconsumedOpenMembers = openMembers.filter(
+        (member) => !consumedOpenNumbers.has(member.pr.prNumber),
+      );
+      if (unconsumedOpenMembers.length === 0) {
+        continue;
+      }
+      const representativeHints = new Set<number>();
+      for (const member of unconsumedOpenMembers) {
+        const analysis = analysisByNumber.get(member.pr.prNumber);
+        if (analysis?.bestBase?.state === "open") {
+          representativeHints.add(analysis.bestBase.prNumber);
+        }
+      }
+      clusterSummaries.push(
+        this.buildPriorityClusterSummary({
+          clusterKey,
+          basis: "linked_issue",
+          issueNumbers: group.issueNumbers,
+          openMembers: unconsumedOpenMembers,
+          allStateRows: allRows.map((row) => ({
+            prNumber: row.number,
+            state: row.state,
+            updatedAt: row.updated_at,
+          })),
+          representativeHints,
+        }),
+      );
+      for (const member of unconsumedOpenMembers) {
+        consumedOpenNumbers.add(member.pr.prNumber);
+      }
+    }
+
+    const semanticVisited = new Set<number>();
+    for (const candidate of seedWindow) {
+      if (
+        consumedOpenNumbers.has(candidate.pr.prNumber) ||
+        semanticVisited.has(candidate.pr.prNumber)
+      ) {
+        continue;
+      }
+      const queue = [candidate.pr.prNumber];
+      const component = new Set<number>();
+      while (queue.length > 0) {
+        const current = queue.pop()!;
+        if (semanticVisited.has(current) || consumedOpenNumbers.has(current)) {
+          continue;
+        }
+        semanticVisited.add(current);
+        component.add(current);
+        for (const next of semanticAdjacent.get(current) ?? []) {
+          if (!semanticVisited.has(next) && !consumedOpenNumbers.has(next)) {
+            queue.push(next);
+          }
+        }
+      }
+
+      const mergedRows = Array.from(component).flatMap(
+        (prNumber) => semanticMergedBySeed.get(prNumber) ?? [],
+      );
+      if (component.size <= 1 && mergedRows.length === 0) {
+        continue;
+      }
+
+      const openMembers = (
+        await Promise.all(
+          Array.from(component).map((prNumber) =>
+            this.getOrBuildPriorityCandidate(prNumber, repoKey, candidateCache),
+          ),
+        )
+      ).filter((member): member is PriorityCandidate => Boolean(member));
+      if (openMembers.length === 0) {
+        continue;
+      }
+
+      const clusterKey = `semantic:${openMembers
+        .map((member) => member.pr.prNumber)
+        .sort((left, right) => left - right)
+        .join(",")}`;
+      const allStateRows = [
+        ...openMembers.map((member) => ({
+          prNumber: member.pr.prNumber,
+          state: member.pr.state,
+          updatedAt: member.pr.updatedAt,
+        })),
+        ...mergedRows,
+      ].filter(
+        (row, index, rows) =>
+          rows.findIndex((candidateRow) => candidateRow.prNumber === row.prNumber) === index,
+      );
+      clusterSummaries.push(
+        this.buildPriorityClusterSummary({
+          clusterKey,
+          basis: "semantic_only",
+          issueNumbers: [],
+          openMembers,
+          allStateRows,
+          representativeHints: new Set<number>(),
+        }),
+      );
+      for (const member of openMembers) {
+        consumedOpenNumbers.add(member.pr.prNumber);
+      }
+    }
+
+    const items: PriorityInboxItem[] = [
+      ...clusterSummaries.map(
+        (cluster) => ({ kind: "cluster", cluster }) satisfies PriorityInboxItem,
+      ),
+      ...prioritized
+        .filter((candidate) => !consumedOpenNumbers.has(candidate.pr.prNumber))
+        .map((candidate) => ({ kind: "pr", candidate }) satisfies PriorityInboxItem),
+    ];
+
+    return items
+      .sort((left, right) => {
+        const leftScore = left.kind === "cluster" ? left.cluster.score : left.candidate.score;
+        const rightScore = right.kind === "cluster" ? right.cluster.score : right.candidate.score;
+        if (leftScore !== rightScore) {
+          return rightScore - leftScore;
+        }
+        const leftUpdatedAt =
+          left.kind === "cluster"
+            ? left.cluster.representative.pr.updatedAt
+            : left.candidate.pr.updatedAt;
+        const rightUpdatedAt =
+          right.kind === "cluster"
+            ? right.cluster.representative.pr.updatedAt
+            : right.candidate.pr.updatedAt;
+        return rightUpdatedAt.localeCompare(leftUpdatedAt);
+      })
       .slice(0, params.limit);
   }
 
@@ -1808,6 +2150,88 @@ export class PrIndexStore {
     return out;
   }
 
+  private async collectLinkedIssueCandidateSet(params: {
+    seed: PrRow;
+    clusterIssueNumbers: number[];
+    liveIssueSearchLimit: number;
+    repo?: RepoRef;
+    source?: PullRequestDataSource;
+    refresh?: boolean;
+  }): Promise<{
+    rawCandidates: ClusterCandidate[];
+    decisionTrace: ClusterDecisionTrace[];
+  }> {
+    const exactMatches = new Map<number, ClusterMatchSource>([
+      [params.seed.number, "linked_issue"],
+    ]);
+    for (const prNumber of this.findPullRequestsByLinkedIssues(params.clusterIssueNumbers)) {
+      exactMatches.set(prNumber, "linked_issue");
+    }
+
+    if (params.repo && params.source) {
+      const liveIssueMatches = await this.collectLiveIssueSearchCandidates(
+        params.repo,
+        params.source,
+        params.clusterIssueNumbers,
+        params.liveIssueSearchLimit,
+      );
+      for (const [prNumber, matchedBy] of liveIssueMatches) {
+        await this.ensurePullRequestCached(
+          params.repo,
+          params.source,
+          prNumber,
+          params.refresh ?? false,
+        );
+        const linkedIssues = this.getLinkedIssuesForPr(prNumber).map((issue) => issue.issueNumber);
+        if (linkedIssues.some((issue) => params.clusterIssueNumbers.includes(issue))) {
+          exactMatches.set(prNumber, exactMatches.get(prNumber) ?? matchedBy);
+        }
+      }
+    }
+
+    const rawCandidates = Array.from(exactMatches.entries())
+      .map(([prNumber, matchedBy]) =>
+        this.buildClusterCandidate(
+          prNumber,
+          "same_cluster_candidate",
+          matchedBy,
+          matchedBy === "live_issue_search" ? "discovered via live issue search" : undefined,
+          matchedBy === "live_issue_search"
+            ? ["same_linked_issue", "discovered_via_live_issue_search"]
+            : ["same_linked_issue"],
+        ),
+      )
+      .filter((candidate): candidate is ClusterCandidate => Boolean(candidate));
+
+    return {
+      rawCandidates,
+      decisionTrace: [
+        buildClusterDecisionTrace({
+          phase: "seed",
+          prNumber: params.seed.number,
+          matchedBy: null,
+          outcome: "linked_issue_seed",
+          summary: `Seed PR links issues ${params.clusterIssueNumbers.map((issue) => `#${issue}`).join(", ")}.`,
+        }),
+        ...rawCandidates.map((candidate) =>
+          buildClusterDecisionTrace({
+            phase: "candidate",
+            prNumber: candidate.prNumber,
+            matchedBy: candidate.matchedBy,
+            outcome: "candidate_generated",
+            summary:
+              candidate.reason ??
+              (candidate.matchedBy === "live_issue_search"
+                ? "Candidate discovered via live issue search."
+                : "Candidate shares the linked issue."),
+            featureVector: candidate.featureVector,
+            reasonCodes: candidate.reasonCodes,
+          }),
+        ),
+      ],
+    };
+  }
+
   private async collectSemanticOnlyDecisionSet(params: {
     seed: PrRow;
     semanticNumbers: Map<number, ClusterMatchSource>;
@@ -2136,89 +2560,25 @@ export class PrIndexStore {
       const nearbyButExcluded = semanticDecisionSet.nearbyButExcluded;
       decisionTrace.push(...semanticDecisionSet.decisionTrace);
       const orderedCandidates = orderSemanticOnlyCandidates(sameClusterCandidates, limit);
-      decisionTrace.push(
-        buildClusterDecisionTrace({
-          phase: "result",
-          prNumber: null,
-          matchedBy: null,
-          outcome: "semantic_only_result",
-          summary: semanticOnlyResultSummary(orderedCandidates.length),
-        }),
-      );
-      return {
-        seedPr: buildClusterSeed(seed),
-        clusterBasis: "semantic_only",
-        clusterIssueNumbers: [],
-        bestBase: null,
+      return buildSemanticOnlyClusterResult({
+        seed,
         sameClusterCandidates: orderedCandidates,
-        nearbyButExcluded: nearbyButExcluded.slice(0, limit),
-        mergeReadiness: null,
+        nearbyButExcluded,
         decisionTrace,
-      };
+        limit,
+      });
     }
 
-    const exactMatches = new Map<number, ClusterMatchSource>([[params.prNumber, "linked_issue"]]);
-    for (const prNumber of this.findPullRequestsByLinkedIssues(seedLinkedIssues)) {
-      exactMatches.set(prNumber, "linked_issue");
-    }
-    if (params.repo && params.source) {
-      const liveIssueMatches = await this.collectLiveIssueSearchCandidates(
-        params.repo,
-        params.source,
-        seedLinkedIssues,
-        limit * 3,
-      );
-      for (const [prNumber, matchedBy] of liveIssueMatches) {
-        await this.ensurePullRequestCached(
-          params.repo,
-          params.source,
-          prNumber,
-          params.refresh ?? false,
-        );
-        const linkedIssues = this.getLinkedIssuesForPr(prNumber).map((issue) => issue.issueNumber);
-        if (linkedIssues.some((issue) => seedLinkedIssues.includes(issue))) {
-          exactMatches.set(prNumber, exactMatches.get(prNumber) ?? matchedBy);
-        }
-      }
-    }
-
-    const rawCandidates = Array.from(exactMatches.entries())
-      .map(([prNumber, matchedBy]) =>
-        this.buildClusterCandidate(
-          prNumber,
-          "same_cluster_candidate",
-          matchedBy,
-          matchedBy === "live_issue_search" ? "discovered via live issue search" : undefined,
-          matchedBy === "live_issue_search"
-            ? ["same_linked_issue", "discovered_via_live_issue_search"]
-            : ["same_linked_issue"],
-        ),
-      )
-      .filter((candidate): candidate is ClusterCandidate => Boolean(candidate));
-    const decisionTrace = [
-      buildClusterDecisionTrace({
-        phase: "seed",
-        prNumber: seed.number,
-        matchedBy: null,
-        outcome: "linked_issue_seed",
-        summary: `Seed PR links issues ${seedLinkedIssues.map((issue) => `#${issue}`).join(", ")}.`,
-      }),
-      ...rawCandidates.map((candidate) =>
-        buildClusterDecisionTrace({
-          phase: "candidate",
-          prNumber: candidate.prNumber,
-          matchedBy: candidate.matchedBy,
-          outcome: "candidate_generated",
-          summary:
-            candidate.reason ??
-            (candidate.matchedBy === "live_issue_search"
-              ? "Candidate discovered via live issue search."
-              : "Candidate shares the linked issue."),
-          featureVector: candidate.featureVector,
-          reasonCodes: candidate.reasonCodes,
-        }),
-      ),
-    ];
+    const linkedIssueCandidateSet = await this.collectLinkedIssueCandidateSet({
+      seed,
+      clusterIssueNumbers: seedLinkedIssues,
+      liveIssueSearchLimit: limit * 3,
+      repo: params.repo,
+      source: params.source,
+      refresh: params.refresh ?? false,
+    });
+    const rawCandidates = linkedIssueCandidateSet.rawCandidates;
+    const decisionTrace = [...linkedIssueCandidateSet.decisionTrace];
     const relevantPaths = buildRelevantPathSets(params.prNumber, rawCandidates);
     const rankedCandidates = rawCandidates
       .map((candidate) =>
@@ -2264,31 +2624,16 @@ export class PrIndexStore {
     });
     const nearbyButExcluded = nearbyDecisionSet.nearbyButExcluded;
     decisionTrace.push(...nearbyDecisionSet.decisionTrace);
-
-    const resolvedBestBase =
-      sameClusterCandidates.find((candidate) => candidate.status === "best_base") ?? bestBase;
-    decisionTrace.push(
-      buildClusterDecisionTrace({
-        phase: "result",
-        prNumber: resolvedBestBase?.prNumber ?? null,
-        matchedBy: resolvedBestBase?.matchedBy ?? null,
-        outcome: resolvedBestBase ? "linked_issue_result" : "linked_issue_result_empty",
-        summary: linkedIssueResultSummary(seedLinkedIssues, resolvedBestBase),
-        featureVector: resolvedBestBase?.featureVector,
-        reasonCodes: resolvedBestBase?.reasonCodes,
-      }),
-    );
-
-    return {
-      seedPr: buildClusterSeed(seed),
-      clusterBasis: "linked_issue",
+    return buildLinkedIssueClusterResult({
+      seed,
       clusterIssueNumbers: seedLinkedIssues,
-      bestBase: resolvedBestBase,
+      bestBase,
       sameClusterCandidates,
-      nearbyButExcluded: nearbyButExcluded.slice(0, limit),
-      mergeReadiness: this.resolveMergeReadiness(resolvedBestBase),
+      nearbyButExcluded,
+      mergeReadiness: this.resolveMergeReadiness(bestBase),
       decisionTrace,
-    };
+      limit,
+    });
   }
 
   async listSemanticCorpusDocuments(): Promise<SemanticCorpusDocument[]> {

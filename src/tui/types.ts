@@ -7,6 +7,8 @@ import type {
   PullRequestShowResult,
   PrContextBundle,
   PriorityCandidate,
+  PriorityClusterSummary,
+  PriorityInboxItem,
   SearchResult,
   StatusSnapshot,
   SyncProgressEvent,
@@ -41,6 +43,7 @@ export const TUI_MODE_ORDER: Array<{ id: TuiMode; label: string; queryPrompt: st
 export type TuiActionId =
   | "query"
   | "detail"
+  | "expand-cluster"
   | "jump-linked-issues"
   | "cluster"
   | "sync-prs"
@@ -98,6 +101,11 @@ export type TuiClusterVerificationSummary = {
 
 export type TuiResultRow =
   | { kind: "pr"; pr: SearchResult; freshness: TuiFreshness; priority: PriorityCandidate | null }
+  | {
+      kind: "priority-cluster";
+      cluster: PriorityClusterSummary;
+      freshness: TuiFreshness;
+    }
   | { kind: "issue"; issue: IssueSearchResult; freshness: TuiFreshness }
   | {
       kind: "cluster-candidate";
@@ -176,6 +184,7 @@ export type TuiCommand =
   | { type: "activate_mode"; delta: number }
   | { type: "move_selection"; delta: number }
   | { type: "toggle_detail" }
+  | { type: "expand_cluster" }
   | { type: "jump_detail_section"; section: Extract<TuiDetailSection, "linked-issues" | "cluster"> }
   | { type: "start_query" }
   | { type: "stop_query" }
@@ -253,6 +262,7 @@ export type TuiRenderModel = {
 
 export interface TuiDataService {
   status(): Promise<StatusSnapshot>;
+  listPriorityInbox(options: { limit: number; scanLimit?: number }): Promise<PriorityInboxItem[]>;
   listPriorityQueue(options: { limit: number; scanLimit?: number }): Promise<PriorityCandidate[]>;
   listWatchlist(limit: number): Promise<PriorityCandidate[]>;
   search(query: string, limit: number): Promise<SearchResult[]>;

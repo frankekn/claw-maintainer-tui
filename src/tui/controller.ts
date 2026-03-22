@@ -349,6 +349,9 @@ export class TuiController {
       case "toggle_detail":
         await this.openSelected();
         return;
+      case "expand_cluster":
+        await this.expandSelectedCluster();
+        return;
       case "jump_detail_section":
         if (command.section === "linked-issues") {
           await this.crossReferenceSelected();
@@ -577,7 +580,7 @@ export class TuiController {
     }
     this.showDetail = true;
     this.isLandingView = false;
-    await this.refreshDetailForSelection(true);
+    await this.refreshDetailForSelection(true, row.kind === "priority-cluster" ? "cluster" : null);
   }
 
   async triggerAction(slot: number): Promise<void> {
@@ -591,6 +594,9 @@ export class TuiController {
         return;
       case "detail":
         await this.openSelected();
+        return;
+      case "expand-cluster":
+        await this.expandSelectedCluster();
         return;
       case "jump-linked-issues":
         await this.crossReferenceSelected();
@@ -641,10 +647,27 @@ export class TuiController {
 
   async clusterSelected(): Promise<void> {
     const row = this.rows[this.selectedIndex];
-    if (!row || row.kind !== "pr") {
+    if (!row || (row.kind !== "pr" && row.kind !== "priority-cluster")) {
       return;
     }
     await this.openPrDetailSection("cluster");
+  }
+
+  async expandSelectedCluster(): Promise<void> {
+    const row = this.rows[this.selectedIndex];
+    if (!row || row.kind !== "priority-cluster") {
+      return;
+    }
+    this.pushHistory();
+    this.rows = row.cluster.openMembers.map((member) => this.toPrRow(member.pr, member));
+    this.selectedIndex = 0;
+    this.resultTitle = `Cluster · ${row.cluster.statusLabel}`;
+    this.message = `Expanded ${row.cluster.openMembers.length} open PR(s) from ${row.cluster.statusLabel}.`;
+    this.activeUrl = this.rowUrl(this.rows[0]);
+    this.isLandingView = false;
+    this.resetDetailState(this.mode);
+    this.focus = "results";
+    this.emit();
   }
 
   async markSeenSelected(): Promise<void> {
@@ -653,10 +676,13 @@ export class TuiController {
 
   async toggleWatchSelected(): Promise<void> {
     const row = this.rows[this.selectedIndex];
-    if (!row || row.kind !== "pr") {
+    if (!row || (row.kind !== "pr" && row.kind !== "priority-cluster")) {
       return;
     }
-    const current = await this.currentAttentionState(row.pr.prNumber, row.priority?.attentionState);
+    const current =
+      row.kind === "pr"
+        ? await this.currentAttentionState(row.pr.prNumber, row.priority?.attentionState)
+        : this.clusterAttentionState(row);
     await this.updateAttentionState(
       current === "watch" ? null : "watch",
       current === "watch" ? "Cleared watch state." : "Added PR to watchlist.",
@@ -665,10 +691,13 @@ export class TuiController {
 
   async toggleIgnoreSelected(): Promise<void> {
     const row = this.rows[this.selectedIndex];
-    if (!row || row.kind !== "pr") {
+    if (!row || (row.kind !== "pr" && row.kind !== "priority-cluster")) {
       return;
     }
-    const current = await this.currentAttentionState(row.pr.prNumber, row.priority?.attentionState);
+    const current =
+      row.kind === "pr"
+        ? await this.currentAttentionState(row.pr.prNumber, row.priority?.attentionState)
+        : this.clusterAttentionState(row);
     await this.updateAttentionState(
       current === "ignore" ? null : "ignore",
       current === "ignore" ? "Cleared ignore state." : "Ignored PR in Inbox.",
@@ -721,6 +750,10 @@ export class TuiController {
     if (!row) {
       return;
     }
+    if (row.kind === "priority-cluster") {
+      await this.refreshPriorityCluster(row.cluster);
+      return;
+    }
     if (row.kind === "pr") {
       await this.refreshDetailForPr(row.pr.prNumber, true);
       return;
@@ -730,14 +763,56 @@ export class TuiController {
     }
   }
 
+  private async refreshPriorityCluster(
+    cluster: Extract<TuiResultRow, { kind: "priority-cluster" }>["cluster"],
+  ): Promise<void> {
+    await this.runBusy(`Refreshing cluster ${cluster.statusLabel}`, async () => {
+      this.syncMode = "detail";
+      await this.effects.refreshPrDetail(cluster.representative.pr.prNumber);
+      this.detailFreshness.set(`pr:${cluster.representative.pr.prNumber}`, "fresh");
+      await this.refreshStatus();
+      await this.refreshActiveListPreservingUi();
+      this.message = `Refreshed cluster anchored on PR #${cluster.representative.pr.prNumber}.`;
+    });
+    this.syncMode = null;
+    this.emit();
+  }
+
   private async updateAttentionState(state: AttentionState | null, message: string): Promise<void> {
     const row = this.rows[this.selectedIndex];
-    if (!row || row.kind !== "pr") {
+    if (!row) {
       return;
     }
-    await this.effects.setPrAttentionState(row.pr.prNumber, state);
+    if (row.kind === "pr") {
+      await this.effects.setPrAttentionState(row.pr.prNumber, state);
+    } else if (row.kind === "priority-cluster") {
+      await Promise.all(
+        row.cluster.openMembers.map((member) =>
+          this.effects.setPrAttentionState(member.pr.prNumber, state),
+        ),
+      );
+    } else {
+      return;
+    }
     this.message = message;
     await this.refreshActiveListPreservingUi();
+  }
+
+  private clusterAttentionState(
+    row: Extract<TuiResultRow, { kind: "priority-cluster" }>,
+  ): PriorityAttentionState | "mixed" {
+    const states = new Set(
+      row.cluster.openMembers
+        .map((member) => member.attentionState)
+        .filter((value) => value !== "new"),
+    );
+    if (states.size === 0) {
+      return "new";
+    }
+    if (states.size > 1) {
+      return "mixed";
+    }
+    return states.values().next().value as PriorityAttentionState;
   }
 
   private async currentAttentionState(
@@ -755,18 +830,32 @@ export class TuiController {
     const row = this.rows[this.selectedIndex];
     const hasRow = Boolean(row);
     const hasHistory = this.history.length > 0;
-    const canJumpContext = row?.kind === "pr";
-    const canTriage = row?.kind === "pr";
-    const canRefresh = row?.kind === "pr" || row?.kind === "issue";
-    const hasLocalState = row?.kind === "pr" && (row.priority?.attentionState ?? "new") !== "new";
+    const canLinked = row?.kind === "pr";
+    const canCluster = row?.kind === "pr" || row?.kind === "priority-cluster";
+    const canExpand = row?.kind === "priority-cluster";
+    const canTriage = row?.kind === "pr" || row?.kind === "priority-cluster";
+    const canRefresh =
+      row?.kind === "pr" || row?.kind === "issue" || row?.kind === "priority-cluster";
+    const hasLocalState =
+      row?.kind === "pr"
+        ? (row.priority?.attentionState ?? "new") !== "new"
+        : row?.kind === "priority-cluster"
+          ? this.clusterAttentionState(row) !== "new"
+          : false;
 
     switch (this.mode) {
       case "inbox":
       case "watchlist":
         return [
           this.action(1, "detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
-          this.action(2, "jump-linked-issues", "Linked", "x", canJumpContext),
-          this.action(3, "cluster", "Cluster", "c", canJumpContext),
+          this.action(
+            2,
+            row?.kind === "priority-cluster" ? "expand-cluster" : "jump-linked-issues",
+            row?.kind === "priority-cluster" ? "Expand" : "Linked",
+            row?.kind === "priority-cluster" ? "e" : "x",
+            row?.kind === "priority-cluster" ? canExpand : canLinked,
+          ),
+          this.action(3, "cluster", "Cluster", "c", canCluster),
           this.action(4, "mark-seen", "Seen", "v", canTriage),
           this.action(5, "toggle-watch", "Watch", "w", canTriage),
           this.action(6, "toggle-ignore", "Ignore", "i", canTriage),
@@ -777,8 +866,8 @@ export class TuiController {
         return [
           this.action(1, "query", "Search", "/"),
           this.action(2, "detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
-          this.action(3, "jump-linked-issues", "Linked", "x", canJumpContext),
-          this.action(4, "cluster", "Cluster", "c", canJumpContext),
+          this.action(3, "jump-linked-issues", "Linked", "x", canLinked),
+          this.action(4, "cluster", "Cluster", "c", canCluster),
           this.action(5, "sync-prs", "Sync PRs", "s"),
           this.action(6, "sync-issues", "Sync Issues", "S"),
           this.action(7, "refresh", "Refresh", "r", canRefresh),
@@ -788,8 +877,8 @@ export class TuiController {
         return [
           this.action(1, "query", "Search", "/"),
           this.action(2, "detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
-          this.action(3, "jump-linked-issues", "Linked", "x", canJumpContext),
-          this.action(4, "cluster", "Cluster", "c", canJumpContext),
+          this.action(3, "jump-linked-issues", "Linked", "x", canLinked),
+          this.action(4, "cluster", "Cluster", "c", canCluster),
           this.action(5, "mark-seen", "Seen", "v", canTriage),
           this.action(6, "toggle-watch", "Watch", "w", canTriage),
           this.action(7, "refresh", "Refresh", "r", canRefresh),
@@ -883,11 +972,13 @@ export class TuiController {
       mode,
       query,
       browseLimit: this.browseLimit,
+      listPriorityInbox: (options) => this.effects.listPriorityInbox(options),
       listPriorityQueue: (options) => this.effects.listPriorityQueue(options),
       listWatchlist: (limit) => this.effects.listWatchlist(limit),
       search: (searchQuery, limit) => this.effects.search(searchQuery, limit),
       searchIssues: (searchQuery, limit) => this.effects.searchIssues(searchQuery, limit),
       toPrRow: (pr, priority = null) => this.toPrRow(pr, priority),
+      toPriorityClusterRow: (cluster) => this.toPriorityClusterRow(cluster),
       toIssueRow: (issue) => this.toIssueRow(issue),
       rowUrl: (row) => this.rowUrl(row),
       priorityScanLimit: PRIORITY_SCAN_LIMIT,
@@ -933,6 +1024,28 @@ export class TuiController {
         });
         this.context = { kind: "pr", prNumber: bundle.candidate.pr.prNumber };
         this.activeUrl = bundle.candidate.pr.url;
+        this.emit();
+        return;
+      }
+
+      if (row.kind === "priority-cluster") {
+        const bundle = await this.effects.getPrContextBundle(
+          row.cluster.representative.pr.prNumber,
+        );
+        if (requestId !== this.detailRequestId || !bundle) {
+          return;
+        }
+        const targetSection = focusSection ?? "cluster";
+        this.setDetailPayload({
+          visible: true,
+          payload: { kind: "pr", bundle },
+          identity: row.cluster.clusterKey,
+          status: `${row.cluster.statusLabel} · ${row.cluster.openPrCount} open / ${row.cluster.totalPrCount} total`,
+          focusSection: targetSection,
+          anchorKey: `${row.cluster.clusterKey}:${targetSection}:${++this.detailAnchorNonce}`,
+        });
+        this.context = { kind: "pr", prNumber: bundle.candidate.pr.prNumber };
+        this.activeUrl = row.cluster.representative.pr.url;
         this.emit();
         return;
       }
@@ -983,7 +1096,7 @@ export class TuiController {
 
   private async openPrDetailSection(section: TuiDetailSection): Promise<void> {
     const row = this.rows[this.selectedIndex];
-    if (!row || row.kind !== "pr") {
+    if (!row || (row.kind !== "pr" && row.kind !== "priority-cluster")) {
       return;
     }
     this.showDetail = true;
@@ -1053,6 +1166,19 @@ export class TuiController {
     };
   }
 
+  private toPriorityClusterRow(
+    cluster: Extract<TuiResultRow, { kind: "priority-cluster" }>["cluster"],
+  ): Extract<TuiResultRow, { kind: "priority-cluster" }> {
+    return {
+      kind: "priority-cluster",
+      cluster,
+      freshness: this.prFreshness(
+        cluster.representative.pr.updatedAt,
+        `pr:${cluster.representative.pr.prNumber}`,
+      ),
+    };
+  }
+
   private toIssueRow(issue: IssueSearchResult): Extract<TuiResultRow, { kind: "issue" }> {
     return {
       kind: "issue",
@@ -1114,11 +1240,15 @@ export class TuiController {
     });
   }
 
-  private rowFreshness(row: Extract<TuiResultRow, { kind: "pr" | "issue" }>): TuiFreshness {
+  private rowFreshness(
+    row: Extract<TuiResultRow, { kind: "pr" | "issue" | "priority-cluster" }>,
+  ): TuiFreshness {
     return rowFreshness(row);
   }
 
-  private rowIdentity(row: Extract<TuiResultRow, { kind: "pr" | "issue" }>): string {
+  private rowIdentity(
+    row: Extract<TuiResultRow, { kind: "pr" | "issue" | "priority-cluster" }>,
+  ): string {
     return rowIdentity(row);
   }
 

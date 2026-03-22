@@ -7,6 +7,8 @@ import type {
   IssueSearchResult,
   PrContextBundle,
   PriorityCandidate,
+  PriorityClusterSummary,
+  PriorityInboxItem,
   SearchResult,
   StatusSnapshot,
   SyncProgressEvent,
@@ -111,6 +113,35 @@ function makeBundle(
   };
 }
 
+function makePriorityCluster(
+  prNumbers: number[],
+  overrides: Partial<PriorityClusterSummary> = {},
+): PriorityClusterSummary {
+  const openMembers = prNumbers.map((prNumber, index) =>
+    makePriorityCandidate(prNumber, "new", {
+      score: 36 - index,
+      pr: makePr(prNumber, { score: 36 - index }),
+    }),
+  );
+  return {
+    clusterKey: `issue:41789:${prNumbers.join(",")}`,
+    basis: "linked_issue",
+    representative: openMembers[0]!,
+    openMembers,
+    score: 40,
+    totalPrCount: openMembers.length,
+    openPrCount: openMembers.length,
+    mergedPrCount: 0,
+    linkedIssueCount: 1,
+    clusterIssueNumbers: [41789],
+    statusLabel: `${openMembers.length} open variants`,
+    statusReason: `${openMembers.length} open PRs are competing in the same cluster.`,
+    recommendation: "open_variants",
+    solvedByPrNumber: null,
+    ...overrides,
+  };
+}
+
 function makeCluster(prNumber: number): ClusterPullRequestAnalysis {
   return {
     seedPr: {
@@ -194,6 +225,7 @@ const syncSummary: SyncSummary = {
 class FakeTuiDataService implements TuiDataService {
   syncPrsCalls = 0;
   syncIssuesCalls = 0;
+  priorityInboxCalls: Array<{ limit: number; scanLimit?: number }> = [];
   priorityQueueCalls: Array<{ limit: number; scanLimit?: number }> = [];
   watchlistCalls: number[] = [];
   searchCalls: Array<{ query: string; limit: number }> = [];
@@ -207,6 +239,7 @@ class FakeTuiDataService implements TuiDataService {
   blockPriorityQueue = false;
   blockPrContextBundle = false;
   detailErrorMessage: string | null = null;
+  inboxItems: PriorityInboxItem[] | null = null;
   private syncPrsRelease: (() => void) | null = null;
   private refreshPrRelease: (() => void) | null = null;
   private priorityQueueRelease: (() => void) | null = null;
@@ -218,6 +251,16 @@ class FakeTuiDataService implements TuiDataService {
 
   async rateLimit() {
     return rateLimit;
+  }
+
+  async listPriorityInbox(options: { limit: number; scanLimit?: number }) {
+    this.priorityInboxCalls.push(options);
+    if (this.inboxItems) {
+      return this.inboxItems.slice(0, options.limit);
+    }
+    return (await this.listPriorityQueue(options)).map(
+      (candidate) => ({ kind: "pr", candidate }) satisfies PriorityInboxItem,
+    );
   }
 
   async listPriorityQueue(options: { limit: number; scanLimit?: number }) {
@@ -428,8 +471,32 @@ describe("TuiController", () => {
     expect(model.mode).toBe("inbox");
     expect(model.resultsPane.title).toBe("Inbox");
     expect(model.resultsPane.rows).toHaveLength(20);
-    expect(model.detailPane.lines.join("\n")).toContain("Inbox ranks PRs");
-    expect(service.priorityQueueCalls).toEqual([{ limit: 20, scanLimit: 300 }]);
+    expect(model.detailPane.lines.join("\n")).toContain("collapsed priority queue");
+    expect(service.priorityInboxCalls).toEqual([{ limit: 20, scanLimit: 300 }]);
+  });
+
+  it("renders collapsed cluster rows and expands them into member PRs", async () => {
+    const service = new FakeTuiDataService();
+    service.inboxItems = [
+      { kind: "cluster", cluster: makePriorityCluster([41793, 42212]) },
+      { kind: "pr", candidate: makePriorityCandidate(43001) },
+    ];
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    let model = controller.getRenderModel();
+    expect(model.resultsPane.rows[0]?.kind).toBe("priority-cluster");
+    expect(model.resultsPane.lines.join("\n")).toContain("CLUSTER");
+
+    await controller.expandSelectedCluster();
+    model = controller.getRenderModel();
+    expect(model.resultsPane.title).toContain("Cluster");
+    expect(model.resultsPane.rows.every((row) => row.kind === "pr")).toBe(true);
+    expect(model.resultsPane.rows).toHaveLength(2);
   });
 
   it("opens PR context detail from Inbox", async () => {
@@ -502,7 +569,7 @@ describe("TuiController", () => {
     const model = controller.getRenderModel();
     expect(model.detailPane.visible).toBe(false);
     expect(model.detailPane.title).toBe("Start Here");
-    expect(model.detailPane.lines.join("\n")).toContain("Inbox ranks PRs");
+    expect(model.detailPane.lines.join("\n")).toContain("collapsed priority queue");
 
     service.releaseRefreshPr();
     await openPromise;
@@ -604,7 +671,7 @@ describe("TuiController", () => {
 
     const model = controller.getRenderModel();
     expect(model.resultsPane.rows).toHaveLength(40);
-    expect(model.resultsPane.summary?.yieldLabel).toBe("40 PRs · 40 shown");
+    expect(model.resultsPane.summary?.yieldLabel).toBe("40 rows · 40 PRs · 40 shown");
   });
 
   it("sorts cross-search rows by score before entity type", async () => {

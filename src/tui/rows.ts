@@ -21,12 +21,22 @@ export function computePrFreshness(params: {
   return "partial";
 }
 
-export function rowFreshness(row: Extract<TuiResultRow, { kind: "pr" | "issue" }>): TuiFreshness {
+export function rowFreshness(
+  row: Extract<TuiResultRow, { kind: "pr" | "issue" | "priority-cluster" }>,
+): TuiFreshness {
   return row.freshness;
 }
 
-export function rowIdentity(row: Extract<TuiResultRow, { kind: "pr" | "issue" }>): string {
-  return row.kind === "pr" ? `pr:${row.pr.prNumber}` : `issue:${row.issue.issueNumber}`;
+export function rowIdentity(
+  row: Extract<TuiResultRow, { kind: "pr" | "issue" | "priority-cluster" }>,
+): string {
+  if (row.kind === "pr") {
+    return `pr:${row.pr.prNumber}`;
+  }
+  if (row.kind === "issue") {
+    return `issue:${row.issue.issueNumber}`;
+  }
+  return row.cluster.clusterKey;
 }
 
 export function rowUrl(row: TuiResultRow | undefined): string | null {
@@ -39,6 +49,9 @@ export function rowUrl(row: TuiResultRow | undefined): string | null {
   if (row.kind === "issue") {
     return row.issue.url;
   }
+  if (row.kind === "priority-cluster") {
+    return row.cluster.representative.pr.url;
+  }
   return null;
 }
 
@@ -48,6 +61,9 @@ export function rowIdentityForAny(row: TuiResultRow): string | null {
   }
   if (row.kind === "issue") {
     return `issue:${row.issue.issueNumber}`;
+  }
+  if (row.kind === "priority-cluster") {
+    return row.cluster.clusterKey;
   }
   return row.kind;
 }

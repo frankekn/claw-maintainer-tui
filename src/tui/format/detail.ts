@@ -299,7 +299,7 @@ export function formatInboxLandingDetail(
 ): string[] {
   const lines = [
     sectionLabel("Start Here"),
-    "Inbox ranks PRs by how much context they can open up.",
+    "Inbox collapses overlapping PR work so you can review clusters before individual PRs.",
   ];
   if (status) {
     lines.push(accentMeta("repo", status.repo));
@@ -310,10 +310,11 @@ export function formatInboxLandingDetail(
   lines.push(
     "",
     sectionLabel("Workflow"),
-    "1 Review the single priority queue.",
-    "2 Press Enter to open the PR investigation workspace.",
-    "3 Press x or c to jump to linked issues or cluster.",
-    "4 Press v / w / i / u to manage local triage state.",
+    "1 Review the collapsed priority queue.",
+    "2 Press Enter to open the selected PR or cluster investigation workspace.",
+    "3 Press e to expand a collapsed cluster into member PRs.",
+    "4 Press x or c to jump to linked issues or cluster.",
+    "5 Press v / w / i / u to manage local triage state.",
   );
   return lines;
 }

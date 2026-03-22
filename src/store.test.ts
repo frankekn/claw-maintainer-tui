@@ -936,6 +936,83 @@ describe("PrIndexStore", () => {
     }
   });
 
+  it("collapses inbox rows for linked-issue clusters and marks merged families as solved", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-14T00:00:00.000Z"));
+
+    try {
+      const store = await createStore();
+      const openA = makePullRequest(51001, {
+        title: "fix: gateway timeout cascade across retry paths",
+        body: "Closes #42011\nFix the gateway timeout cascade across retry paths.",
+        updatedAt: "2026-03-13T12:00:00.000Z",
+      });
+      const openB = makePullRequest(51002, {
+        title: "fix: gateway timeout cascade in retry cleanup",
+        body: "Closes #42011\nReduce retry loop fallout from the same gateway timeout cascade.",
+        updatedAt: "2026-03-13T11:00:00.000Z",
+      });
+      const merged = makePullRequest(51003, {
+        title: "fix: gateway timeout cascade with landed cleanup",
+        body: "Closes #42011\nLand the gateway timeout cascade fix.",
+        state: "merged",
+        mergedAt: "2026-03-13T10:00:00.000Z",
+        closedAt: "2026-03-13T10:00:00.000Z",
+        updatedAt: "2026-03-13T10:00:00.000Z",
+      });
+      const unrelated = makePullRequest(51010, {
+        title: "docs: refresh maintainer notes",
+        body: "Routine docs cleanup.",
+        updatedAt: "2026-03-13T09:00:00.000Z",
+      });
+
+      await store.sync({
+        repo,
+        source: new FakePullRequestDataSource([openA, openB, merged, unrelated]),
+        full: true,
+      });
+
+      for (const prNumber of [51001, 51002, 51003] as const) {
+        await store.recordPullRequestFacts(
+          makePullRequestFacts(prNumber, {
+            linkedIssues: [{ issueNumber: 42011, linkSource: "closing_reference" }],
+            changedFiles: [{ path: "src/gateway/retry.ts", kind: "prod" }],
+          }),
+        );
+      }
+      await store.recordPullRequestFacts(
+        makePullRequestFacts(51010, {
+          changedFiles: [{ path: "docs/maintainers.md", kind: "other" }],
+        }),
+      );
+
+      const inbox = await store.listPriorityInbox({ repo, limit: 10, scanLimit: 10 });
+      const cluster = inbox.find((item) => item.kind === "cluster");
+
+      expect(cluster).toBeTruthy();
+      expect(cluster?.kind).toBe("cluster");
+      if (cluster?.kind === "cluster") {
+        expect(cluster.cluster.clusterIssueNumbers).toEqual([42011]);
+        expect(cluster.cluster.openPrCount).toBe(2);
+        expect(cluster.cluster.mergedPrCount).toBe(1);
+        expect(cluster.cluster.totalPrCount).toBe(3);
+        expect(cluster.cluster.recommendation).toBe("merged_exists");
+        expect(cluster.cluster.statusLabel).toBe("merged exists");
+        expect(cluster.cluster.openMembers.map((member) => member.pr.prNumber)).toEqual([
+          51001, 51002,
+        ]);
+      }
+      expect(inbox.some((item) => item.kind === "pr" && item.candidate.pr.prNumber === 51010)).toBe(
+        true,
+      );
+      expect(inbox.some((item) => item.kind === "pr" && item.candidate.pr.prNumber === 51001)).toBe(
+        false,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("treats maintainer as badge-only while watch and ignore stay local", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-03-14T00:00:00.000Z"));

@@ -48,6 +48,8 @@ function formatKind(kind: TuiResultRow["kind"]): string {
   switch (kind) {
     case "pr":
       return "PR";
+    case "priority-cluster":
+      return "CLUSTER";
     case "issue":
       return "ISSUE";
     case "cluster-candidate":
@@ -96,6 +98,29 @@ function formatPrRow(row: Extract<TuiResultRow, { kind: "pr" }>, mode: TuiMode):
   )} ${padRight(formatDateShort(result.updatedAt), 10)} ${truncate(result.title, 54)}`;
 }
 
+function formatPriorityClusterRow(
+  row: Extract<TuiResultRow, { kind: "priority-cluster" }>,
+): string {
+  const cluster = row.cluster;
+  const representative = cluster.representative;
+  const badge =
+    cluster.recommendation === "merged_exists"
+      ? "MRG"
+      : cluster.recommendation === "open_variants"
+        ? "VAR"
+        : "SEM";
+  const context = `P${cluster.totalPrCount} I${cluster.linkedIssueCount}`;
+  return `${padRight(formatKind(row.kind), 8)} ${padRight(`#${representative.pr.prNumber}`, 9)} ${String(
+    Math.round(cluster.score),
+  ).padStart(4)} ${padRight(cluster.statusLabel.toUpperCase().slice(0, 7), 7)} ${padRight(
+    formatRelativeAge(representative.pr.updatedAt),
+    4,
+  )} ${padRight(context, 7)} ${padRight(badge, 3)} ${truncate(
+    `${representative.pr.title} · ${cluster.statusReason}`,
+    64,
+  )}`;
+}
+
 function formatIssueRow(row: Extract<TuiResultRow, { kind: "issue" }>): string {
   const result = row.issue;
   return `${padRight(formatKind(row.kind), 8)} ${padRight(`#${result.issueNumber}`, 9)} ${result.score
@@ -142,6 +167,8 @@ export function formatResultRow(row: TuiResultRow, mode: TuiMode): string {
   switch (row.kind) {
     case "pr":
       return formatPrRow(row, mode);
+    case "priority-cluster":
+      return formatPriorityClusterRow(row);
     case "issue":
       return formatIssueRow(row);
     case "cluster-candidate":

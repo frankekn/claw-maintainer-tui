@@ -157,7 +157,7 @@ export function defaultSecondaryHintText(mode: string, canLoadMore = false): str
       : "";
   const triageHint =
     mode === "inbox" || mode === "watchlist"
-      ? `  ${text("v/w/i/u", "muted")} triage  ${text("x/c", "muted")} context`
+      ? `  ${text("v/w/i/u", "muted")} triage  ${text("x/c/e", "muted")} context`
       : `  ${text("x/c", "muted")} context`;
   return `${text("Move/Scroll", "muted")} j/k ↑↓  ${text("Enter", "muted")} detail  ${text("Tab", "muted")} focus${queryHint}${triageHint}${canLoadMore ? `  ${text("m", "muted")} more` : ""}  ${text("q", "muted")} quit`;
 }

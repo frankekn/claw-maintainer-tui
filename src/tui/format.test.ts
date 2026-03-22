@@ -10,7 +10,12 @@ import {
   formatResultRow,
   formatStatusDetail,
 } from "./format.js";
-import type { PrContextBundle, PriorityCandidate, StatusSnapshot } from "../types.js";
+import type {
+  PrContextBundle,
+  PriorityCandidate,
+  PriorityClusterSummary,
+  StatusSnapshot,
+} from "../types.js";
 import type { TuiHeaderModel } from "./types.js";
 
 const status: StatusSnapshot = {
@@ -159,6 +164,26 @@ function makeBundle(): PrContextBundle {
   };
 }
 
+function makePriorityCluster(): PriorityClusterSummary {
+  const representative = makeCandidate();
+  return {
+    clusterKey: "issue:41789",
+    basis: "linked_issue",
+    representative,
+    openMembers: [representative],
+    score: 48,
+    totalPrCount: 3,
+    openPrCount: 2,
+    mergedPrCount: 1,
+    linkedIssueCount: 1,
+    clusterIssueNumbers: [41789],
+    statusLabel: "merged exists",
+    statusReason: "Merged PR #42212 already covers this cluster.",
+    recommendation: "merged_exists",
+    solvedByPrNumber: 42212,
+  };
+}
+
 describe("tui formatting", () => {
   it("formats the header with sync badges", () => {
     const header = formatHeader(headerModel, new Date("2026-03-11T08:28:13.832Z"));
@@ -186,6 +211,17 @@ describe("tui formatting", () => {
     expect(row).toContain("WATCH");
     expect(row).toContain("I2 R3");
 
+    const clusterRow = formatResultRow(
+      {
+        kind: "priority-cluster",
+        cluster: makePriorityCluster(),
+        freshness: "fresh",
+      },
+      "inbox",
+    );
+    expect(clusterRow).toContain("CLUSTER");
+    expect(clusterRow).toContain("MRG");
+
     const detail = formatPriorityPrDetail(makeBundle(), "linked-issues");
     expect(detail.lines.join("\n")).toContain("WHY PRIORITIZED");
     expect(detail.lines.join("\n")).toContain("LINKED ISSUES");
@@ -197,7 +233,8 @@ describe("tui formatting", () => {
     const detail = formatInboxLandingDetail(status, new Date("2026-03-11T08:28:13.832Z"));
 
     expect(detail.join("\n")).toContain("START HERE");
-    expect(detail.join("\n")).toContain("single priority queue");
+    expect(detail.join("\n")).toContain("collapsed priority queue");
+    expect(detail.join("\n")).toContain("Press e to expand");
     expect(detail.join("\n")).toContain("v / w / i / u");
 
     const tabs = formatModeTabs("inbox", "nav");
@@ -228,6 +265,7 @@ describe("tui formatting", () => {
       }),
     ).toContain("priority queue");
     expect(defaultSecondaryHintText("inbox", true)).toContain("v/w/i/u");
+    expect(defaultSecondaryHintText("inbox", true)).toContain("x/c/e");
     expect(defaultSecondaryHintText("pr-search", true)).toContain("/");
   });
 });

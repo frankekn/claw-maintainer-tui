@@ -1,4 +1,9 @@
-import type { IssueSearchResult, PriorityCandidate, SearchResult } from "../types.js";
+import type {
+  IssueSearchResult,
+  PriorityCandidate,
+  PriorityInboxItem,
+  SearchResult,
+} from "../types.js";
 import type {
   ListLoadResult,
   ListMode,
@@ -24,17 +29,31 @@ export function buildListSummary(params: {
     return { yieldLabel: `${count} metrics`, confidenceLabel: null, coverageLabel: null };
   }
   if (mode === "inbox" || mode === "watchlist") {
-    const prRows = rows.filter(
-      (row): row is Extract<TuiResultRow, { kind: "pr" }> => row.kind === "pr",
-    );
-    const linkedCount = prRows.filter((row) => (row.priority?.linkedIssueCount ?? 0) > 0).length;
-    const relatedCount = prRows.filter(
-      (row) => (row.priority?.relatedPullRequestCount ?? 0) > 0,
-    ).length;
+    const representedCount = rows.reduce((sum, row) => {
+      if (row.kind === "pr") {
+        return sum + 1;
+      }
+      if (row.kind === "priority-cluster") {
+        return sum + row.cluster.totalPrCount;
+      }
+      return sum;
+    }, 0);
+    const linkedCount = rows.filter((row) => {
+      if (row.kind === "pr") {
+        return (row.priority?.linkedIssueCount ?? 0) > 0;
+      }
+      return row.kind === "priority-cluster" && row.cluster.linkedIssueCount > 0;
+    }).length;
+    const relatedCount = rows.filter((row) => {
+      if (row.kind === "pr") {
+        return (row.priority?.relatedPullRequestCount ?? 0) > 0;
+      }
+      return row.kind === "priority-cluster" && row.cluster.totalPrCount > 1;
+    }).length;
     return {
-      yieldLabel: `${count} PR${count === 1 ? "" : "s"}${count >= browseLimit ? ` · ${browseLimit} shown` : ""}`,
+      yieldLabel: `${count} row${count === 1 ? "" : "s"} · ${representedCount} PR${representedCount === 1 ? "" : "s"}${count >= browseLimit ? ` · ${browseLimit} shown` : ""}`,
       confidenceLabel: `issue-linked ${linkedCount} · related ${relatedCount}`,
-      coverageLabel: mode === "watchlist" ? "local watch state" : "priority queue",
+      coverageLabel: mode === "watchlist" ? "local watch state" : "collapsed priority queue",
     };
   }
 
@@ -108,6 +127,10 @@ export async function resolveListRows(params: {
   mode: ListMode;
   query: string;
   browseLimit: number;
+  listPriorityInbox: (options: {
+    limit: number;
+    scanLimit?: number;
+  }) => Promise<PriorityInboxItem[]>;
   listPriorityQueue: (options: {
     limit: number;
     scanLimit?: number;
@@ -119,6 +142,9 @@ export async function resolveListRows(params: {
     pr: SearchResult,
     priority?: PriorityCandidate | null,
   ) => Extract<TuiResultRow, { kind: "pr" }>;
+  toPriorityClusterRow: (
+    cluster: Extract<PriorityInboxItem, { kind: "cluster" }>["cluster"],
+  ) => Extract<TuiResultRow, { kind: "priority-cluster" }>;
   toIssueRow: (issue: IssueSearchResult) => Extract<TuiResultRow, { kind: "issue" }>;
   rowUrl: (row: TuiResultRow | undefined) => string | null;
   priorityScanLimit: number;
@@ -127,28 +153,36 @@ export async function resolveListRows(params: {
     mode,
     query,
     browseLimit,
+    listPriorityInbox,
     listPriorityQueue,
     listWatchlist,
     search,
     searchIssues,
     toPrRow,
+    toPriorityClusterRow,
     toIssueRow,
     rowUrl,
     priorityScanLimit,
   } = params;
 
   if (mode === "inbox") {
-    const candidates = await listPriorityQueue({
+    const items = await listPriorityInbox({
       limit: browseLimit,
       scanLimit: priorityScanLimit,
     });
-    const rows = candidates.map((candidate) => toPrRow(candidate.pr, candidate));
+    const rows = items.map((item) =>
+      item.kind === "pr"
+        ? toPrRow(item.candidate.pr, item.candidate)
+        : toPriorityClusterRow(item.cluster),
+    );
     return {
       mode,
       rows,
       resultTitle: "Inbox",
       message:
-        rows.length > 0 ? `Loaded ${rows.length} prioritized PR(s).` : "No prioritized PRs found.",
+        rows.length > 0
+          ? `Loaded ${rows.length} collapsed inbox row(s).`
+          : "No prioritized PRs found.",
       activeUrl: rowUrl(rows[0]),
       isLandingView: true,
     };

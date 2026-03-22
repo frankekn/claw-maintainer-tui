@@ -19,6 +19,10 @@ export class TuiEffects {
     return this.service.rateLimit();
   }
 
+  listPriorityInbox(options: { limit: number; scanLimit?: number }) {
+    return this.service.listPriorityInbox(options);
+  }
+
   listPriorityQueue(options: { limit: number; scanLimit?: number }) {
     return this.service.listPriorityQueue(options);
   }

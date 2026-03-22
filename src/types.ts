@@ -161,6 +161,29 @@ export type PriorityCandidate = {
   };
 };
 
+export type PriorityClusterRecommendation = "merged_exists" | "open_variants" | "semantic_family";
+
+export type PriorityClusterSummary = {
+  clusterKey: string;
+  basis: "linked_issue" | "semantic_only";
+  representative: PriorityCandidate;
+  openMembers: PriorityCandidate[];
+  score: number;
+  totalPrCount: number;
+  openPrCount: number;
+  mergedPrCount: number;
+  linkedIssueCount: number;
+  clusterIssueNumbers: number[];
+  statusLabel: string;
+  statusReason: string;
+  recommendation: PriorityClusterRecommendation;
+  solvedByPrNumber: number | null;
+};
+
+export type PriorityInboxItem =
+  | { kind: "pr"; candidate: PriorityCandidate }
+  | { kind: "cluster"; cluster: PriorityClusterSummary };
+
 export type PullRequestLinkedIssue = {
   issueNumber: number;
   linkSource: PullRequestLinkSource;
