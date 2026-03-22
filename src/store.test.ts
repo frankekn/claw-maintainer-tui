@@ -660,6 +660,36 @@ describe("PrIndexStore", () => {
     expect(results[0]?.title).toBe("Updated issue state");
   });
 
+  it("replaces stale derived issue links when refreshing pull request facts", async () => {
+    const store = await createStore();
+    const pr = makePullRequest(42003, {
+      title: "Refresh derived issue links",
+      body: "Source Issue #42011",
+    });
+
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([pr]),
+      full: true,
+    });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(42003, {
+        linkedIssues: [{ issueNumber: 42011, linkSource: "source_issue_marker" }],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(42003, {
+        linkedIssues: [{ issueNumber: 42012, linkSource: "source_issue_marker" }],
+      }),
+    );
+
+    const facts = await store.getPullRequestFacts(42003);
+
+    expect(facts?.linkedIssues).toEqual([
+      { issueNumber: 42012, linkSource: "source_issue_marker" },
+    ]);
+  });
+
   it("persists the incremental issue watermark captured at sync start", async () => {
     const store = await createStore();
     const source = new FakeIssueDataSource([

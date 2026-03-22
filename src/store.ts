@@ -565,7 +565,10 @@ export class PrIndexStore {
           JSON.stringify(facts.statusChecks),
           facts.fetchedAt,
         );
-      this.clearIssueLinksForSources(facts.prNumber, ["closing_reference"]);
+      this.clearIssueLinksForSources(
+        facts.prNumber,
+        Array.from(new Set(facts.linkedIssues.map((issue) => issue.linkSource))),
+      );
       for (const issue of facts.linkedIssues) {
         this.db
           .prepare(
