@@ -1,6 +1,11 @@
 import { buildStatusRows } from "./format.js";
 import { TuiEffects } from "./effects.js";
-import { buildListSummary, currentBrowseCapacity, resolveListRows } from "./listing.js";
+import {
+  buildListSummary,
+  crossSearchLimits,
+  currentBrowseCapacity,
+  resolveListRows,
+} from "./listing.js";
 import {
   computePrFreshness,
   rowFreshness,
@@ -1210,10 +1215,16 @@ export class TuiController {
   }
 
   private canLoadMore(): boolean {
-    return (
-      this.isListMode(this.mode) &&
-      this.rows.length >= currentBrowseCapacity(this.mode, this.browseLimit)
-    );
+    if (!this.isListMode(this.mode)) {
+      return false;
+    }
+    if (this.mode === "cross-search") {
+      const limits = crossSearchLimits(this.browseLimit);
+      const prCount = this.rows.filter((row) => row.kind === "pr").length;
+      const issueCount = this.rows.filter((row) => row.kind === "issue").length;
+      return prCount >= limits.pr || issueCount >= limits.issue;
+    }
+    return this.rows.length >= currentBrowseCapacity(this.mode, this.browseLimit);
   }
 
   async loadMore(): Promise<void> {

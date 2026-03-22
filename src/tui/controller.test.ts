@@ -711,6 +711,27 @@ describe("TuiController", () => {
     expect(rows[1]?.kind).toBe("pr");
   });
 
+  it("keeps cross-search pagination enabled when one result type hits its cap", async () => {
+    const service = new FakeTuiDataService();
+    service.search = vi.fn(async () =>
+      Array.from({ length: 10 }, (_, index) => makePr(50000 + index, { score: 0.9 - index / 100 })),
+    );
+    service.searchIssues = vi.fn(async () => []);
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    controller.activateMode("cross-search");
+    await flushMicrotasks();
+
+    const loadMore = controller
+      .getRenderModel()
+      .footer.actions.find((action) => action.id === "load-more");
+    expect(loadMore?.enabled).toBe(true);
+  });
+
   it("surfaces detail load failures instead of rejecting the action", async () => {
     const service = new FakeTuiDataService();
     service.detailErrorMessage = "detail boom";
