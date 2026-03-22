@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { ClusterCandidate } from "../types.js";
 import {
+  buildLinkedIssueClusterResult,
+  buildSemanticOnlyClusterResult,
   classifyNearbyExcludedCandidate,
   describeReasonCodes,
   evaluateSemanticOnlyCandidate,
@@ -200,5 +202,43 @@ describe("cluster workflow helpers", () => {
     expect(describeReasonCodes(["broader_relevant_prod_coverage", "adds_companion_tests"])).toBe(
       "adds companion tests, broader relevant production coverage",
     );
+  });
+
+  it("assembles semantic-only and linked-issue results with final traces", () => {
+    const semantic = buildSemanticOnlyClusterResult({
+      seed: {
+        number: 40,
+        title: "Seed",
+        url: "https://example.test/pr/40",
+        state: "open",
+        updated_at: "2026-03-18T10:00:00.000Z",
+      },
+      sameClusterCandidates: [makeCandidate(41, { matchedBy: "local_semantic", linkedIssues: [] })],
+      nearbyButExcluded: [],
+      decisionTrace: [],
+      limit: 5,
+    });
+    expect(semantic.clusterBasis).toBe("semantic_only");
+    expect(semantic.decisionTrace.at(-1)?.outcome).toBe("semantic_only_result");
+
+    const linked = buildLinkedIssueClusterResult({
+      seed: {
+        number: 50,
+        title: "Seed",
+        url: "https://example.test/pr/50",
+        state: "open",
+        updated_at: "2026-03-18T10:00:00.000Z",
+      },
+      clusterIssueNumbers: [41789],
+      bestBase: makeCandidate(51),
+      sameClusterCandidates: [makeCandidate(51, { status: "best_base" })],
+      nearbyButExcluded: [],
+      mergeReadiness: null,
+      decisionTrace: [],
+      limit: 5,
+    });
+    expect(linked.clusterBasis).toBe("linked_issue");
+    expect(linked.bestBase?.prNumber).toBe(51);
+    expect(linked.decisionTrace.at(-1)?.outcome).toBe("linked_issue_result");
   });
 });

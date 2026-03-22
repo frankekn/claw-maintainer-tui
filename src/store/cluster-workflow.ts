@@ -2,11 +2,17 @@ import type {
   ClusterCandidate,
   ClusterDecisionTrace,
   ClusterExcludedCandidate,
+  ClusterPullRequestAnalysis,
   ClusterReasonCode,
+  MergeReadiness,
+  PrState,
 } from "../types.js";
 import {
+  buildClusterSeed,
   buildClusterDecisionTrace,
   buildExcludedTrace,
+  linkedIssueResultSummary,
+  semanticOnlyResultSummary,
   withClusterFeatures,
 } from "./cluster-analysis.js";
 import {
@@ -227,5 +233,82 @@ export function rankClusterDecisionSet(params: {
     bestBase,
     sameClusterCandidates,
     decisionTrace,
+  };
+}
+
+export function buildSemanticOnlyClusterResult(params: {
+  seed: {
+    number: number;
+    title: string;
+    url: string;
+    state: PrState;
+    updated_at: string;
+  };
+  sameClusterCandidates: ClusterCandidate[];
+  nearbyButExcluded: ClusterExcludedCandidate[];
+  decisionTrace: ClusterDecisionTrace[];
+  limit: number;
+}): ClusterPullRequestAnalysis {
+  return {
+    seedPr: buildClusterSeed(params.seed),
+    clusterBasis: "semantic_only",
+    clusterIssueNumbers: [],
+    bestBase: null,
+    sameClusterCandidates: params.sameClusterCandidates,
+    nearbyButExcluded: params.nearbyButExcluded.slice(0, params.limit),
+    mergeReadiness: null,
+    decisionTrace: [
+      ...params.decisionTrace,
+      buildClusterDecisionTrace({
+        phase: "result",
+        prNumber: null,
+        matchedBy: null,
+        outcome: "semantic_only_result",
+        summary: semanticOnlyResultSummary(params.sameClusterCandidates.length),
+      }),
+    ],
+  };
+}
+
+export function buildLinkedIssueClusterResult(params: {
+  seed: {
+    number: number;
+    title: string;
+    url: string;
+    state: PrState;
+    updated_at: string;
+  };
+  clusterIssueNumbers: number[];
+  bestBase: ClusterCandidate | null;
+  sameClusterCandidates: ClusterCandidate[];
+  nearbyButExcluded: ClusterExcludedCandidate[];
+  mergeReadiness: MergeReadiness | null;
+  decisionTrace: ClusterDecisionTrace[];
+  limit: number;
+}): ClusterPullRequestAnalysis {
+  const resolvedBestBase =
+    params.sameClusterCandidates.find((candidate) => candidate.status === "best_base") ??
+    params.bestBase;
+
+  return {
+    seedPr: buildClusterSeed(params.seed),
+    clusterBasis: "linked_issue",
+    clusterIssueNumbers: params.clusterIssueNumbers,
+    bestBase: resolvedBestBase,
+    sameClusterCandidates: params.sameClusterCandidates,
+    nearbyButExcluded: params.nearbyButExcluded.slice(0, params.limit),
+    mergeReadiness: params.mergeReadiness,
+    decisionTrace: [
+      ...params.decisionTrace,
+      buildClusterDecisionTrace({
+        phase: "result",
+        prNumber: resolvedBestBase?.prNumber ?? null,
+        matchedBy: resolvedBestBase?.matchedBy ?? null,
+        outcome: resolvedBestBase ? "linked_issue_result" : "linked_issue_result_empty",
+        summary: linkedIssueResultSummary(params.clusterIssueNumbers, resolvedBestBase),
+        featureVector: resolvedBestBase?.featureVector,
+        reasonCodes: resolvedBestBase?.reasonCodes,
+      }),
+    ],
   };
 }
