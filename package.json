@@ -11,6 +11,9 @@
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "verify": "pnpm typecheck && pnpm test && pnpm format",
+    "dev": "pnpm clawlens tui --repo openclaw/openclaw",
+    "dev:sync": "pnpm clawlens sync --repo openclaw/openclaw && pnpm clawlens sync-issues --repo openclaw/openclaw",
+    "dev:full": "pnpm clawlens sync --full --repo openclaw/openclaw && pnpm clawlens sync-issues --full --repo openclaw/openclaw",
     "format": "oxfmt --check .",
     "format:fix": "oxfmt --write ."
   },
