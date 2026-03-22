@@ -87,9 +87,10 @@ export async function syncPullRequestsWorkflow(params: {
         params.repo,
         params.lastSyncWatermark,
       )) {
-        // First-seen PRs cannot safely use issue-style summaries because draft and
-        // branch metadata are missing from that payload.
-        if (!params.getStoredUpdatedAt(pr.number)) {
+        // Issue-style changed-PR payloads do not carry reliable draft/branch metadata.
+        // Hydrate whenever those fields are missing so new and existing PR rows stay
+        // correct for ranking and branch filters.
+        if (!params.getStoredUpdatedAt(pr.number) || !pr.baseRef || !pr.headRef) {
           toProcess.push(pr.number);
           continue;
         }

@@ -414,6 +414,49 @@ describe("PrIndexStore", () => {
     expect(branchResult.map((result) => result.prNumber)).toContain(40004);
   });
 
+  it("hydrates existing incremental PRs when changed summaries omit branch metadata", async () => {
+    const store = await createStore();
+    const initial = makePullRequest(40005, {
+      title: "Existing incremental PR",
+      body: "Existing row should refresh when branch metadata is missing.",
+      isDraft: false,
+      baseRef: "main",
+      headRef: "feature/original-branch",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([initial]);
+
+    await store.sync({ repo, source, full: true });
+    source.hydrateCalls = [];
+
+    const refreshed = makePullRequest(40005, {
+      title: "Existing incremental PR",
+      body: "Existing row should refresh when branch metadata is missing.",
+      isDraft: true,
+      baseRef: "release",
+      headRef: "feature/retargeted-existing-pr",
+      updatedAt: "2026-03-11T00:00:00.000Z",
+    });
+    source.setPullRequest(refreshed);
+    source.changedPrs = [
+      {
+        ...refreshed.pr,
+        isDraft: false,
+        baseRef: "",
+        headRef: "",
+      },
+    ];
+
+    const summary = await store.sync({ repo, source });
+    const queue = await store.listPriorityQueue({ repo, limit: 10, scanLimit: 10 });
+    const branchResult = await store.search("branch:feature/retargeted-existing-pr");
+
+    expect(summary.processedPrs).toBe(1);
+    expect(source.hydrateCalls).toEqual([40005]);
+    expect(queue.find((candidate) => candidate.pr.prNumber === 40005)?.badges.draft).toBe(true);
+    expect(branchResult.map((result) => result.prNumber)).toContain(40005);
+  });
+
   it("uses shallow full sync by default to avoid hydrating every PR", async () => {
     const store = await createStore();
     const pr = makePullRequest(50001, {
