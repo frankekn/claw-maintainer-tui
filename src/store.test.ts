@@ -1013,6 +1013,62 @@ describe("PrIndexStore", () => {
     }
   });
 
+  it("keeps ignored PRs out of collapsed inbox clusters", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-14T00:00:00.000Z"));
+
+    try {
+      const store = await createStore();
+      const openA = makePullRequest(51101, {
+        title: "fix: timeout cascade across retry paths",
+        body: "Closes #42021\nFix the timeout cascade across retry paths.",
+        updatedAt: "2026-03-13T12:00:00.000Z",
+      });
+      const openB = makePullRequest(51102, {
+        title: "fix: timeout cascade in retry cleanup",
+        body: "Closes #42021\nReduce retry loop fallout from the same timeout cascade.",
+        updatedAt: "2026-03-13T11:00:00.000Z",
+      });
+      const merged = makePullRequest(51103, {
+        title: "fix: timeout cascade with landed cleanup",
+        body: "Closes #42021\nLand the timeout cascade fix.",
+        state: "merged",
+        mergedAt: "2026-03-13T10:00:00.000Z",
+        closedAt: "2026-03-13T10:00:00.000Z",
+        updatedAt: "2026-03-13T10:00:00.000Z",
+      });
+
+      await store.sync({
+        repo,
+        source: new FakePullRequestDataSource([openA, openB, merged]),
+        full: true,
+      });
+
+      for (const prNumber of [51101, 51102, 51103] as const) {
+        await store.recordPullRequestFacts(
+          makePullRequestFacts(prNumber, {
+            linkedIssues: [{ issueNumber: 42021, linkSource: "closing_reference" }],
+            changedFiles: [{ path: "src/gateway/retry.ts", kind: "prod" }],
+          }),
+        );
+      }
+      await store.setPrAttentionState(repo, 51102, "ignore");
+
+      const inbox = await store.listPriorityInbox({ repo, limit: 10, scanLimit: 10 });
+      const cluster = inbox.find((item) => item.kind === "cluster");
+
+      expect(cluster?.kind).toBe("cluster");
+      if (cluster?.kind === "cluster") {
+        expect(cluster.cluster.openMembers.map((member) => member.pr.prNumber)).toEqual([51101]);
+        expect(
+          cluster.cluster.openMembers.some((member) => member.attentionState === "ignore"),
+        ).toBe(false);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("treats maintainer as badge-only while watch and ignore stay local", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-03-14T00:00:00.000Z"));

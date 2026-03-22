@@ -639,7 +639,7 @@ export class TuiController {
 
   async crossReferenceSelected(): Promise<void> {
     const row = this.rows[this.selectedIndex];
-    if (!row || row.kind !== "pr") {
+    if (!row || (row.kind !== "pr" && row.kind !== "priority-cluster")) {
       return;
     }
     await this.openPrDetailSection("linked-issues");

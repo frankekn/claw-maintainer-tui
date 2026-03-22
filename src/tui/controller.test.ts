@@ -499,6 +499,25 @@ describe("TuiController", () => {
     expect(model.resultsPane.rows).toHaveLength(2);
   });
 
+  it("uses x on a collapsed cluster row to open linked-issue detail", async () => {
+    const service = new FakeTuiDataService();
+    service.inboxItems = [{ kind: "cluster", cluster: makePriorityCluster([41793, 42212]) }];
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.crossReferenceSelected();
+
+    const model = controller.getRenderModel();
+    expect(model.mode).toBe("inbox");
+    expect(model.detailPane.visible).toBe(true);
+    expect(model.detailPane.anchorKey).not.toBeNull();
+    expect(model.detailPane.lines.join("\n")).toContain("LINKED ISSUES");
+  });
+
   it("opens PR context detail from Inbox", async () => {
     const service = new FakeTuiDataService();
     const controller = new TuiController(service, {

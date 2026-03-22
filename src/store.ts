@@ -1306,6 +1306,9 @@ export class PrIndexStore {
     const candidate = await this.enrichPriorityCandidate(
       this.buildPriorityCandidateBase(pr, repoKey),
     );
+    if (candidate.attentionState === "ignore") {
+      return null;
+    }
     cache.set(prNumber, candidate);
     return candidate;
   }
