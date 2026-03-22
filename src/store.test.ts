@@ -924,6 +924,52 @@ describe("PrIndexStore", () => {
     );
   });
 
+  it("hydrates the seed before cluster analysis when repo and source are provided", async () => {
+    const store = await createStore();
+    const refreshedSeed = makePullRequest(39672, {
+      title: "feat: warn before compaction on large token usage",
+      body: "Warn before compaction when token usage grows too large.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const liveNeighbor = makePullRequest(39673, {
+      title: "feat: warn before compaction on high token usage",
+      body: "Warn before compaction when token usage grows too high during long sessions.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([refreshedSeed, liveNeighbor]);
+    source.setFacts(
+      makePullRequestFacts(39672, {
+        changedFiles: [{ path: "src/auto-reply/reply/agent-runner.ts", kind: "prod" }],
+      }),
+    );
+    source.setFacts(
+      makePullRequestFacts(39673, {
+        changedFiles: [{ path: "src/auto-reply/reply/agent-runner.ts", kind: "prod" }],
+      }),
+    );
+    source.setSearchResults("warn before compaction on large token usage", "open", [39673]);
+
+    const analysis = await store.clusterPullRequest({
+      prNumber: 39672,
+      limit: 10,
+      ftsOnly: true,
+      repo,
+      source,
+      refresh: true,
+    });
+
+    expect(source.hydrateCalls).toContain(39672);
+    expect(analysis?.seedPr.title).toBe("feat: warn before compaction on large token usage");
+    expect(analysis?.sameClusterCandidates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          prNumber: 39673,
+          matchedBy: "live_semantic",
+        }),
+      ]),
+    );
+  });
+
   it("prioritizes issue-linked hub PRs above recency-only PRs", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-03-14T00:00:00.000Z"));

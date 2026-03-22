@@ -2507,11 +2507,6 @@ export class PrIndexStore {
     await this.init();
     await this.ensureDerivedIssueLinksBackfilled();
     const limit = params.limit ?? DEFAULT_SEARCH_LIMIT;
-    const seed = this.getPrRow(params.prNumber);
-    if (!seed) {
-      return null;
-    }
-
     if (params.repo && params.source) {
       await this.ensurePullRequestCached(
         params.repo,
@@ -2519,6 +2514,10 @@ export class PrIndexStore {
         params.prNumber,
         params.refresh ?? false,
       );
+    }
+    const seed = this.getPrRow(params.prNumber);
+    if (!seed) {
+      return null;
     }
     const seedLinkedIssues = this.getLinkedIssuesForPr(params.prNumber).map(
       (issue) => issue.issueNumber,
