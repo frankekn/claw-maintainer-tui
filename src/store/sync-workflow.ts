@@ -87,6 +87,12 @@ export async function syncPullRequestsWorkflow(params: {
         params.repo,
         params.lastSyncWatermark,
       )) {
+        // First-seen PRs cannot safely use issue-style summaries because draft and
+        // branch metadata are missing from that payload.
+        if (!params.getStoredUpdatedAt(pr.number)) {
+          toProcess.push(pr.number);
+          continue;
+        }
         // Some sources only return issue-style summaries for changed PRs, which cannot
         // reliably distinguish merged from closed. Hydrate those ambiguous closed PRs
         // before overwriting the stored record.

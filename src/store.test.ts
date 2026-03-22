@@ -374,6 +374,46 @@ describe("PrIndexStore", () => {
     expect(shown.pr?.state).toBe("merged");
   });
 
+  it("hydrates first-seen incremental PRs so draft and branch metadata stay accurate", async () => {
+    const store = await createStore();
+    const existing = makePullRequest(40003, {
+      title: "Existing PR",
+      body: "Seed the last-sync watermark.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([existing]);
+
+    await store.sync({ repo, source, full: true });
+    source.hydrateCalls = [];
+
+    const incoming = makePullRequest(40004, {
+      title: "Draft incremental PR",
+      body: "New PR discovered during incremental sync.",
+      isDraft: true,
+      baseRef: "release",
+      headRef: "feature/draft-incremental",
+      updatedAt: "2026-03-11T00:00:00.000Z",
+    });
+    source.setPullRequest(incoming);
+    source.changedPrs = [
+      {
+        ...incoming.pr,
+        isDraft: false,
+        baseRef: "",
+        headRef: "",
+      },
+    ];
+
+    const summary = await store.sync({ repo, source });
+    const queue = await store.listPriorityQueue({ repo, limit: 10, scanLimit: 10 });
+    const branchResult = await store.search("branch:feature/draft-incremental");
+
+    expect(summary.processedPrs).toBe(1);
+    expect(source.hydrateCalls).toEqual([40004]);
+    expect(queue.find((candidate) => candidate.pr.prNumber === 40004)?.badges.draft).toBe(true);
+    expect(branchResult.map((result) => result.prNumber)).toContain(40004);
+  });
+
   it("uses shallow full sync by default to avoid hydrating every PR", async () => {
     const store = await createStore();
     const pr = makePullRequest(50001, {
