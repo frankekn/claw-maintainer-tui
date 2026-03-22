@@ -142,7 +142,7 @@ function parseCommand(commandRaw: string | undefined, rest: string[]): Command {
       return "review-fact-import";
     }
   }
-  if (commandRaw in COMMAND_USAGE) {
+  if (Object.hasOwn(COMMAND_USAGE, commandRaw)) {
     return commandRaw as Command;
   }
   throw new CliUsageError(usage(), 1, "stderr");

@@ -17,13 +17,13 @@
   "dependencies": {
     "blessed": "^0.1.81",
     "node-llama-cpp": "3.16.2",
-    "sqlite-vec": "0.1.7-alpha.2"
+    "sqlite-vec": "0.1.7-alpha.2",
+    "tsx": "^4.21.0"
   },
   "devDependencies": {
     "@types/blessed": "^0.1.27",
     "@types/node": "^25.3.5",
     "oxfmt": "^0.38.0",
-    "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vitest": "^4.0.18"
   },

@@ -92,6 +92,9 @@ export function resolveMergeReadiness(params: {
   if (githubSnapshot.reviewDecision === "CHANGES_REQUESTED") {
     state = "needs_work";
     summary = "GitHub review decision is CHANGES_REQUESTED.";
+  } else if (githubSnapshot.reviewDecision === "REVIEW_REQUIRED") {
+    state = "pending";
+    summary = "GitHub review is still required before merge.";
   } else if (failingChecks.length > 0) {
     state = "needs_work";
     summary = "One or more GitHub checks are failing.";

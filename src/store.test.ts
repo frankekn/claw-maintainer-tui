@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as embeddingModule from "./embedding.js";
 import * as timeModule from "./lib/time.js";
 import { PrIndexStore } from "./store.js";
+import { resolveMergeReadiness } from "./store/merge-readiness.js";
 import type {
   HydratedPullRequest,
   IssueDataSource,
@@ -456,6 +457,62 @@ describe("PrIndexStore", () => {
     expect(source.hydrateCalls).toEqual([40005]);
     expect(queue.find((candidate) => candidate.pr.prNumber === 40005)?.badges.draft).toBe(true);
     expect(branchResult.map((result) => result.prNumber)).toContain(40005);
+  });
+
+  it("treats REVIEW_REQUIRED as pending merge readiness", () => {
+    const readiness = resolveMergeReadiness({
+      candidate: {
+        prNumber: 40007,
+        title: "Needs review before merge",
+        url: "https://github.com/openclaw/openclaw/pull/40007",
+        state: "open",
+        updatedAt: "2026-03-11T00:00:00.000Z",
+        headSha: "head-40007",
+        matchedBy: "linked_issue",
+        linkedIssues: [40007],
+        prodFiles: [],
+        testFiles: [],
+        otherFiles: [],
+        relevantProdFiles: [],
+        relevantTestFiles: [],
+        noiseFilesCount: 0,
+        status: "best_base",
+        reasonCodes: ["same_linked_issue"],
+        featureVector: {
+          matchedBy: "linked_issue",
+          linkedIssueOverlap: 1,
+          linkedIssueCount: 1,
+          totalProdFileCount: 0,
+          totalTestFileCount: 0,
+          totalOtherFileCount: 0,
+          relevantProdFileCount: 0,
+          relevantTestFileCount: 0,
+          noiseFilesCount: 0,
+          semanticScore: 0,
+        },
+      },
+      latestReviewFact: null,
+      githubSnapshot: {
+        reviewDecision: "REVIEW_REQUIRED",
+        mergeStateStatus: "CLEAN",
+        mergeable: "MERGEABLE",
+        statusChecks: [
+          {
+            name: "verify",
+            status: "COMPLETED",
+            conclusion: "SUCCESS",
+            workflowName: "CI",
+            detailsUrl: null,
+          },
+        ],
+      },
+    });
+
+    expect(readiness).toMatchObject({
+      state: "pending",
+      source: "github",
+      summary: "GitHub review is still required before merge.",
+    });
   });
 
   it("persists the incremental PR watermark captured at sync start", async () => {

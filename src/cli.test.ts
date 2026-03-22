@@ -27,4 +27,15 @@ describe("runCli", () => {
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Usage:"));
     expect(logSpy).not.toHaveBeenCalled();
   });
+
+  it("rejects inherited prototype command keys", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const code = await runCli(["toString"]);
+
+    expect(code).toBe(1);
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Usage:"));
+    expect(logSpy).not.toHaveBeenCalled();
+  });
 });

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ghApiJsonWithRetry, isRetryableGhApiError } from "./github.js";
+import { collectLinkedIssuesFromPrText } from "./lib/pull-request-facts.js";
 
 describe("clawlens github retry", () => {
   it("retries transient gh api failures before succeeding", async () => {
@@ -47,5 +48,14 @@ describe("clawlens github retry", () => {
     expect(isRetryableGhApiError(new Error("HTTP 429 Too Many Requests"))).toBe(true);
     expect(isRetryableGhApiError(new Error("HTTP 503 Service Unavailable"))).toBe(true);
     expect(isRetryableGhApiError(new Error("HTTP 404 Not Found"))).toBe(false);
+  });
+
+  it("collects all issue refs from closing-reference lists", () => {
+    expect(
+      collectLinkedIssuesFromPrText(
+        "",
+        "Fixes #12, #34 and #56\nSource Issue #78\n[issue #90]",
+      ).map((issue) => issue.issueNumber),
+    ).toEqual([12, 34, 56, 78]);
   });
 });
