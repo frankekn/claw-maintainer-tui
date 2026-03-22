@@ -570,6 +570,36 @@ describe("PrIndexStore", () => {
     expect(result[0]?.prNumber).toBe(50001);
   });
 
+  it("preserves cached comments during shallow full sync", async () => {
+    const store = await createStore();
+    const pr = makePullRequest(50003, {
+      title: "Keep cached comments",
+      body: "Comments should survive a shallow refresh.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    pr.comments.push(
+      makeComment("issue:keep-comments", "Cached review context should remain searchable."),
+    );
+    const source = new FakePullRequestDataSource([pr]);
+
+    await store.sync({ repo, source, full: true, hydrateAll: true });
+
+    const updated = makePullRequest(50003, {
+      title: "Keep cached comments updated",
+      body: "Comments should survive a shallow refresh.",
+      updatedAt: "2026-03-11T00:00:00.000Z",
+    });
+    source.setPullRequest(updated);
+
+    const summary = await store.sync({ repo, source, full: true });
+    const shown = await store.show(50003);
+    const commentSearch = await store.search("Cached review context");
+
+    expect(summary.commentCount).toBe(1);
+    expect(shown.comments).toHaveLength(1);
+    expect(commentSearch.map((result) => result.prNumber)).toContain(50003);
+  });
+
   it("does not initialize embeddings during status or shallow sync", async () => {
     const createProvider = vi
       .spyOn(embeddingModule, "createLocalEmbeddingProvider")
@@ -688,6 +718,34 @@ describe("PrIndexStore", () => {
     expect(facts?.linkedIssues).toEqual([
       { issueNumber: 42012, linkSource: "source_issue_marker" },
     ]);
+  });
+
+  it("clears stale fact-derived issue links when refreshed facts contain none", async () => {
+    const store = await createStore();
+    const pr = makePullRequest(42004, {
+      title: "Drop stale fact links",
+      body: "Source Issue #42021",
+    });
+
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([pr]),
+      full: true,
+    });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(42004, {
+        linkedIssues: [{ issueNumber: 42021, linkSource: "source_issue_marker" }],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(42004, {
+        linkedIssues: [],
+      }),
+    );
+
+    const facts = await store.getPullRequestFacts(42004);
+
+    expect(facts?.linkedIssues).toEqual([]);
   });
 
   it("persists the incremental issue watermark captured at sync start", async () => {

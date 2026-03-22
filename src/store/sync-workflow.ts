@@ -40,7 +40,6 @@ export async function syncPullRequestsWorkflow(params: {
   params.setMeta(params.metaKeys.repo, params.repoName);
 
   const toProcess: number[] = [];
-  const shallowPullRequests: HydratedPullRequest[] = [];
   const summaryPullRequests: PullRequestRecord[] = [];
   let skippedPrs = 0;
   let processedPrs = 0;
@@ -54,14 +53,8 @@ export async function syncPullRequestsWorkflow(params: {
       phase,
       processed: processedPrs,
       skipped: skippedPrs,
-      queued: Math.max(
-        0,
-        shallowPullRequests.length + summaryPullRequests.length + toProcess.length - processedPrs,
-      ),
-      totalKnown:
-        mode === "incremental"
-          ? shallowPullRequests.length + summaryPullRequests.length + toProcess.length
-          : null,
+      queued: Math.max(0, summaryPullRequests.length + toProcess.length - processedPrs),
+      totalKnown: mode === "incremental" ? summaryPullRequests.length + toProcess.length : null,
       currentId,
       currentTitle,
     });
@@ -79,7 +72,7 @@ export async function syncPullRequestsWorkflow(params: {
       if (params.hydrateAll) {
         toProcess.push(pr.number);
       } else {
-        shallowPullRequests.push({ pr, comments: [] });
+        summaryPullRequests.push(pr);
       }
     }
   } else if (params.lastSyncWatermark) {
@@ -114,11 +107,6 @@ export async function syncPullRequestsWorkflow(params: {
     }
   }
 
-  for (const payload of shallowPullRequests) {
-    await params.upsertHydratedPullRequest(payload, { indexVectors: false });
-    processedPrs += 1;
-    emitProgress("syncing", payload.pr.number, payload.pr.title);
-  }
   for (const pr of summaryPullRequests) {
     params.upsertPullRequestSummary(pr);
     processedPrs += 1;

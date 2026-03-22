@@ -121,6 +121,7 @@ const DERIVED_LINK_SOURCES: PullRequestLinkSource[] = [
   "body_reference",
   "title_reference",
 ];
+const FACT_LINK_SOURCES: PullRequestLinkSource[] = ["closing_reference", ...DERIVED_LINK_SOURCES];
 const SUCCESSFUL_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
 
 type IssueDocRow = {
@@ -565,10 +566,7 @@ export class PrIndexStore {
           JSON.stringify(facts.statusChecks),
           facts.fetchedAt,
         );
-      this.clearIssueLinksForSources(
-        facts.prNumber,
-        Array.from(new Set(facts.linkedIssues.map((issue) => issue.linkSource))),
-      );
+      this.clearIssueLinksForSources(facts.prNumber, FACT_LINK_SOURCES);
       for (const issue of facts.linkedIssues) {
         this.db
           .prepare(
