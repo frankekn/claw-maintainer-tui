@@ -1,10 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import {
-  classifyChangedFileKind,
-  collectLinkedIssuesFromPrText,
-  mergeClosingReferenceIssues,
-} from "./lib/pull-request-facts.js";
+import { classifyChangedFileKind } from "./lib/pull-request-facts.js";
+import { toClosingReferenceIssues } from "./lib/pull-request-links.js";
 import { isoNow } from "./lib/time.js";
 import type {
   HydratedPullRequest,
@@ -289,10 +286,7 @@ function normalizeStatusCheck(value: unknown): PullRequestStatusCheck | null {
 }
 
 export function normalizePullRequestFactRecord(value: RestPullRequestView): PullRequestFactRecord {
-  const title = value.title?.trim() ?? "";
-  const body = value.body ?? "";
-  const linkedIssues = mergeClosingReferenceIssues(
-    collectLinkedIssuesFromPrText(title, body),
+  const linkedIssues = toClosingReferenceIssues(
     (value.closingIssuesReferences ?? [])
       .map((issue) => issue?.number)
       .filter((issueNumber): issueNumber is number => typeof issueNumber === "number"),

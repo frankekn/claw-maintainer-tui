@@ -3,6 +3,11 @@ import { runTasksWithConcurrency } from "./lib/concurrency.js";
 import { buildFtsQuery, bm25RankToScore } from "./lib/hybrid.js";
 import { ensureDir, hashText } from "./lib/internal.js";
 import { collectLinkedIssuesFromPrText } from "./lib/pull-request-facts.js";
+import {
+  FACT_OWNED_PULL_REQUEST_LINK_SOURCES,
+  TEXT_DERIVED_PULL_REQUEST_LINK_SOURCES,
+  isFactOwnedPullRequestLinkSource,
+} from "./lib/pull-request-links.js";
 import { loadSqliteVecExtension } from "./lib/sqlite-vec.js";
 import { requireNodeSqlite } from "./lib/sqlite.js";
 import { truncateUtf16Safe } from "./lib/text.js";
@@ -51,6 +56,7 @@ import {
 } from "./store/search-workflow.js";
 import { buildIssueFilterClause, buildPrFilterClause } from "./store/search-sql.js";
 import { resolveMergeReadiness as resolveMergeReadinessModel } from "./store/merge-readiness.js";
+import { mergeSummaryPullRequestRecord } from "./store/pull-request-sync-contract.js";
 import { syncIssuesWorkflow, syncPullRequestsWorkflow } from "./store/sync-workflow.js";
 import { buildCrossReferenceQuery, normalizeSearchText, uniqueStrings } from "./store/text.js";
 import { pullRequestUpsertParams, UPSERT_PULL_REQUEST_SQL } from "./store/upsert.js";
@@ -116,12 +122,6 @@ const META_REPO = "repo";
 const META_EMBEDDING_MODEL = "embedding_model";
 const META_VECTOR_DIMS = "vector_dims";
 const META_DERIVED_ISSUE_LINKS_BACKFILLED_AT = "derived_issue_links_backfilled_at";
-const DERIVED_LINK_SOURCES: PullRequestLinkSource[] = [
-  "source_issue_marker",
-  "body_reference",
-  "title_reference",
-];
-const FACT_LINK_SOURCES: PullRequestLinkSource[] = ["closing_reference", ...DERIVED_LINK_SOURCES];
 const SUCCESSFUL_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
 
 type IssueDocRow = {
@@ -168,19 +168,9 @@ function toVectorBlob(values: number[]): Buffer {
 function buildSearchDocuments(payload: HydratedPullRequest): SearchDocument[] {
   const docs: SearchDocument[] = [];
   const prTitle = payload.pr.title.trim();
-  const prText = normalizeSearchText(
-    [payload.pr.title, payload.pr.body].filter(Boolean).join("\n\n"),
-  );
-  if (prText) {
-    docs.push({
-      docId: `pr:${payload.pr.number}`,
-      prNumber: payload.pr.number,
-      kind: "pr_body",
-      title: prTitle,
-      text: prText,
-      updatedAt: payload.pr.updatedAt,
-      hash: hashText(prText),
-    });
+  const prDoc = buildPullRequestBodyDocument(payload.pr);
+  if (prDoc) {
+    docs.push(prDoc);
   }
   for (const comment of payload.comments) {
     const text = normalizeSearchText(comment.body);
@@ -200,6 +190,22 @@ function buildSearchDocuments(payload: HydratedPullRequest): SearchDocument[] {
     });
   }
   return docs;
+}
+
+function buildPullRequestBodyDocument(pr: PullRequestRecord): SearchDocument | null {
+  const text = normalizeSearchText([pr.title, pr.body].filter(Boolean).join("\n\n"));
+  if (!text) {
+    return null;
+  }
+  return {
+    docId: `pr:${pr.number}`,
+    prNumber: pr.number,
+    kind: "pr_body",
+    title: pr.title.trim(),
+    text,
+    updatedAt: pr.updatedAt,
+    hash: hashText(text),
+  };
 }
 
 export class PrIndexStore {
@@ -501,7 +507,7 @@ export class PrIndexStore {
   }
 
   private upsertDerivedIssueLinksForPr(prNumber: number, title: string, body: string): void {
-    this.clearIssueLinksForSources(prNumber, DERIVED_LINK_SOURCES);
+    this.clearIssueLinksForSources(prNumber, TEXT_DERIVED_PULL_REQUEST_LINK_SOURCES);
     for (const issue of collectLinkedIssuesFromPrText(title, body)) {
       this.db
         .prepare(
@@ -525,9 +531,9 @@ export class PrIndexStore {
     try {
       this.db
         .prepare(
-          `DELETE FROM pr_linked_issues WHERE link_source IN (${DERIVED_LINK_SOURCES.map(() => "?").join(", ")})`,
+          `DELETE FROM pr_linked_issues WHERE link_source IN (${TEXT_DERIVED_PULL_REQUEST_LINK_SOURCES.map(() => "?").join(", ")})`,
         )
-        .run(...DERIVED_LINK_SOURCES);
+        .run(...TEXT_DERIVED_PULL_REQUEST_LINK_SOURCES);
       for (const row of rows) {
         this.upsertDerivedIssueLinksForPr(row.number, row.title, row.body);
       }
@@ -566,8 +572,10 @@ export class PrIndexStore {
           JSON.stringify(facts.statusChecks),
           facts.fetchedAt,
         );
-      this.clearIssueLinksForSources(facts.prNumber, FACT_LINK_SOURCES);
-      for (const issue of facts.linkedIssues) {
+      this.clearIssueLinksForSources(facts.prNumber, FACT_OWNED_PULL_REQUEST_LINK_SOURCES);
+      for (const issue of facts.linkedIssues.filter((linkedIssue) =>
+        isFactOwnedPullRequestLinkSource(linkedIssue.linkSource),
+      )) {
         this.db
           .prepare(
             `INSERT INTO pr_linked_issues (pr_number, issue_number, link_source) VALUES (?, ?, ?)
@@ -692,6 +700,37 @@ export class PrIndexStore {
       )
       .get(repo, prNumber) as Pick<PrTriageStateRow, "attention_state"> | undefined;
     return row?.attention_state ?? "new";
+  }
+
+  private isVisibleOnPrioritySurfaces(repo: string, prNumber: number): boolean {
+    return this.getAttentionState(repo, prNumber) !== "ignore";
+  }
+
+  private filterVisibleSearchResults(
+    repo: string,
+    results: Iterable<SearchResult>,
+  ): SearchResult[] {
+    return Array.from(results).filter((result) =>
+      this.isVisibleOnPrioritySurfaces(repo, result.prNumber),
+    );
+  }
+
+  private filterVisibleClusterAnalysis(
+    repo: string,
+    analysis: ClusterPullRequestAnalysis | null,
+  ): ClusterPullRequestAnalysis | null {
+    if (!analysis) {
+      return null;
+    }
+    return {
+      ...analysis,
+      sameClusterCandidates: analysis.sameClusterCandidates.filter((candidate) =>
+        this.isVisibleOnPrioritySurfaces(repo, candidate.prNumber),
+      ),
+      nearbyButExcluded: analysis.nearbyButExcluded.filter((candidate) =>
+        this.isVisibleOnPrioritySurfaces(repo, candidate.prNumber),
+      ),
+    };
   }
 
   private buildSearchResultFromPrRow(pr: PrRow, score: number): SearchResult {
@@ -1006,7 +1045,10 @@ export class PrIndexStore {
     }
   }
 
-  private upsertPullRequestSummary(pr: PullRequestRecord): void {
+  private upsertPullRequestSummary(
+    pr: PullRequestRecord,
+    authority: "authoritative" | "partial",
+  ): void {
     const existing = this.db
       .prepare(
         `SELECT state, is_draft, base_ref, head_ref, url, closed_at, merged_at
@@ -1024,22 +1066,22 @@ export class PrIndexStore {
           merged_at: string | null;
         }
       | undefined;
-    const mergedState = pr.state === "closed" && existing?.state === "merged" ? "merged" : pr.state;
-    const preserved = {
-      isDraft: existing ? Boolean(existing.is_draft) : pr.isDraft,
-      baseRef: pr.baseRef || existing?.base_ref || "",
-      headRef: pr.headRef || existing?.head_ref || "",
-      url: pr.url || existing?.url || "",
-      closedAt: pr.closedAt ?? existing?.closed_at ?? null,
-      mergedAt: pr.mergedAt ?? existing?.merged_at ?? null,
-    };
-    const mergedRecord: PullRequestRecord = {
-      ...pr,
-      state: mergedState,
-      ...preserved,
-    };
-    const docs = buildSearchDocuments({ pr: mergedRecord, comments: [] });
-    const prDoc = docs.find((doc) => doc.kind === "pr_body") ?? null;
+    const mergedRecord = mergeSummaryPullRequestRecord({
+      pr,
+      authority,
+      existing: existing
+        ? {
+            state: existing.state,
+            isDraft: Boolean(existing.is_draft),
+            baseRef: existing.base_ref,
+            headRef: existing.head_ref,
+            url: existing.url,
+            closedAt: existing.closed_at,
+            mergedAt: existing.merged_at,
+          }
+        : null,
+    });
+    const prDoc = buildPullRequestBodyDocument(mergedRecord);
 
     this.db.exec("BEGIN");
     try {
@@ -1206,7 +1248,7 @@ export class PrIndexStore {
       getStoredUpdatedAt: (prNumber) => this.getStoredUpdatedAt(prNumber),
       upsertHydratedPullRequest: (payload, options) =>
         this.upsertHydratedPullRequest(payload, options),
-      upsertPullRequestSummary: (pr) => this.upsertPullRequestSummary(pr),
+      upsertPullRequestSummary: (pr, authority) => this.upsertPullRequestSummary(pr, authority),
       setMeta: (key, value) => this.setMeta(key, value),
       countRows: (table) => this.countRows(table),
       metaKeys: {
@@ -1307,7 +1349,7 @@ export class PrIndexStore {
     const candidate = await this.enrichPriorityCandidate(
       this.buildPriorityCandidateBase(pr, repoKey),
     );
-    if (candidate.attentionState === "ignore") {
+    if (!this.isVisibleOnPrioritySurfaces(repoKey, candidate.pr.prNumber)) {
       return null;
     }
     cache.set(prNumber, candidate);
@@ -1694,15 +1736,21 @@ export class PrIndexStore {
         score: 1,
         matchedExcerpt: truncateUtf16Safe(normalizeSearchText(issue.body || issue.title), 280),
       }));
-    const cluster = await this.clusterPullRequest({
-      prNumber,
-      limit: 5,
-      ftsOnly: true,
-    });
+    const cluster = this.filterVisibleClusterAnalysis(
+      repoKey,
+      await this.clusterPullRequest({
+        prNumber,
+        limit: 5,
+        ftsOnly: true,
+      }),
+    );
     const relatedPullRequests = new Map<number, SearchResult>();
-    for (const relatedPullRequest of await this.findRelatedPullRequests(prNumber, 5, {
-      ftsOnly: true,
-    })) {
+    for (const relatedPullRequest of this.filterVisibleSearchResults(
+      repoKey,
+      await this.findRelatedPullRequests(prNumber, 5, {
+        ftsOnly: true,
+      }),
+    )) {
       relatedPullRequests.set(relatedPullRequest.prNumber, relatedPullRequest);
     }
     for (const clusterCandidate of cluster?.sameClusterCandidates ?? []) {

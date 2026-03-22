@@ -600,6 +600,32 @@ describe("PrIndexStore", () => {
     expect(commentSearch.map((result) => result.prNumber)).toContain(50003);
   });
 
+  it("lets authoritative full-sync summaries refresh draft metadata", async () => {
+    const store = await createStore();
+    const initial = makePullRequest(50004, {
+      title: "Refresh draft badge",
+      isDraft: false,
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([initial]);
+
+    await store.sync({ repo, source, full: true, hydrateAll: true });
+
+    source.setPullRequest(
+      makePullRequest(50004, {
+        title: "Refresh draft badge",
+        isDraft: true,
+        updatedAt: "2026-03-11T00:00:00.000Z",
+      }),
+    );
+
+    await store.sync({ repo, source, full: true });
+
+    const queue = await store.listPriorityQueue({ repo, limit: 10, scanLimit: 10 });
+
+    expect(queue.find((candidate) => candidate.pr.prNumber === 50004)?.badges.draft).toBe(true);
+  });
+
   it("does not initialize embeddings during status or shallow sync", async () => {
     const createProvider = vi
       .spyOn(embeddingModule, "createLocalEmbeddingProvider")
@@ -690,11 +716,11 @@ describe("PrIndexStore", () => {
     expect(results[0]?.title).toBe("Updated issue state");
   });
 
-  it("replaces stale derived issue links when refreshing pull request facts", async () => {
+  it("replaces stale fact-owned issue links when refreshing pull request facts", async () => {
     const store = await createStore();
     const pr = makePullRequest(42003, {
-      title: "Refresh derived issue links",
-      body: "Source Issue #42011",
+      title: "Refresh fact-owned issue links",
+      body: "PR body has no exact issue references.",
     });
 
     await store.sync({
@@ -704,27 +730,25 @@ describe("PrIndexStore", () => {
     });
     await store.recordPullRequestFacts(
       makePullRequestFacts(42003, {
-        linkedIssues: [{ issueNumber: 42011, linkSource: "source_issue_marker" }],
+        linkedIssues: [{ issueNumber: 42011, linkSource: "closing_reference" }],
       }),
     );
     await store.recordPullRequestFacts(
       makePullRequestFacts(42003, {
-        linkedIssues: [{ issueNumber: 42012, linkSource: "source_issue_marker" }],
+        linkedIssues: [{ issueNumber: 42012, linkSource: "closing_reference" }],
       }),
     );
 
     const facts = await store.getPullRequestFacts(42003);
 
-    expect(facts?.linkedIssues).toEqual([
-      { issueNumber: 42012, linkSource: "source_issue_marker" },
-    ]);
+    expect(facts?.linkedIssues).toEqual([{ issueNumber: 42012, linkSource: "closing_reference" }]);
   });
 
-  it("clears stale fact-derived issue links when refreshed facts contain none", async () => {
+  it("clears stale fact-owned issue links when refreshed facts contain none", async () => {
     const store = await createStore();
     const pr = makePullRequest(42004, {
       title: "Drop stale fact links",
-      body: "Source Issue #42021",
+      body: "PR body has no exact issue references.",
     });
 
     await store.sync({
@@ -734,7 +758,7 @@ describe("PrIndexStore", () => {
     });
     await store.recordPullRequestFacts(
       makePullRequestFacts(42004, {
-        linkedIssues: [{ issueNumber: 42021, linkSource: "source_issue_marker" }],
+        linkedIssues: [{ issueNumber: 42021, linkSource: "closing_reference" }],
       }),
     );
     await store.recordPullRequestFacts(
@@ -746,6 +770,36 @@ describe("PrIndexStore", () => {
     const facts = await store.getPullRequestFacts(42004);
 
     expect(facts?.linkedIssues).toEqual([]);
+  });
+
+  it("keeps text-derived issue links when only fact-owned links are refreshed away", async () => {
+    const store = await createStore();
+    const pr = makePullRequest(42005, {
+      title: "Keep text-derived links",
+      body: "Source Issue #42031",
+    });
+
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([pr]),
+      full: true,
+    });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(42005, {
+        linkedIssues: [{ issueNumber: 42032, linkSource: "closing_reference" }],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(42005, {
+        linkedIssues: [],
+      }),
+    );
+
+    const facts = await store.getPullRequestFacts(42005);
+
+    expect(facts?.linkedIssues).toEqual([
+      { issueNumber: 42031, linkSource: "source_issue_marker" },
+    ]);
   });
 
   it("persists the incremental issue watermark captured at sync start", async () => {
@@ -1575,5 +1629,44 @@ describe("PrIndexStore", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("keeps ignored PRs out of context bundle cluster and related rows", async () => {
+    const store = await createStore();
+    const seed = makePullRequest(50040, {
+      title: "fix: stabilize context bundle visibility",
+      body: "Closes #42040\nStabilize context bundle visibility across cluster surfaces.",
+      updatedAt: "2026-03-13T10:00:00.000Z",
+    });
+    const ignoredSibling = makePullRequest(50041, {
+      title: "fix: stabilize context bundle visibility in same cluster",
+      body: "Closes #42040\nSame cluster candidate that should stay ignored in bundle surfaces.",
+      updatedAt: "2026-03-13T09:00:00.000Z",
+    });
+
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([seed, ignoredSibling]),
+      full: true,
+      hydrateAll: true,
+    });
+    await store.syncIssues({
+      repo,
+      source: new FakeIssueDataSource([
+        makeIssue(42040, {
+          title: "Context bundle visibility",
+          body: "Ignored PRs should not leak back into context surfaces.",
+        }),
+      ]),
+      full: true,
+    });
+    await store.setPrAttentionState(repo, 50041, "ignore");
+
+    const bundle = await store.getPrContextBundle(repo, 50040);
+
+    expect(bundle?.relatedPullRequests).toEqual([]);
+    expect(
+      bundle?.cluster?.sameClusterCandidates.some((candidate) => candidate.prNumber === 50041),
+    ).toBe(false);
   });
 });

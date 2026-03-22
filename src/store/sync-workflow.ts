@@ -1,5 +1,6 @@
 import { runTasksWithConcurrency } from "../lib/concurrency.js";
 import { isoNow } from "../lib/time.js";
+import { selectPullRequestSyncWriteTarget } from "./pull-request-sync-contract.js";
 import type {
   HydratedPullRequest,
   IssueDataSource,
@@ -26,7 +27,7 @@ export async function syncPullRequestsWorkflow(params: {
     payload: HydratedPullRequest,
     options: { indexVectors: boolean },
   ) => Promise<void>;
-  upsertPullRequestSummary: (pr: PullRequestRecord) => void;
+  upsertPullRequestSummary: (pr: PullRequestRecord, authority: "authoritative" | "partial") => void;
   setMeta: (key: string, value: string) => void;
   countRows: (table: string) => number;
   metaKeys: {
@@ -69,10 +70,16 @@ export async function syncPullRequestsWorkflow(params: {
         emitProgress("discovering", pr.number, pr.title);
         continue;
       }
-      if (params.hydrateAll) {
-        toProcess.push(pr.number);
+      const target = selectPullRequestSyncWriteTarget({
+        pr,
+        mode,
+        hydrateAll: params.hydrateAll,
+        storedUpdatedAt: existingUpdatedAt,
+      });
+      if (target.kind === "hydrate") {
+        toProcess.push(target.prNumber);
       } else {
-        summaryPullRequests.push(pr);
+        summaryPullRequests.push(target.pr);
       }
     }
   } else if (params.lastSyncWatermark) {
@@ -81,21 +88,17 @@ export async function syncPullRequestsWorkflow(params: {
         params.repo,
         params.lastSyncWatermark,
       )) {
-        // Issue-style changed-PR payloads do not carry reliable draft/branch metadata.
-        // Hydrate whenever those fields are missing so new and existing PR rows stay
-        // correct for ranking and branch filters.
-        if (!params.getStoredUpdatedAt(pr.number) || !pr.baseRef || !pr.headRef) {
-          toProcess.push(pr.number);
+        const target = selectPullRequestSyncWriteTarget({
+          pr,
+          mode,
+          hydrateAll: params.hydrateAll,
+          storedUpdatedAt: params.getStoredUpdatedAt(pr.number),
+        });
+        if (target.kind === "hydrate") {
+          toProcess.push(target.prNumber);
           continue;
         }
-        // Some sources only return issue-style summaries for changed PRs, which cannot
-        // reliably distinguish merged from closed. Hydrate those ambiguous closed PRs
-        // before overwriting the stored record.
-        if (pr.state === "closed" && !pr.mergedAt) {
-          toProcess.push(pr.number);
-          continue;
-        }
-        summaryPullRequests.push(pr);
+        summaryPullRequests.push(target.pr);
       }
     } else {
       toProcess.push(
@@ -108,7 +111,7 @@ export async function syncPullRequestsWorkflow(params: {
   }
 
   for (const pr of summaryPullRequests) {
-    params.upsertPullRequestSummary(pr);
+    params.upsertPullRequestSummary(pr, mode === "full" ? "authoritative" : "partial");
     processedPrs += 1;
     emitProgress("syncing", pr.number, pr.title);
   }

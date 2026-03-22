@@ -1,4 +1,5 @@
 import { requireNodeSqlite } from "../lib/sqlite.js";
+import { mergePullRequestLinkedIssues } from "../lib/pull-request-links.js";
 import type {
   PullRequestChangedFile,
   PullRequestLinkedIssue,
@@ -37,17 +38,6 @@ export type IssueRow = {
   closed_at: string | null;
 };
 
-function mergeLinkedIssue(
-  out: Map<number, PullRequestLinkedIssue>,
-  issueNumber: number,
-  linkSource: PullRequestLinkSource,
-): void {
-  const current = out.get(issueNumber);
-  if (!current || linkSource === "closing_reference") {
-    out.set(issueNumber, { issueNumber, linkSource });
-  }
-}
-
 export function getPrRow(db: StoreDatabase, prNumber: number): PrRow | null {
   return (
     (db.prepare("SELECT * FROM prs WHERE number = ?").get(prNumber) as PrRow | undefined) ?? null
@@ -74,11 +64,12 @@ export function getLinkedIssuesForPr(
         ORDER BY issue_number ASC, link_source ASC`,
     )
     .all(prNumber) as Array<{ issue_number: number; link_source: PullRequestLinkSource }>;
-  const out = new Map<number, PullRequestLinkedIssue>();
-  for (const row of rows) {
-    mergeLinkedIssue(out, row.issue_number, row.link_source);
-  }
-  return Array.from(out.values()).sort((a, b) => a.issueNumber - b.issueNumber);
+  return mergePullRequestLinkedIssues(
+    rows.map((row) => ({
+      issueNumber: row.issue_number,
+      linkSource: row.link_source,
+    })),
+  );
 }
 
 export function getChangedFilesForPr(

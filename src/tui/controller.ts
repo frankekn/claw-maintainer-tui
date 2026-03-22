@@ -1,11 +1,6 @@
 import { buildStatusRows } from "./format.js";
 import { TuiEffects } from "./effects.js";
-import {
-  buildListSummary,
-  crossSearchLimits,
-  currentBrowseCapacity,
-  resolveListRows,
-} from "./listing.js";
+import { buildListSummary, resolveListRows } from "./listing.js";
 import {
   computePrFreshness,
   rowFreshness,
@@ -14,6 +9,7 @@ import {
   rowUrl,
   selectedRowIdentity,
 } from "./rows.js";
+import { canLoadMoreRows, isPriorityDetailRow } from "./capabilities.js";
 import type {
   ListLoadResult,
   ListMode,
@@ -644,7 +640,7 @@ export class TuiController {
 
   async crossReferenceSelected(): Promise<void> {
     const row = this.rows[this.selectedIndex];
-    if (!row || (row.kind !== "pr" && row.kind !== "priority-cluster")) {
+    if (!isPriorityDetailRow(row)) {
       return;
     }
     await this.openPrDetailSection("linked-issues");
@@ -652,7 +648,7 @@ export class TuiController {
 
   async clusterSelected(): Promise<void> {
     const row = this.rows[this.selectedIndex];
-    if (!row || (row.kind !== "pr" && row.kind !== "priority-cluster")) {
+    if (!isPriorityDetailRow(row)) {
       return;
     }
     await this.openPrDetailSection("cluster");
@@ -681,7 +677,7 @@ export class TuiController {
 
   async toggleWatchSelected(): Promise<void> {
     const row = this.rows[this.selectedIndex];
-    if (!row || (row.kind !== "pr" && row.kind !== "priority-cluster")) {
+    if (!isPriorityDetailRow(row)) {
       return;
     }
     const current =
@@ -696,7 +692,7 @@ export class TuiController {
 
   async toggleIgnoreSelected(): Promise<void> {
     const row = this.rows[this.selectedIndex];
-    if (!row || (row.kind !== "pr" && row.kind !== "priority-cluster")) {
+    if (!isPriorityDetailRow(row)) {
       return;
     }
     const current =
@@ -836,9 +832,9 @@ export class TuiController {
     const hasRow = Boolean(row);
     const hasHistory = this.history.length > 0;
     const canLinked = row?.kind === "pr";
-    const canCluster = row?.kind === "pr" || row?.kind === "priority-cluster";
+    const canCluster = isPriorityDetailRow(row);
     const canExpand = row?.kind === "priority-cluster";
-    const canTriage = row?.kind === "pr" || row?.kind === "priority-cluster";
+    const canTriage = isPriorityDetailRow(row);
     const canRefresh =
       row?.kind === "pr" || row?.kind === "issue" || row?.kind === "priority-cluster";
     const hasLocalState =
@@ -1101,7 +1097,7 @@ export class TuiController {
 
   private async openPrDetailSection(section: TuiDetailSection): Promise<void> {
     const row = this.rows[this.selectedIndex];
-    if (!row || (row.kind !== "pr" && row.kind !== "priority-cluster")) {
+    if (!isPriorityDetailRow(row)) {
       return;
     }
     this.showDetail = true;
@@ -1215,16 +1211,7 @@ export class TuiController {
   }
 
   private canLoadMore(): boolean {
-    if (!this.isListMode(this.mode)) {
-      return false;
-    }
-    if (this.mode === "cross-search") {
-      const limits = crossSearchLimits(this.browseLimit);
-      const prCount = this.rows.filter((row) => row.kind === "pr").length;
-      const issueCount = this.rows.filter((row) => row.kind === "issue").length;
-      return prCount >= limits.pr || issueCount >= limits.issue;
-    }
-    return this.rows.length >= currentBrowseCapacity(this.mode, this.browseLimit);
+    return canLoadMoreRows(this.mode, this.rows, this.browseLimit);
   }
 
   async loadMore(): Promise<void> {
