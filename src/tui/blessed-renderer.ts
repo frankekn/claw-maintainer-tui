@@ -17,6 +17,20 @@ const execFileAsync = promisify(execFile);
 
 type Box = blessed.Widgets.BoxElement;
 
+export function getUrlOpenCommand(
+  url: string,
+  platform: NodeJS.Platform = process.platform,
+): { command: string; args: string[] } {
+  switch (platform) {
+    case "darwin":
+      return { command: "open", args: [url] };
+    case "win32":
+      return { command: "cmd", args: ["/c", "start", "", url] };
+    default:
+      return { command: "xdg-open", args: [url] };
+  }
+}
+
 export class BlessedTuiRenderer {
   private readonly screen = blessed.screen({
     smartCSR: false,
@@ -394,7 +408,8 @@ export class BlessedTuiRenderer {
       return;
     }
     try {
-      await execFileAsync("open", [url]);
+      const opener = getUrlOpenCommand(url);
+      await execFileAsync(opener.command, opener.args);
     } catch (error) {
       this.controller.reportError(
         error instanceof Error ? error.message : String(error),

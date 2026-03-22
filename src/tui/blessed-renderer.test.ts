@@ -1,6 +1,6 @@
 import type blessed from "blessed";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BlessedTuiRenderer } from "./blessed-renderer.js";
+import { BlessedTuiRenderer, getUrlOpenCommand } from "./blessed-renderer.js";
 import type { TuiRenderModel } from "./types.js";
 
 const renderModel: TuiRenderModel = {
@@ -79,6 +79,21 @@ afterEach(() => {
 });
 
 describe("BlessedTuiRenderer", () => {
+  it("selects the correct URL opener command for each platform", () => {
+    expect(getUrlOpenCommand("https://example.test", "darwin")).toEqual({
+      command: "open",
+      args: ["https://example.test"],
+    });
+    expect(getUrlOpenCommand("https://example.test", "linux")).toEqual({
+      command: "xdg-open",
+      args: ["https://example.test"],
+    });
+    expect(getUrlOpenCommand("https://example.test", "win32")).toEqual({
+      command: "cmd",
+      args: ["/c", "start", "", "https://example.test"],
+    });
+  });
+
   it("uses full repaint mode for layout changes", () => {
     const controller = createControllerStub();
     const renderer = new BlessedTuiRenderer(controller as never);

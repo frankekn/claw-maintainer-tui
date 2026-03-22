@@ -83,12 +83,19 @@ export async function syncPullRequestsWorkflow(params: {
     }
   } else if (params.lastSyncWatermark) {
     if (params.source.listChangedPullRequestsSince) {
-      summaryPullRequests.push(
-        ...(await params.source.listChangedPullRequestsSince(
-          params.repo,
-          params.lastSyncWatermark,
-        )),
-      );
+      for (const pr of await params.source.listChangedPullRequestsSince(
+        params.repo,
+        params.lastSyncWatermark,
+      )) {
+        // Some sources only return issue-style summaries for changed PRs, which cannot
+        // reliably distinguish merged from closed. Hydrate those ambiguous closed PRs
+        // before overwriting the stored record.
+        if (pr.state === "closed" && !pr.mergedAt) {
+          toProcess.push(pr.number);
+          continue;
+        }
+        summaryPullRequests.push(pr);
+      }
     } else {
       toProcess.push(
         ...(await params.source.listChangedPullRequestNumbersSince(

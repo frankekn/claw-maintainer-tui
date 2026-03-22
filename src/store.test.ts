@@ -343,6 +343,37 @@ describe("PrIndexStore", () => {
     expect(shown.comments[0]?.excerpt).toContain("Existing comment");
   });
 
+  it("hydrates ambiguous closed incremental summaries so merged PRs stay merged", async () => {
+    const store = await createStore();
+    const initial = makePullRequest(40002, {
+      title: "Merged-state preservation",
+      body: "Keep merged PR state during incremental sync.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([initial]);
+
+    await store.sync({ repo, source, full: true });
+    source.hydrateCalls = [];
+
+    const merged = makePullRequest(40002, {
+      title: "Merged-state preservation",
+      body: "Keep merged PR state during incremental sync.",
+      state: "merged",
+      updatedAt: "2026-03-11T00:00:00.000Z",
+      closedAt: "2026-03-11T00:00:00.000Z",
+      mergedAt: "2026-03-11T00:00:00.000Z",
+    });
+    source.setPullRequest(merged);
+    source.changedPrs = [{ ...merged.pr, state: "closed", mergedAt: null }];
+
+    const summary = await store.sync({ repo, source });
+    const shown = await store.show(40002);
+
+    expect(summary.processedPrs).toBe(1);
+    expect(source.hydrateCalls).toEqual([40002]);
+    expect(shown.pr?.state).toBe("merged");
+  });
+
   it("uses shallow full sync by default to avoid hydrating every PR", async () => {
     const store = await createStore();
     const pr = makePullRequest(50001, {
