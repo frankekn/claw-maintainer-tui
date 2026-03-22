@@ -36,6 +36,7 @@ export async function syncPullRequestsWorkflow(params: {
   };
 }): Promise<SyncSummary> {
   const mode = params.full || !params.lastSyncWatermark ? "full" : "incremental";
+  const syncStartedAt = isoNow();
   params.setMeta(params.metaKeys.repo, params.repoName);
 
   const toProcess: number[] = [];
@@ -141,7 +142,7 @@ export async function syncPullRequestsWorkflow(params: {
 
   const syncedAt = isoNow();
   params.setMeta(params.metaKeys.lastSyncAt, syncedAt);
-  params.setMeta(params.metaKeys.lastSyncWatermark, syncedAt);
+  params.setMeta(params.metaKeys.lastSyncWatermark, syncStartedAt);
   emitProgress("complete");
 
   return {
@@ -157,7 +158,7 @@ export async function syncPullRequestsWorkflow(params: {
     labelCount: params.countRows("pr_labels"),
     vectorAvailable: params.vectorAvailable,
     lastSyncAt: syncedAt,
-    lastSyncWatermark: syncedAt,
+    lastSyncWatermark: syncStartedAt,
   };
 }
 
@@ -181,6 +182,7 @@ export async function syncIssuesWorkflow(params: {
   };
 }): Promise<SyncSummary> {
   const mode = params.full || !params.lastSyncWatermark ? "full" : "incremental";
+  const syncStartedAt = isoNow();
   params.setMeta(params.metaKeys.repo, params.repoName);
 
   const toProcess: number[] = [];
@@ -253,7 +255,7 @@ export async function syncIssuesWorkflow(params: {
 
   const syncedAt = isoNow();
   params.setMeta(params.metaKeys.lastSyncAt, syncedAt);
-  params.setMeta(params.metaKeys.lastSyncWatermark, syncedAt);
+  params.setMeta(params.metaKeys.lastSyncWatermark, syncStartedAt);
   emitProgress("complete");
 
   return {
@@ -269,6 +271,6 @@ export async function syncIssuesWorkflow(params: {
     labelCount: params.countRows("issue_labels"),
     vectorAvailable: params.vectorAvailable,
     lastSyncAt: syncedAt,
-    lastSyncWatermark: syncedAt,
+    lastSyncWatermark: syncStartedAt,
   };
 }

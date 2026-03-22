@@ -3,6 +3,7 @@ import os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as embeddingModule from "./embedding.js";
+import * as timeModule from "./lib/time.js";
 import { PrIndexStore } from "./store.js";
 import type {
   HydratedPullRequest,
@@ -457,6 +458,39 @@ describe("PrIndexStore", () => {
     expect(branchResult.map((result) => result.prNumber)).toContain(40005);
   });
 
+  it("persists the incremental PR watermark captured at sync start", async () => {
+    const store = await createStore();
+    const source = new FakePullRequestDataSource([
+      makePullRequest(40006, {
+        title: "Initial incremental watermark seed",
+        updatedAt: "2026-03-10T00:00:00.000Z",
+      }),
+    ]);
+
+    await store.sync({ repo, source, full: true });
+    source.changedPrs = [
+      makePullRequest(40006, {
+        title: "Updated incremental watermark seed",
+        updatedAt: "2026-03-11T00:00:00.000Z",
+      }).pr,
+    ];
+
+    const isoNowSpy = vi.spyOn(timeModule, "isoNow");
+    isoNowSpy.mockImplementationOnce(() => "2026-03-12T00:00:00.000Z");
+    isoNowSpy.mockImplementation(() => "2026-03-12T00:05:00.000Z");
+
+    const summary = await store.sync({ repo, source });
+    const status = await store.status();
+
+    expect(summary.mode).toBe("incremental");
+    expect(summary.lastSyncAt).toBe("2026-03-12T00:05:00.000Z");
+    expect(summary.lastSyncWatermark).toBe("2026-03-12T00:00:00.000Z");
+    expect(status.lastSyncAt).toBe("2026-03-12T00:05:00.000Z");
+    expect(status.lastSyncWatermark).toBe("2026-03-12T00:00:00.000Z");
+
+    isoNowSpy.mockRestore();
+  });
+
   it("uses shallow full sync by default to avoid hydrating every PR", async () => {
     const store = await createStore();
     const pr = makePullRequest(50001, {
@@ -567,6 +601,39 @@ describe("PrIndexStore", () => {
     const results = await store.searchIssues('label:"needs-triage" updated');
     expect(results).toHaveLength(1);
     expect(results[0]?.title).toBe("Updated issue state");
+  });
+
+  it("persists the incremental issue watermark captured at sync start", async () => {
+    const store = await createStore();
+    const source = new FakeIssueDataSource([
+      makeIssue(42002, {
+        title: "Initial issue watermark seed",
+        updatedAt: "2026-03-10T00:00:00.000Z",
+      }),
+    ]);
+
+    await store.syncIssues({ repo, source, full: true });
+    source.changedIssues = [
+      makeIssue(42002, {
+        title: "Updated issue watermark seed",
+        updatedAt: "2026-03-11T00:00:00.000Z",
+      }),
+    ];
+
+    const isoNowSpy = vi.spyOn(timeModule, "isoNow");
+    isoNowSpy.mockImplementationOnce(() => "2026-03-12T01:00:00.000Z");
+    isoNowSpy.mockImplementation(() => "2026-03-12T01:05:00.000Z");
+
+    const summary = await store.syncIssues({ repo, source });
+    const status = await store.status();
+
+    expect(summary.mode).toBe("incremental");
+    expect(summary.lastSyncAt).toBe("2026-03-12T01:05:00.000Z");
+    expect(summary.lastSyncWatermark).toBe("2026-03-12T01:00:00.000Z");
+    expect(status.issueLastSyncAt).toBe("2026-03-12T01:05:00.000Z");
+    expect(status.issueLastSyncWatermark).toBe("2026-03-12T01:00:00.000Z");
+
+    isoNowSpy.mockRestore();
   });
 
   it("clusters linked-issue PRs by best base coverage and keeps merge readiness separate", async () => {
