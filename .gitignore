@@ -6,3 +6,6 @@ data
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+# Claude Code local config
+.claude/

@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { ghApiJsonWithRetry, isRetryableGhApiError } from "./github.js";
+import {
+  ghApiJsonWithRetry,
+  isRetryableGhApiError,
+  normalizePullRequestFactRecord,
+} from "./github.js";
+import { collectLinkedIssuesFromPrText } from "./lib/pull-request-facts.js";
 
 describe("clawlens github retry", () => {
   it("retries transient gh api failures before succeeding", async () => {
@@ -47,5 +52,30 @@ describe("clawlens github retry", () => {
     expect(isRetryableGhApiError(new Error("HTTP 429 Too Many Requests"))).toBe(true);
     expect(isRetryableGhApiError(new Error("HTTP 503 Service Unavailable"))).toBe(true);
     expect(isRetryableGhApiError(new Error("HTTP 404 Not Found"))).toBe(false);
+  });
+
+  it("collects all issue refs from closing-reference lists", () => {
+    expect(
+      collectLinkedIssuesFromPrText(
+        "",
+        "Fixes #12, #34 and #56\nSource Issue #78\n[issue #90]",
+      ).map((issue) => issue.issueNumber),
+    ).toEqual([12, 34, 56, 78]);
+  });
+
+  it("keeps pull request facts scoped to fact-owned closing references", () => {
+    const facts = normalizePullRequestFactRecord({
+      number: 42,
+      title: "Fixes #12",
+      body: "Source Issue #78\nFixes #12",
+      closingIssuesReferences: [{ number: 12 }, { number: 34 }],
+      files: [],
+      statusCheckRollup: [],
+    });
+
+    expect(facts.linkedIssues).toEqual([
+      { issueNumber: 12, linkSource: "closing_reference" },
+      { issueNumber: 34, linkSource: "closing_reference" },
+    ]);
   });
 });

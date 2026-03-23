@@ -1,12 +1,21 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { classifyChangedFileKind } from "./lib/pull-request-facts.js";
+import { toClosingReferenceIssues } from "./lib/pull-request-links.js";
+import { isoNow } from "./lib/time.js";
 import type {
   HydratedPullRequest,
   IssueDataSource,
   IssueRecord,
+  PullRequestChangedFile,
+  PullRequestChangedFileKind,
   PullRequestCommentRecord,
   PullRequestDataSource,
+  PullRequestFactRecord,
+  PullRequestLinkedIssue,
+  PullRequestLinkSource,
   PullRequestRecord,
+  PullRequestStatusCheck,
   RepoRef,
 } from "./types.js";
 
@@ -74,6 +83,37 @@ type RestReviewComment = {
   updated_at?: string | null;
 };
 
+type RestPullRequestView = {
+  number: number;
+  body?: string | null;
+  title?: string | null;
+  state?: string | null;
+  isDraft?: boolean | null;
+  headRefOid?: string | null;
+  reviewDecision?: string | null;
+  mergeStateStatus?: string | null;
+  mergeable?: string | null;
+  updatedAt?: string | null;
+  url?: string | null;
+  closingIssuesReferences?: Array<{ number?: number | null }> | null;
+  files?: Array<{ path?: string | null }> | null;
+  statusCheckRollup?: unknown;
+};
+
+type SearchPullRequestResult = {
+  number: number;
+};
+
+type RestRateLimit = {
+  resources?: {
+    core?: {
+      limit?: number | null;
+      remaining?: number | null;
+      reset?: number | null;
+    } | null;
+  } | null;
+};
+
 type GhApiRunner = (path: string) => Promise<string>;
 
 function sleep(ms: number): Promise<void> {
@@ -132,6 +172,25 @@ function toIssueRecord(value: RestIssue): IssueRecord {
   };
 }
 
+function toShallowPullRequestRecord(value: RestIssue): PullRequestRecord {
+  return {
+    number: value.number,
+    title: value.title?.trim() ?? "",
+    body: value.body ?? "",
+    state: value.state === "open" ? "open" : "closed",
+    isDraft: false,
+    author: value.user?.login?.trim() ?? "",
+    baseRef: "",
+    headRef: "",
+    url: value.html_url?.trim() ?? "",
+    createdAt: value.created_at ?? new Date(0).toISOString(),
+    updatedAt: value.updated_at ?? new Date(0).toISOString(),
+    closedAt: value.closed_at ?? null,
+    mergedAt: null,
+    labels: normalizeLabels(value.labels),
+  };
+}
+
 function toIssueCommentRecord(value: RestIssueComment): PullRequestCommentRecord | null {
   const body = value.body?.trim() ?? "";
   if (!body) {
@@ -181,6 +240,77 @@ function toReviewCommentRecord(value: RestReviewComment): PullRequestCommentReco
     url: value.html_url?.trim() ?? "",
     createdAt: value.created_at ?? new Date(0).toISOString(),
     updatedAt: value.updated_at ?? value.created_at ?? new Date(0).toISOString(),
+  };
+}
+
+function collectStatusCheckCandidates(value: unknown): unknown[] {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  if (!value || typeof value !== "object") {
+    return [];
+  }
+  const item = value as Record<string, unknown>;
+  const directNodes = item.nodes;
+  if (Array.isArray(directNodes)) {
+    return directNodes;
+  }
+  const contexts = item.contexts;
+  if (Array.isArray(contexts)) {
+    return contexts;
+  }
+  return Object.values(item).flatMap((child) => collectStatusCheckCandidates(child));
+}
+
+function normalizeStatusCheck(value: unknown): PullRequestStatusCheck | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const item = value as Record<string, unknown>;
+  const name =
+    (typeof item.name === "string" && item.name) ||
+    (typeof item.context === "string" && item.context) ||
+    (typeof item.workflowName === "string" && item.workflowName) ||
+    (typeof item.__typename === "string" && item.__typename) ||
+    "";
+  if (!name) {
+    return null;
+  }
+  return {
+    name,
+    status: typeof item.status === "string" ? item.status : "UNKNOWN",
+    conclusion: typeof item.conclusion === "string" ? item.conclusion : null,
+    workflowName: typeof item.workflowName === "string" ? item.workflowName : null,
+    detailsUrl: typeof item.detailsUrl === "string" ? item.detailsUrl : null,
+  };
+}
+
+export function normalizePullRequestFactRecord(value: RestPullRequestView): PullRequestFactRecord {
+  const linkedIssues = toClosingReferenceIssues(
+    (value.closingIssuesReferences ?? [])
+      .map((issue) => issue?.number)
+      .filter((issueNumber): issueNumber is number => typeof issueNumber === "number"),
+  );
+  const changedFiles: PullRequestChangedFile[] = (value.files ?? [])
+    .map((item) => item?.path?.trim() ?? "")
+    .filter(Boolean)
+    .map((filePath) => ({
+      path: filePath,
+      kind: classifyChangedFileKind(filePath),
+    }));
+  const statusChecksRaw = collectStatusCheckCandidates(value.statusCheckRollup);
+  return {
+    prNumber: value.number,
+    headSha: value.headRefOid?.trim() ?? "",
+    reviewDecision: value.reviewDecision?.trim() || null,
+    mergeStateStatus: value.mergeStateStatus?.trim() || null,
+    mergeable: value.mergeable?.trim() || null,
+    statusChecks: statusChecksRaw
+      .map(normalizeStatusCheck)
+      .filter((item): item is PullRequestStatusCheck => Boolean(item)),
+    linkedIssues,
+    changedFiles,
+    fetchedAt: isoNow(),
   };
 }
 
@@ -257,6 +387,34 @@ async function collectPaginated<T>(pathBuilder: (page: number) => string): Promi
 }
 
 export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueDataSource {
+  async getRateLimitStatus(): Promise<{
+    limit: number;
+    remaining: number;
+    resetAt: string;
+  } | null> {
+    const { stdout } = await execFileAsync("gh", ["api", "rate_limit"], {
+      maxBuffer: GH_MAX_BUFFER,
+    });
+    const payload = JSON.parse(stdout) as RestRateLimit;
+    const core = payload.resources?.core;
+    if (
+      !core ||
+      typeof core.limit !== "number" ||
+      typeof core.remaining !== "number" ||
+      typeof core.reset !== "number"
+    ) {
+      return null;
+    }
+    const limit = core.limit;
+    const remaining = core.remaining;
+    const reset = core.reset;
+    return {
+      limit,
+      remaining,
+      resetAt: new Date(reset * 1000).toISOString(),
+    };
+  }
+
   async *listAllPullRequests(repo: RepoRef): AsyncGenerator<PullRequestRecord> {
     for (let page = 1; ; page += 1) {
       const items = await ghApiJsonWithRetry<RestPullRequest[]>(
@@ -293,6 +451,25 @@ export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueD
     return Array.from(seen).sort((a, b) => a - b);
   }
 
+  async listChangedPullRequestsSince(repo: RepoRef, since: string): Promise<PullRequestRecord[]> {
+    const items = await collectPaginated<RestIssue>(
+      (page) =>
+        `repos/${repo.owner}/${repo.name}/issues?state=all&sort=updated&direction=desc&since=${encodeURIComponent(
+          since,
+        )}&per_page=${PAGE_SIZE}&page=${page}`,
+    );
+    const seen = new Set<number>();
+    const out: PullRequestRecord[] = [];
+    for (const item of items) {
+      if (!item.pull_request || !Number.isInteger(item.number) || seen.has(item.number)) {
+        continue;
+      }
+      seen.add(item.number);
+      out.push(toShallowPullRequestRecord(item));
+    }
+    return out.sort((a, b) => a.number - b.number);
+  }
+
   async *listAllIssues(repo: RepoRef): AsyncGenerator<IssueRecord> {
     for (let page = 1; ; page += 1) {
       const items = await ghApiJsonWithRetry<RestIssue[]>(
@@ -327,6 +504,25 @@ export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueD
       }
     }
     return Array.from(seen).sort((a, b) => a - b);
+  }
+
+  async listChangedIssuesSince(repo: RepoRef, since: string): Promise<IssueRecord[]> {
+    const items = await collectPaginated<RestIssue>(
+      (page) =>
+        `repos/${repo.owner}/${repo.name}/issues?state=all&sort=updated&direction=desc&since=${encodeURIComponent(
+          since,
+        )}&per_page=${PAGE_SIZE}&page=${page}`,
+    );
+    const seen = new Set<number>();
+    const out: IssueRecord[] = [];
+    for (const item of items) {
+      if (item.pull_request || !Number.isInteger(item.number) || seen.has(item.number)) {
+        continue;
+      }
+      seen.add(item.number);
+      out.push(toIssueRecord(item));
+    }
+    return out.sort((a, b) => a.number - b.number);
   }
 
   async getIssue(repo: RepoRef, issueNumber: number): Promise<IssueRecord> {
@@ -376,6 +572,71 @@ export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueD
       pr: toPullRequestRecord(pr),
       comments,
     };
+  }
+
+  async fetchPullRequestFacts(repo: RepoRef, prNumber: number): Promise<PullRequestFactRecord> {
+    const repoRef = `${repo.owner}/${repo.name}`;
+    const { stdout } = await execFileAsync(
+      "gh",
+      [
+        "pr",
+        "view",
+        String(prNumber),
+        "-R",
+        repoRef,
+        "--json",
+        [
+          "number",
+          "title",
+          "body",
+          "state",
+          "isDraft",
+          "headRefOid",
+          "reviewDecision",
+          "mergeStateStatus",
+          "mergeable",
+          "statusCheckRollup",
+          "closingIssuesReferences",
+          "files",
+          "updatedAt",
+          "url",
+        ].join(","),
+      ],
+      {
+        maxBuffer: GH_MAX_BUFFER,
+      },
+    );
+    return normalizePullRequestFactRecord(JSON.parse(stdout) as RestPullRequestView);
+  }
+
+  async searchPullRequestNumbers(
+    repo: RepoRef,
+    query: string,
+    options: { state: "open" | "closed"; limit: number },
+  ): Promise<number[]> {
+    const repoRef = `${repo.owner}/${repo.name}`;
+    const { stdout } = await execFileAsync(
+      "gh",
+      [
+        "search",
+        "prs",
+        query,
+        "-R",
+        repoRef,
+        "--state",
+        options.state,
+        "--limit",
+        String(options.limit),
+        "--json",
+        "number",
+      ],
+      {
+        maxBuffer: GH_MAX_BUFFER,
+      },
+    );
+    return (JSON.parse(stdout) as SearchPullRequestResult[])
+      .map((item) => item.number)
+      .filter((number) => Number.isInteger(number));
   }
 }
 

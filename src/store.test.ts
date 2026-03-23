@@ -3,14 +3,18 @@ import os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as embeddingModule from "./embedding.js";
+import * as timeModule from "./lib/time.js";
 import { PrIndexStore } from "./store.js";
+import { resolveMergeReadiness } from "./store/merge-readiness.js";
 import type {
   HydratedPullRequest,
   IssueDataSource,
   IssueRecord,
   PullRequestCommentRecord,
   PullRequestDataSource,
+  PullRequestFactRecord,
   PullRequestRecord,
+  PullRequestReviewFact,
   RepoRef,
 } from "./types.js";
 
@@ -19,7 +23,10 @@ const MISSING_MODEL = "/tmp/clawlens-missing-model.gguf";
 
 class FakePullRequestDataSource implements PullRequestDataSource {
   private readonly hydrated = new Map<number, HydratedPullRequest>();
+  private readonly facts = new Map<number, PullRequestFactRecord>();
+  private readonly searchResults = new Map<string, number[]>();
   changedPrNumbers: number[] = [];
+  changedPrs: PullRequestRecord[] = [];
   hydrateCalls: number[] = [];
 
   constructor(items: HydratedPullRequest[]) {
@@ -30,6 +37,14 @@ class FakePullRequestDataSource implements PullRequestDataSource {
 
   setPullRequest(item: HydratedPullRequest): void {
     this.hydrated.set(item.pr.number, item);
+  }
+
+  setFacts(item: PullRequestFactRecord): void {
+    this.facts.set(item.prNumber, item);
+  }
+
+  setSearchResults(query: string, state: "open" | "closed", prNumbers: number[]): void {
+    this.searchResults.set(`${state}:${query}`, [...prNumbers]);
   }
 
   async *listAllPullRequests(_repo: RepoRef): AsyncGenerator<PullRequestRecord> {
@@ -43,6 +58,10 @@ class FakePullRequestDataSource implements PullRequestDataSource {
     return [...this.changedPrNumbers];
   }
 
+  async listChangedPullRequestsSince(_repo: RepoRef, _since: string): Promise<PullRequestRecord[]> {
+    return [...this.changedPrs];
+  }
+
   async hydratePullRequest(_repo: RepoRef, prNumber: number): Promise<HydratedPullRequest> {
     this.hydrateCalls.push(prNumber);
     const payload = this.hydrated.get(prNumber);
@@ -51,11 +70,29 @@ class FakePullRequestDataSource implements PullRequestDataSource {
     }
     return payload;
   }
+
+  async fetchPullRequestFacts(_repo: RepoRef, prNumber: number): Promise<PullRequestFactRecord> {
+    const payload = this.facts.get(prNumber);
+    if (!payload) {
+      throw new Error(`missing facts for PR ${prNumber}`);
+    }
+    return payload;
+  }
+
+  async searchPullRequestNumbers(
+    _repo: RepoRef,
+    query: string,
+    options: { state: "open" | "closed"; limit: number },
+  ): Promise<number[]> {
+    return [...(this.searchResults.get(`${options.state}:${query}`) ?? [])].slice(0, options.limit);
+  }
 }
 
 class FakeIssueDataSource implements IssueDataSource {
   private readonly issues = new Map<number, IssueRecord>();
   changedIssueNumbers: number[] = [];
+  changedIssues: IssueRecord[] = [];
+  getIssueCalls: number[] = [];
 
   constructor(items: IssueRecord[]) {
     for (const item of items) {
@@ -78,7 +115,12 @@ class FakeIssueDataSource implements IssueDataSource {
     return [...this.changedIssueNumbers];
   }
 
+  async listChangedIssuesSince(_repo: RepoRef, _since: string): Promise<IssueRecord[]> {
+    return [...this.changedIssues];
+  }
+
   async getIssue(_repo: RepoRef, issueNumber: number): Promise<IssueRecord> {
+    this.getIssueCalls.push(issueNumber);
     const payload = this.issues.get(issueNumber);
     if (!payload) {
       throw new Error(`missing issue ${issueNumber}`);
@@ -145,6 +187,42 @@ function makeIssue(number: number, overrides: Partial<IssueRecord> = {}): IssueR
     updatedAt: "2026-03-10T00:00:00.000Z",
     closedAt: null,
     labels: [],
+    ...overrides,
+  };
+}
+
+function makePullRequestFacts(
+  prNumber: number,
+  overrides: Partial<PullRequestFactRecord> = {},
+): PullRequestFactRecord {
+  return {
+    prNumber,
+    headSha: `head-${prNumber}`,
+    reviewDecision: null,
+    mergeStateStatus: "CLEAN",
+    mergeable: "MERGEABLE",
+    statusChecks: [],
+    linkedIssues: [],
+    changedFiles: [],
+    fetchedAt: "2026-03-11T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function makeReviewFact(
+  prNumber: number,
+  overrides: Partial<PullRequestReviewFact> = {},
+): PullRequestReviewFact {
+  return {
+    repo: "openclaw/openclaw",
+    prNumber,
+    headSha: `head-${prNumber}`,
+    decision: "needs_work",
+    summary: "Existing contract test still fails.",
+    commands: [],
+    failingTests: [],
+    source: "manual",
+    recordedAt: "2026-03-11T00:00:00.000Z",
     ...overrides,
   };
 }
@@ -230,25 +308,25 @@ describe("PrIndexStore", () => {
       labels: ["size: M"],
       updatedAt: "2026-03-10T00:00:00.000Z",
     });
+    first.comments.push(makeComment("issue:xs", "Existing comment should stay cached."));
     const source = new FakePullRequestDataSource([first, second]);
 
-    await store.sync({ repo, source, full: true });
+    await store.sync({ repo, source, full: true, hydrateAll: true });
     source.hydrateCalls = [];
 
-    source.setPullRequest(
-      makePullRequest(35983, {
-        title: "Updated label state",
-        body: "The PR moved out of XS and now tracks size S.",
-        labels: ["size: S"],
-        updatedAt: "2026-03-11T00:00:00.000Z",
-      }),
-    );
-    source.changedPrNumbers = [35983];
+    const updated = makePullRequest(35983, {
+      title: "Updated label state",
+      body: "The PR moved out of XS and now tracks size S.",
+      labels: ["size: S"],
+      updatedAt: "2026-03-11T00:00:00.000Z",
+    });
+    source.setPullRequest(updated);
+    source.changedPrs = [updated.pr];
 
     const summary = await store.sync({ repo, source });
     expect(summary.mode).toBe("incremental");
     expect(summary.processedPrs).toBe(1);
-    expect(source.hydrateCalls).toEqual([35983]);
+    expect(source.hydrateCalls).toEqual([]);
 
     const oldLabel = await store.search('label:"size: XS"');
     expect(oldLabel).toHaveLength(0);
@@ -261,6 +339,213 @@ describe("PrIndexStore", () => {
     const unchanged = await store.search("#40001");
     expect(unchanged).toHaveLength(1);
     expect(unchanged[0]?.title).toBe("Unchanged PR");
+
+    const shown = await store.show(35983);
+    expect(shown.comments).toHaveLength(1);
+    expect(shown.comments[0]?.excerpt).toContain("Existing comment");
+  });
+
+  it("hydrates ambiguous closed incremental summaries so merged PRs stay merged", async () => {
+    const store = await createStore();
+    const initial = makePullRequest(40002, {
+      title: "Merged-state preservation",
+      body: "Keep merged PR state during incremental sync.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([initial]);
+
+    await store.sync({ repo, source, full: true });
+    source.hydrateCalls = [];
+
+    const merged = makePullRequest(40002, {
+      title: "Merged-state preservation",
+      body: "Keep merged PR state during incremental sync.",
+      state: "merged",
+      updatedAt: "2026-03-11T00:00:00.000Z",
+      closedAt: "2026-03-11T00:00:00.000Z",
+      mergedAt: "2026-03-11T00:00:00.000Z",
+    });
+    source.setPullRequest(merged);
+    source.changedPrs = [{ ...merged.pr, state: "closed", mergedAt: null }];
+
+    const summary = await store.sync({ repo, source });
+    const shown = await store.show(40002);
+
+    expect(summary.processedPrs).toBe(1);
+    expect(source.hydrateCalls).toEqual([40002]);
+    expect(shown.pr?.state).toBe("merged");
+  });
+
+  it("hydrates first-seen incremental PRs so draft and branch metadata stay accurate", async () => {
+    const store = await createStore();
+    const existing = makePullRequest(40003, {
+      title: "Existing PR",
+      body: "Seed the last-sync watermark.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([existing]);
+
+    await store.sync({ repo, source, full: true });
+    source.hydrateCalls = [];
+
+    const incoming = makePullRequest(40004, {
+      title: "Draft incremental PR",
+      body: "New PR discovered during incremental sync.",
+      isDraft: true,
+      baseRef: "release",
+      headRef: "feature/draft-incremental",
+      updatedAt: "2026-03-11T00:00:00.000Z",
+    });
+    source.setPullRequest(incoming);
+    source.changedPrs = [
+      {
+        ...incoming.pr,
+        isDraft: false,
+        baseRef: "",
+        headRef: "",
+      },
+    ];
+
+    const summary = await store.sync({ repo, source });
+    const queue = await store.listPriorityQueue({ repo, limit: 10, scanLimit: 10 });
+    const branchResult = await store.search("branch:feature/draft-incremental");
+
+    expect(summary.processedPrs).toBe(1);
+    expect(source.hydrateCalls).toEqual([40004]);
+    expect(queue.find((candidate) => candidate.pr.prNumber === 40004)?.badges.draft).toBe(true);
+    expect(branchResult.map((result) => result.prNumber)).toContain(40004);
+  });
+
+  it("hydrates existing incremental PRs when changed summaries omit branch metadata", async () => {
+    const store = await createStore();
+    const initial = makePullRequest(40005, {
+      title: "Existing incremental PR",
+      body: "Existing row should refresh when branch metadata is missing.",
+      isDraft: false,
+      baseRef: "main",
+      headRef: "feature/original-branch",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([initial]);
+
+    await store.sync({ repo, source, full: true });
+    source.hydrateCalls = [];
+
+    const refreshed = makePullRequest(40005, {
+      title: "Existing incremental PR",
+      body: "Existing row should refresh when branch metadata is missing.",
+      isDraft: true,
+      baseRef: "release",
+      headRef: "feature/retargeted-existing-pr",
+      updatedAt: "2026-03-11T00:00:00.000Z",
+    });
+    source.setPullRequest(refreshed);
+    source.changedPrs = [
+      {
+        ...refreshed.pr,
+        isDraft: false,
+        baseRef: "",
+        headRef: "",
+      },
+    ];
+
+    const summary = await store.sync({ repo, source });
+    const queue = await store.listPriorityQueue({ repo, limit: 10, scanLimit: 10 });
+    const branchResult = await store.search("branch:feature/retargeted-existing-pr");
+
+    expect(summary.processedPrs).toBe(1);
+    expect(source.hydrateCalls).toEqual([40005]);
+    expect(queue.find((candidate) => candidate.pr.prNumber === 40005)?.badges.draft).toBe(true);
+    expect(branchResult.map((result) => result.prNumber)).toContain(40005);
+  });
+
+  it("treats REVIEW_REQUIRED as pending merge readiness", () => {
+    const readiness = resolveMergeReadiness({
+      candidate: {
+        prNumber: 40007,
+        title: "Needs review before merge",
+        url: "https://github.com/openclaw/openclaw/pull/40007",
+        state: "open",
+        updatedAt: "2026-03-11T00:00:00.000Z",
+        headSha: "head-40007",
+        matchedBy: "linked_issue",
+        linkedIssues: [40007],
+        prodFiles: [],
+        testFiles: [],
+        otherFiles: [],
+        relevantProdFiles: [],
+        relevantTestFiles: [],
+        noiseFilesCount: 0,
+        status: "best_base",
+        reasonCodes: ["same_linked_issue"],
+        featureVector: {
+          matchedBy: "linked_issue",
+          linkedIssueOverlap: 1,
+          linkedIssueCount: 1,
+          totalProdFileCount: 0,
+          totalTestFileCount: 0,
+          totalOtherFileCount: 0,
+          relevantProdFileCount: 0,
+          relevantTestFileCount: 0,
+          noiseFilesCount: 0,
+          semanticScore: 0,
+        },
+      },
+      latestReviewFact: null,
+      githubSnapshot: {
+        reviewDecision: "REVIEW_REQUIRED",
+        mergeStateStatus: "CLEAN",
+        mergeable: "MERGEABLE",
+        statusChecks: [
+          {
+            name: "verify",
+            status: "COMPLETED",
+            conclusion: "SUCCESS",
+            workflowName: "CI",
+            detailsUrl: null,
+          },
+        ],
+      },
+    });
+
+    expect(readiness).toMatchObject({
+      state: "pending",
+      source: "github",
+      summary: "GitHub review is still required before merge.",
+    });
+  });
+
+  it("persists the incremental PR watermark captured at sync start", async () => {
+    const store = await createStore();
+    const source = new FakePullRequestDataSource([
+      makePullRequest(40006, {
+        title: "Initial incremental watermark seed",
+        updatedAt: "2026-03-10T00:00:00.000Z",
+      }),
+    ]);
+
+    await store.sync({ repo, source, full: true });
+    source.changedPrs = [
+      makePullRequest(40006, {
+        title: "Updated incremental watermark seed",
+        updatedAt: "2026-03-11T00:00:00.000Z",
+      }).pr,
+    ];
+
+    const isoNowSpy = vi.spyOn(timeModule, "isoNow");
+    isoNowSpy.mockImplementationOnce(() => "2026-03-12T00:00:00.000Z");
+    isoNowSpy.mockImplementation(() => "2026-03-12T00:05:00.000Z");
+
+    const summary = await store.sync({ repo, source });
+    const status = await store.status();
+
+    expect(summary.mode).toBe("incremental");
+    expect(summary.lastSyncAt).toBe("2026-03-12T00:05:00.000Z");
+    expect(summary.lastSyncWatermark).toBe("2026-03-12T00:00:00.000Z");
+    expect(status.lastSyncAt).toBe("2026-03-12T00:05:00.000Z");
+    expect(status.lastSyncWatermark).toBe("2026-03-12T00:00:00.000Z");
+
+    isoNowSpy.mockRestore();
   });
 
   it("uses shallow full sync by default to avoid hydrating every PR", async () => {
@@ -283,6 +568,62 @@ describe("PrIndexStore", () => {
     const result = await store.search('label:contributor "Shallow full sync"');
     expect(result).toHaveLength(1);
     expect(result[0]?.prNumber).toBe(50001);
+  });
+
+  it("preserves cached comments during shallow full sync", async () => {
+    const store = await createStore();
+    const pr = makePullRequest(50003, {
+      title: "Keep cached comments",
+      body: "Comments should survive a shallow refresh.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    pr.comments.push(
+      makeComment("issue:keep-comments", "Cached review context should remain searchable."),
+    );
+    const source = new FakePullRequestDataSource([pr]);
+
+    await store.sync({ repo, source, full: true, hydrateAll: true });
+
+    const updated = makePullRequest(50003, {
+      title: "Keep cached comments updated",
+      body: "Comments should survive a shallow refresh.",
+      updatedAt: "2026-03-11T00:00:00.000Z",
+    });
+    source.setPullRequest(updated);
+
+    const summary = await store.sync({ repo, source, full: true });
+    const shown = await store.show(50003);
+    const commentSearch = await store.search("Cached review context");
+
+    expect(summary.commentCount).toBe(1);
+    expect(shown.comments).toHaveLength(1);
+    expect(commentSearch.map((result) => result.prNumber)).toContain(50003);
+  });
+
+  it("lets authoritative full-sync summaries refresh draft metadata", async () => {
+    const store = await createStore();
+    const initial = makePullRequest(50004, {
+      title: "Refresh draft badge",
+      isDraft: false,
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([initial]);
+
+    await store.sync({ repo, source, full: true, hydrateAll: true });
+
+    source.setPullRequest(
+      makePullRequest(50004, {
+        title: "Refresh draft badge",
+        isDraft: true,
+        updatedAt: "2026-03-11T00:00:00.000Z",
+      }),
+    );
+
+    await store.sync({ repo, source, full: true });
+
+    const queue = await store.listPriorityQueue({ repo, limit: 10, scanLimit: 10 });
+
+    expect(queue.find((candidate) => candidate.pr.prNumber === 50004)?.badges.draft).toBe(true);
   });
 
   it("does not initialize embeddings during status or shallow sync", async () => {
@@ -341,5 +682,1039 @@ describe("PrIndexStore", () => {
     const status = await store.status();
     expect(status.issueCount).toBe(1);
     expect(status.issueLabelCount).toBe(2);
+  });
+
+  it("refreshes changed issues incrementally without refetching each issue", async () => {
+    const store = await createStore();
+    const source = new FakeIssueDataSource([
+      makeIssue(42001, {
+        title: "Initial issue state",
+        body: "Tracks the original body.",
+        labels: ["bug"],
+        updatedAt: "2026-03-10T00:00:00.000Z",
+      }),
+    ]);
+
+    await store.syncIssues({ repo, source, full: true });
+    source.getIssueCalls = [];
+    source.changedIssues = [
+      makeIssue(42001, {
+        title: "Updated issue state",
+        body: "Tracks the updated issue body.",
+        labels: ["bug", "needs-triage"],
+        updatedAt: "2026-03-11T00:00:00.000Z",
+      }),
+    ];
+
+    const summary = await store.syncIssues({ repo, source });
+    expect(summary.mode).toBe("incremental");
+    expect(summary.processedIssues).toBe(1);
+    expect(source.getIssueCalls).toEqual([]);
+
+    const results = await store.searchIssues('label:"needs-triage" updated');
+    expect(results).toHaveLength(1);
+    expect(results[0]?.title).toBe("Updated issue state");
+  });
+
+  it("replaces stale fact-owned issue links when refreshing pull request facts", async () => {
+    const store = await createStore();
+    const pr = makePullRequest(42003, {
+      title: "Refresh fact-owned issue links",
+      body: "PR body has no exact issue references.",
+    });
+
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([pr]),
+      full: true,
+    });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(42003, {
+        linkedIssues: [{ issueNumber: 42011, linkSource: "closing_reference" }],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(42003, {
+        linkedIssues: [{ issueNumber: 42012, linkSource: "closing_reference" }],
+      }),
+    );
+
+    const facts = await store.getPullRequestFacts(42003);
+
+    expect(facts?.linkedIssues).toEqual([{ issueNumber: 42012, linkSource: "closing_reference" }]);
+  });
+
+  it("clears stale fact-owned issue links when refreshed facts contain none", async () => {
+    const store = await createStore();
+    const pr = makePullRequest(42004, {
+      title: "Drop stale fact links",
+      body: "PR body has no exact issue references.",
+    });
+
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([pr]),
+      full: true,
+    });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(42004, {
+        linkedIssues: [{ issueNumber: 42021, linkSource: "closing_reference" }],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(42004, {
+        linkedIssues: [],
+      }),
+    );
+
+    const facts = await store.getPullRequestFacts(42004);
+
+    expect(facts?.linkedIssues).toEqual([]);
+  });
+
+  it("keeps text-derived issue links when only fact-owned links are refreshed away", async () => {
+    const store = await createStore();
+    const pr = makePullRequest(42005, {
+      title: "Keep text-derived links",
+      body: "Source Issue #42031",
+    });
+
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([pr]),
+      full: true,
+    });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(42005, {
+        linkedIssues: [{ issueNumber: 42032, linkSource: "closing_reference" }],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(42005, {
+        linkedIssues: [],
+      }),
+    );
+
+    const facts = await store.getPullRequestFacts(42005);
+
+    expect(facts?.linkedIssues).toEqual([
+      { issueNumber: 42031, linkSource: "source_issue_marker" },
+    ]);
+  });
+
+  it("persists the incremental issue watermark captured at sync start", async () => {
+    const store = await createStore();
+    const source = new FakeIssueDataSource([
+      makeIssue(42002, {
+        title: "Initial issue watermark seed",
+        updatedAt: "2026-03-10T00:00:00.000Z",
+      }),
+    ]);
+
+    await store.syncIssues({ repo, source, full: true });
+    source.changedIssues = [
+      makeIssue(42002, {
+        title: "Updated issue watermark seed",
+        updatedAt: "2026-03-11T00:00:00.000Z",
+      }),
+    ];
+
+    const isoNowSpy = vi.spyOn(timeModule, "isoNow");
+    isoNowSpy.mockImplementationOnce(() => "2026-03-12T01:00:00.000Z");
+    isoNowSpy.mockImplementation(() => "2026-03-12T01:05:00.000Z");
+
+    const summary = await store.syncIssues({ repo, source });
+    const status = await store.status();
+
+    expect(summary.mode).toBe("incremental");
+    expect(summary.lastSyncAt).toBe("2026-03-12T01:05:00.000Z");
+    expect(summary.lastSyncWatermark).toBe("2026-03-12T01:00:00.000Z");
+    expect(status.issueLastSyncAt).toBe("2026-03-12T01:05:00.000Z");
+    expect(status.issueLastSyncWatermark).toBe("2026-03-12T01:00:00.000Z");
+
+    isoNowSpy.mockRestore();
+  });
+
+  it("clusters linked-issue PRs by best base coverage and keeps merge readiness separate", async () => {
+    const store = await createStore();
+    const seed = makePullRequest(41793, {
+      title: "fix: prune image-containing tool results during context pruning",
+      body: "Source Issue #41789\nPrune image-containing tool results during context pruning.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+      labels: ["size: XS"],
+    });
+    const best = makePullRequest(42212, {
+      title: "fix: prune image-containing tool results across context pruning paths",
+      body: "Source Issue #41789\nHandle image-containing tool results in pruner and history image pruning paths.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+      labels: ["size: XS"],
+    });
+    const partial = makePullRequest(41863, {
+      title: "fix: prune image-containing tool results in pruner",
+      body: "Source Issue #41789\nHandle image-containing tool results in pruner only.",
+      updatedAt: "2026-03-08T00:00:00.000Z",
+      labels: ["size: XS"],
+    });
+    const excluded = makePullRequest(42946, {
+      title: "fix: historical image-containing tool results in transcript replay",
+      body: "Source Issue #42171\nHistorical image-containing tool results still affect context pruning during transcript replay.",
+      updatedAt: "2026-03-11T00:00:00.000Z",
+      labels: ["size: XS"],
+    });
+
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([seed, best, partial, excluded]),
+      full: true,
+    });
+
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(41793, {
+        headSha: "head-41793",
+        linkedIssues: [{ issueNumber: 41789, linkSource: "source_issue_marker" }],
+        changedFiles: [
+          { path: "src/agents/pi-extensions/context-pruning/pruner.ts", kind: "prod" },
+        ],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(42212, {
+        headSha: "ccbd07d3a",
+        linkedIssues: [{ issueNumber: 41789, linkSource: "source_issue_marker" }],
+        changedFiles: [
+          { path: ".github/workflows/auto-response.yml", kind: "other" },
+          { path: "src/agents/pi-extensions/context-pruning/pruner.ts", kind: "prod" },
+          {
+            path: "src/agents/pi-embedded-runner/run/history-image-prune.ts",
+            kind: "prod",
+          },
+          {
+            path: "src/agents/pi-extensions/context-pruning/pruner.test.ts",
+            kind: "test",
+          },
+          {
+            path: "src/agents/pi-embedded-runner/run/history-image-prune.test.ts",
+            kind: "test",
+          },
+          { path: "docs/help/troubleshooting.md", kind: "other" },
+        ],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(41863, {
+        headSha: "head-41863",
+        linkedIssues: [{ issueNumber: 41789, linkSource: "source_issue_marker" }],
+        changedFiles: [
+          { path: "src/agents/pi-extensions/context-pruning/pruner.ts", kind: "prod" },
+        ],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(42946, {
+        headSha: "head-42946",
+        linkedIssues: [{ issueNumber: 42171, linkSource: "source_issue_marker" }],
+        changedFiles: [
+          {
+            path: "src/agents/pi-embedded-runner/run/history-image-prune.ts",
+            kind: "prod",
+          },
+          {
+            path: "src/agents/pi-embedded-runner/run/history-image-prune.test.ts",
+            kind: "test",
+          },
+        ],
+      }),
+    );
+    await store.recordReviewFact(
+      makeReviewFact(42212, {
+        headSha: "ccbd07d3a",
+        summary: "Existing integration-style contract test still fails.",
+        commands: [
+          "scripts/pr review-checkout-pr 42212",
+          "scripts/pr review-tests 42212 src/agents/pi-extensions/context-pruning.test.ts",
+        ],
+        failingTests: [
+          "src/agents/pi-extensions/context-pruning.test.ts > skips tool results that contain images (no soft trim, no hard clear)",
+        ],
+      }),
+    );
+
+    const analysis = await store.clusterPullRequest({
+      prNumber: 41793,
+      limit: 10,
+      ftsOnly: true,
+    });
+
+    expect(analysis?.clusterBasis).toBe("linked_issue");
+    expect(analysis?.clusterIssueNumbers).toEqual([41789]);
+    expect(analysis?.bestBase?.prNumber).toBe(42212);
+    expect(analysis?.bestBase?.status).toBe("best_base");
+    expect(analysis?.bestBase?.matchedBy).toBe("linked_issue");
+    expect(analysis?.bestBase?.relevantProdFiles).toEqual([
+      "src/agents/pi-embedded-runner/run/history-image-prune.ts",
+      "src/agents/pi-extensions/context-pruning/pruner.ts",
+    ]);
+    expect(analysis?.bestBase?.relevantTestFiles).toEqual([
+      "src/agents/pi-embedded-runner/run/history-image-prune.test.ts",
+      "src/agents/pi-extensions/context-pruning/pruner.test.ts",
+    ]);
+    expect(analysis?.bestBase?.noiseFilesCount).toBe(2);
+    expect(analysis?.bestBase?.featureVector).toMatchObject({
+      matchedBy: "linked_issue",
+      linkedIssueOverlap: 1,
+      relevantProdFileCount: 2,
+      relevantTestFileCount: 2,
+      noiseFilesCount: 2,
+    });
+    expect(analysis?.bestBase?.reason).toContain("broader relevant production coverage");
+    expect(analysis?.bestBase?.reason).toContain("adds companion tests");
+    expect(analysis?.mergeReadiness).toEqual({
+      state: "needs_work",
+      source: "review_fact",
+      summary: "Existing integration-style contract test still fails.",
+      commands: [
+        "scripts/pr review-checkout-pr 42212",
+        "scripts/pr review-tests 42212 src/agents/pi-extensions/context-pruning.test.ts",
+      ],
+      failingTests: [
+        "src/agents/pi-extensions/context-pruning.test.ts > skips tool results that contain images (no soft trim, no hard clear)",
+      ],
+      headSha: "ccbd07d3a",
+    });
+
+    expect(analysis?.sameClusterCandidates.map((candidate) => candidate.prNumber)).toEqual([
+      42212, 41793, 41863,
+    ]);
+    expect(analysis?.sameClusterCandidates[1]).toMatchObject({
+      prNumber: 41793,
+      status: "superseded_candidate",
+      supersededBy: 42212,
+    });
+    expect(analysis?.sameClusterCandidates[1]?.relevantProdFiles).toEqual([
+      "src/agents/pi-extensions/context-pruning/pruner.ts",
+    ]);
+    expect(analysis?.sameClusterCandidates[1]?.reason).toContain(
+      "narrower relevant production coverage",
+    );
+    expect(analysis?.sameClusterCandidates[1]?.reason).toContain("fewer companion tests");
+    expect(analysis?.sameClusterCandidates[2]).toMatchObject({
+      prNumber: 41863,
+      status: "superseded_candidate",
+      supersededBy: 42212,
+    });
+    expect(analysis?.decisionTrace).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          phase: "seed",
+          outcome: "linked_issue_seed",
+          prNumber: 41793,
+        }),
+        expect.objectContaining({
+          phase: "result",
+          outcome: "linked_issue_result",
+          prNumber: 42212,
+        }),
+      ]),
+    );
+    expect(analysis?.nearbyButExcluded).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          prNumber: 42946,
+          matchedBy: "local_semantic",
+          linkedIssues: [42171],
+          excludedReasonCode: "different_linked_issue",
+          reason: "different_linked_issue: #42171",
+          featureVector: expect.objectContaining({
+            matchedBy: "local_semantic",
+          }),
+        }),
+      ]),
+    );
+  });
+
+  it("falls back to semantic-only candidates when exact issue links are absent", async () => {
+    const store = await createStore();
+    const seed = makePullRequest(34019, {
+      title: "fix: detect ollama prompt too long as context overflow error",
+      body: "Detect prompt too long failures as context overflow errors.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const neighbor = makePullRequest(34020, {
+      title: "fix: detect prompt too long failures as context overflow details",
+      body: "Detect prompt too long failures as context overflow errors and show more details to the user.",
+      updatedAt: "2026-03-11T00:00:00.000Z",
+    });
+
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([seed, neighbor]),
+      full: true,
+    });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(34019, {
+        changedFiles: [{ path: "src/providers/ollama.ts", kind: "prod" }],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(34020, {
+        changedFiles: [{ path: "src/providers/ollama.ts", kind: "prod" }],
+      }),
+    );
+
+    const analysis = await store.clusterPullRequest({
+      prNumber: 34019,
+      limit: 10,
+      ftsOnly: true,
+    });
+
+    expect(analysis?.clusterBasis).toBe("semantic_only");
+    expect(analysis?.clusterIssueNumbers).toEqual([]);
+    expect(analysis?.bestBase).toBeNull();
+    expect(analysis?.mergeReadiness).toBeNull();
+    expect(analysis?.sameClusterCandidates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          prNumber: 34020,
+          matchedBy: "local_semantic",
+          status: "possible_same_cluster",
+          reason: "semantic-only candidate",
+          featureVector: expect.objectContaining({
+            matchedBy: "local_semantic",
+            semanticScore: expect.any(Number),
+          }),
+        }),
+      ]),
+    );
+    expect(analysis?.decisionTrace).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          phase: "seed",
+          outcome: "semantic_only",
+          prNumber: 34019,
+        }),
+        expect.objectContaining({
+          phase: "result",
+          outcome: "semantic_only_result",
+        }),
+      ]),
+    );
+  });
+
+  it("discovers same-issue siblings via live issue search and dedupes repeated failing checks", async () => {
+    const store = await createStore();
+    const seed = makePullRequest(34019, {
+      title: 'fix: detect Ollama "prompt too long" as context overflow error',
+      body: "Closes #34005\nDetect prompt too long failures as context overflow errors.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const sibling = makePullRequest(36074, {
+      title: "fix(agents): recognize Ollama context overflow error for auto-compaction",
+      body: "Closes #34005\nRecognize Ollama context overflow and trigger auto-compaction.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+      state: "closed",
+      closedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([seed, sibling]);
+    source.setFacts(
+      makePullRequestFacts(34019, {
+        linkedIssues: [{ issueNumber: 34005, linkSource: "closing_reference" }],
+        changedFiles: [
+          { path: "src/agents/pi-embedded-helpers/errors.ts", kind: "prod" },
+          {
+            path: "src/agents/pi-embedded-helpers.formatassistanterrortext.test.ts",
+            kind: "test",
+          },
+        ],
+        statusChecks: [
+          {
+            name: "checks (bun, test, pnpm canvas:a2ui:bundle && bunx vitest run --config vitest.unit.config.ts)",
+            status: "COMPLETED",
+            conclusion: "FAILURE",
+            workflowName: "CI",
+            detailsUrl: null,
+          },
+          {
+            name: "checks-windows (node, test, 3, 6, pnpm test)",
+            status: "COMPLETED",
+            conclusion: "FAILURE",
+            workflowName: "CI",
+            detailsUrl: null,
+          },
+          {
+            name: "checks-windows (node, test, 3, 6, pnpm test)",
+            status: "COMPLETED",
+            conclusion: "FAILURE",
+            workflowName: "CI",
+            detailsUrl: null,
+          },
+        ],
+      }),
+    );
+    source.setFacts(
+      makePullRequestFacts(36074, {
+        linkedIssues: [{ issueNumber: 34005, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/agents/pi-embedded-helpers/errors.ts", kind: "prod" }],
+      }),
+    );
+    source.setSearchResults("34005", "closed", [36074]);
+
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([seed]),
+      full: true,
+    });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(34019, {
+        linkedIssues: [{ issueNumber: 34005, linkSource: "closing_reference" }],
+        changedFiles: [
+          { path: "src/agents/pi-embedded-helpers/errors.ts", kind: "prod" },
+          {
+            path: "src/agents/pi-embedded-helpers.formatassistanterrortext.test.ts",
+            kind: "test",
+          },
+        ],
+        statusChecks: [
+          {
+            name: "checks-windows (node, test, 3, 6, pnpm test)",
+            status: "COMPLETED",
+            conclusion: "FAILURE",
+            workflowName: "CI",
+            detailsUrl: null,
+          },
+          {
+            name: "checks-windows (node, test, 3, 6, pnpm test)",
+            status: "COMPLETED",
+            conclusion: "FAILURE",
+            workflowName: "CI",
+            detailsUrl: null,
+          },
+        ],
+      }),
+    );
+
+    const analysis = await store.clusterPullRequest({
+      prNumber: 34019,
+      limit: 10,
+      ftsOnly: true,
+      repo,
+      source,
+    });
+
+    expect(analysis?.bestBase?.prNumber).toBe(34019);
+    expect(analysis?.sameClusterCandidates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          prNumber: 36074,
+          matchedBy: "live_issue_search",
+          status: "superseded_candidate",
+          supersededBy: 34019,
+        }),
+      ]),
+    );
+    expect(analysis?.mergeReadiness).toMatchObject({
+      state: "needs_work",
+      source: "github",
+      failingChecks: ["checks-windows (node, test, 3, 6, pnpm test) (x2)"],
+    });
+  });
+
+  it("recovers semantic-only candidates via live search when local recall is empty", async () => {
+    const store = await createStore();
+    const seed = makePullRequest(39670, {
+      title: "feat(agents): auto-show context usage warning when nearing token limit",
+      body: "Auto-show a context usage warning before compaction issues become user-visible.",
+      updatedAt: "2026-03-08T00:00:00.000Z",
+    });
+    const liveNeighbor = makePullRequest(39671, {
+      title: "feat: show context usage warning before silent compaction",
+      body: "Show a warning before silent compaction and token limit issues derail long sessions.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([seed, liveNeighbor]);
+    source.setFacts(
+      makePullRequestFacts(39671, {
+        changedFiles: [{ path: "src/auto-reply/reply/agent-runner.ts", kind: "prod" }],
+      }),
+    );
+    source.setSearchResults(
+      "auto-show context usage warning when nearing token limit",
+      "open",
+      [39671],
+    );
+
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([seed]),
+      full: true,
+    });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39670, {
+        changedFiles: [{ path: "src/auto-reply/reply/agent-runner.ts", kind: "prod" }],
+      }),
+    );
+
+    const analysis = await store.clusterPullRequest({
+      prNumber: 39670,
+      limit: 10,
+      ftsOnly: true,
+      repo,
+      source,
+    });
+
+    expect(analysis?.clusterBasis).toBe("semantic_only");
+    expect(analysis?.sameClusterCandidates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          prNumber: 39671,
+          matchedBy: "live_semantic",
+          status: "possible_same_cluster",
+        }),
+      ]),
+    );
+  });
+
+  it("hydrates the seed before cluster analysis when repo and source are provided", async () => {
+    const store = await createStore();
+    const refreshedSeed = makePullRequest(39672, {
+      title: "feat: warn before compaction on large token usage",
+      body: "Warn before compaction when token usage grows too large.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const liveNeighbor = makePullRequest(39673, {
+      title: "feat: warn before compaction on high token usage",
+      body: "Warn before compaction when token usage grows too high during long sessions.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([refreshedSeed, liveNeighbor]);
+    source.setFacts(
+      makePullRequestFacts(39672, {
+        changedFiles: [{ path: "src/auto-reply/reply/agent-runner.ts", kind: "prod" }],
+      }),
+    );
+    source.setFacts(
+      makePullRequestFacts(39673, {
+        changedFiles: [{ path: "src/auto-reply/reply/agent-runner.ts", kind: "prod" }],
+      }),
+    );
+    source.setSearchResults("warn before compaction on large token usage", "open", [39673]);
+
+    const analysis = await store.clusterPullRequest({
+      prNumber: 39672,
+      limit: 10,
+      ftsOnly: true,
+      repo,
+      source,
+      refresh: true,
+    });
+
+    expect(source.hydrateCalls).toContain(39672);
+    expect(analysis?.seedPr.title).toBe("feat: warn before compaction on large token usage");
+    expect(analysis?.sameClusterCandidates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          prNumber: 39673,
+          matchedBy: "live_semantic",
+        }),
+      ]),
+    );
+  });
+
+  it("prioritizes issue-linked hub PRs above recency-only PRs", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-14T00:00:00.000Z"));
+
+    try {
+      const store = await createStore();
+      const recentOnly = makePullRequest(50010, {
+        title: "chore: tidy recent copy updates",
+        body: "Routine copy cleanup.",
+        updatedAt: "2026-03-13T23:00:00.000Z",
+      });
+      const hub = makePullRequest(50011, {
+        title: "fix: gateway timeout cascade across retry paths",
+        body: "Closes #42001\nFix the gateway timeout cascade across retry paths.",
+        updatedAt: "2026-03-13T12:00:00.000Z",
+      });
+      const sibling = makePullRequest(50012, {
+        title: "fix: gateway timeout cascade in retry loop cleanup",
+        body: "Closes #42001\nReduce retry loop fallout from the same gateway timeout cascade.",
+        updatedAt: "2026-03-13T11:00:00.000Z",
+      });
+
+      await store.sync({
+        repo,
+        source: new FakePullRequestDataSource([recentOnly, hub, sibling]),
+        full: true,
+      });
+
+      const queue = await store.listPriorityQueue({ repo, limit: 10, scanLimit: 10 });
+
+      expect(queue[0]?.pr.prNumber).toBe(50011);
+      expect(queue[0]?.linkedIssueCount).toBe(1);
+      expect(queue[0]?.relatedPullRequestCount).toBeGreaterThan(0);
+      expect(queue[0]?.reasons.map((reason) => reason.type)).toEqual(
+        expect.arrayContaining(["freshness", "linked_issue", "related_pr", "hub_bonus"]),
+      );
+      expect(queue.find((candidate) => candidate.pr.prNumber === 50010)).toBeTruthy();
+      expect(queue.find((candidate) => candidate.pr.prNumber === 50010)?.linkedIssueCount).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("collapses inbox rows for linked-issue clusters and marks merged families as solved", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-14T00:00:00.000Z"));
+
+    try {
+      const store = await createStore();
+      const openA = makePullRequest(51001, {
+        title: "fix: gateway timeout cascade across retry paths",
+        body: "Closes #42011\nFix the gateway timeout cascade across retry paths.",
+        updatedAt: "2026-03-13T12:00:00.000Z",
+      });
+      const openB = makePullRequest(51002, {
+        title: "fix: gateway timeout cascade in retry cleanup",
+        body: "Closes #42011\nReduce retry loop fallout from the same gateway timeout cascade.",
+        updatedAt: "2026-03-13T11:00:00.000Z",
+      });
+      const merged = makePullRequest(51003, {
+        title: "fix: gateway timeout cascade with landed cleanup",
+        body: "Closes #42011\nLand the gateway timeout cascade fix.",
+        state: "merged",
+        mergedAt: "2026-03-13T10:00:00.000Z",
+        closedAt: "2026-03-13T10:00:00.000Z",
+        updatedAt: "2026-03-13T10:00:00.000Z",
+      });
+      const unrelated = makePullRequest(51010, {
+        title: "docs: refresh maintainer notes",
+        body: "Routine docs cleanup.",
+        updatedAt: "2026-03-13T09:00:00.000Z",
+      });
+
+      await store.sync({
+        repo,
+        source: new FakePullRequestDataSource([openA, openB, merged, unrelated]),
+        full: true,
+      });
+
+      for (const prNumber of [51001, 51002, 51003] as const) {
+        await store.recordPullRequestFacts(
+          makePullRequestFacts(prNumber, {
+            linkedIssues: [{ issueNumber: 42011, linkSource: "closing_reference" }],
+            changedFiles: [{ path: "src/gateway/retry.ts", kind: "prod" }],
+          }),
+        );
+      }
+      await store.recordPullRequestFacts(
+        makePullRequestFacts(51010, {
+          changedFiles: [{ path: "docs/maintainers.md", kind: "other" }],
+        }),
+      );
+
+      const inbox = await store.listPriorityInbox({ repo, limit: 10, scanLimit: 10 });
+      const cluster = inbox.find((item) => item.kind === "cluster");
+
+      expect(cluster).toBeTruthy();
+      expect(cluster?.kind).toBe("cluster");
+      if (cluster?.kind === "cluster") {
+        expect(cluster.cluster.clusterIssueNumbers).toEqual([42011]);
+        expect(cluster.cluster.openPrCount).toBe(2);
+        expect(cluster.cluster.mergedPrCount).toBe(1);
+        expect(cluster.cluster.totalPrCount).toBe(3);
+        expect(cluster.cluster.recommendation).toBe("merged_exists");
+        expect(cluster.cluster.statusLabel).toBe("merged exists");
+        expect(cluster.cluster.openMembers.map((member) => member.pr.prNumber)).toEqual([
+          51001, 51002,
+        ]);
+      }
+      expect(inbox.some((item) => item.kind === "pr" && item.candidate.pr.prNumber === 51010)).toBe(
+        true,
+      );
+      expect(inbox.some((item) => item.kind === "pr" && item.candidate.pr.prNumber === 51001)).toBe(
+        false,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps ignored PRs out of collapsed inbox clusters", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-14T00:00:00.000Z"));
+
+    try {
+      const store = await createStore();
+      const openA = makePullRequest(51101, {
+        title: "fix: timeout cascade across retry paths",
+        body: "Closes #42021\nFix the timeout cascade across retry paths.",
+        updatedAt: "2026-03-13T12:00:00.000Z",
+      });
+      const openB = makePullRequest(51102, {
+        title: "fix: timeout cascade in retry cleanup",
+        body: "Closes #42021\nReduce retry loop fallout from the same timeout cascade.",
+        updatedAt: "2026-03-13T11:00:00.000Z",
+      });
+      const merged = makePullRequest(51103, {
+        title: "fix: timeout cascade with landed cleanup",
+        body: "Closes #42021\nLand the timeout cascade fix.",
+        state: "merged",
+        mergedAt: "2026-03-13T10:00:00.000Z",
+        closedAt: "2026-03-13T10:00:00.000Z",
+        updatedAt: "2026-03-13T10:00:00.000Z",
+      });
+
+      await store.sync({
+        repo,
+        source: new FakePullRequestDataSource([openA, openB, merged]),
+        full: true,
+      });
+
+      for (const prNumber of [51101, 51102, 51103] as const) {
+        await store.recordPullRequestFacts(
+          makePullRequestFacts(prNumber, {
+            linkedIssues: [{ issueNumber: 42021, linkSource: "closing_reference" }],
+            changedFiles: [{ path: "src/gateway/retry.ts", kind: "prod" }],
+          }),
+        );
+      }
+      await store.setPrAttentionState(repo, 51102, "ignore");
+
+      const inbox = await store.listPriorityInbox({ repo, limit: 10, scanLimit: 10 });
+      const cluster = inbox.find((item) => item.kind === "cluster");
+
+      expect(cluster?.kind).toBe("cluster");
+      if (cluster?.kind === "cluster") {
+        expect(cluster.cluster.openMembers.map((member) => member.pr.prNumber)).toEqual([51101]);
+        expect(
+          cluster.cluster.openMembers.some((member) => member.attentionState === "ignore"),
+        ).toBe(false);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("treats maintainer as badge-only while watch and ignore stay local", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-14T00:00:00.000Z"));
+
+    try {
+      const store = await createStore();
+      const maintainerPr = makePullRequest(50020, {
+        title: "refactor: normalize inbox score output",
+        body: "Keep inbox score output stable.",
+        updatedAt: "2026-03-13T08:00:00.000Z",
+        labels: ["maintainer"],
+      });
+      const plainPr = makePullRequest(50021, {
+        title: "refactor: normalize inbox score output",
+        body: "Keep inbox score output stable.",
+        updatedAt: "2026-03-13T08:00:00.000Z",
+      });
+      const ignoredPr = makePullRequest(50022, {
+        title: "docs: refresh triage notes",
+        body: "Routine docs cleanup.",
+        updatedAt: "2026-03-13T08:00:00.000Z",
+      });
+
+      await store.sync({
+        repo,
+        source: new FakePullRequestDataSource([maintainerPr, plainPr, ignoredPr]),
+        full: true,
+      });
+
+      let queue = await store.listPriorityQueue({ repo, limit: 10, scanLimit: 10 });
+      const maintainerCandidate = queue.find((candidate) => candidate.pr.prNumber === 50020);
+      const plainCandidate = queue.find((candidate) => candidate.pr.prNumber === 50021);
+
+      expect(maintainerCandidate?.badges.maintainer).toBe(true);
+      expect(plainCandidate?.badges.maintainer).toBe(false);
+      expect(maintainerCandidate?.score).toBe(plainCandidate?.score);
+
+      await store.setPrAttentionState(repo, 50021, "watch");
+      await store.setPrAttentionState(repo, 50022, "ignore");
+
+      queue = await store.listPriorityQueue({ repo, limit: 10, scanLimit: 10 });
+      const watchedCandidate = queue.find((candidate) => candidate.pr.prNumber === 50021);
+
+      expect(queue.some((candidate) => candidate.pr.prNumber === 50022)).toBe(false);
+      expect(watchedCandidate?.attentionState).toBe("watch");
+      expect(watchedCandidate?.reasons.map((reason) => reason.type)).toContain("watch");
+      expect(watchedCandidate?.score).toBeGreaterThan(maintainerCandidate?.score ?? 0);
+
+      const watchlist = await store.listWatchlist(repo, 10);
+      expect(watchlist.map((candidate) => candidate.pr.prNumber)).toEqual([50021]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("builds a context bundle with linked issues, related PRs, cluster, and sparse extras", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-14T00:00:00.000Z"));
+
+    try {
+      const store = await createStore();
+      const seed = makePullRequest(50030, {
+        title: "fix: compaction timeout spiral across retry paths",
+        body: "Closes #42002\nFix the compaction timeout spiral across retry paths.",
+        updatedAt: "2026-03-13T10:00:00.000Z",
+      });
+      seed.comments.push(
+        makeComment("issue:50030", "Investigate retry and backoff interaction in compaction."),
+      );
+      const sibling = makePullRequest(50031, {
+        title: "fix: compaction timeout spiral in retry loop handling",
+        body: "Closes #42002\nReduce retry loop fallout from the same compaction timeout spiral.",
+        updatedAt: "2026-03-13T09:00:00.000Z",
+      });
+
+      await store.sync({
+        repo,
+        source: new FakePullRequestDataSource([seed, sibling]),
+        full: true,
+        hydrateAll: true,
+      });
+      await store.syncIssues({
+        repo,
+        source: new FakeIssueDataSource([
+          makeIssue(42002, {
+            title: "Compaction timeout spiral",
+            body: "Retry paths keep re-triggering compaction timeouts.",
+          }),
+        ]),
+        full: true,
+      });
+      await store.recordPullRequestFacts(
+        makePullRequestFacts(50030, {
+          headSha: "head-50030",
+          linkedIssues: [{ issueNumber: 42002, linkSource: "closing_reference" }],
+          changedFiles: [{ path: "src/agents/compaction.ts", kind: "prod" }],
+        }),
+      );
+      await store.recordPullRequestFacts(
+        makePullRequestFacts(50031, {
+          headSha: "head-50031",
+          linkedIssues: [{ issueNumber: 42002, linkSource: "closing_reference" }],
+          changedFiles: [{ path: "src/agents/compaction.ts", kind: "prod" }],
+        }),
+      );
+      await store.recordReviewFact(
+        makeReviewFact(50030, {
+          summary: "Contract coverage still fails under retry-heavy runs.",
+          commands: ["pnpm test -- compaction"],
+          failingTests: ["compaction.test.ts > retries without timeout spiral"],
+        }),
+      );
+
+      const bundle = await store.getPrContextBundle(repo, 50030);
+
+      expect(bundle?.candidate.pr.prNumber).toBe(50030);
+      expect(bundle?.linkedIssues.map((issue) => issue.issueNumber)).toEqual([42002]);
+      expect(bundle?.relatedPullRequests).toEqual(
+        expect.arrayContaining([expect.objectContaining({ prNumber: 50031 })]),
+      );
+      expect(bundle?.cluster?.clusterBasis).toBe("linked_issue");
+      expect(bundle?.cluster?.sameClusterCandidates).toEqual(
+        expect.arrayContaining([expect.objectContaining({ prNumber: 50031 })]),
+      );
+      expect(bundle?.cluster?.decisionTrace.length).toBeGreaterThan(0);
+      expect(bundle?.comments[0]?.excerpt).toContain("retry and backoff");
+      expect(bundle?.latestReviewFact?.summary).toContain("Contract coverage still fails");
+      expect(bundle?.mergeReadiness).toMatchObject({
+        source: "review_fact",
+        state: "needs_work",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps ignored PRs out of context bundle cluster and related rows", async () => {
+    const store = await createStore();
+    const seed = makePullRequest(50040, {
+      title: "fix: stabilize context bundle visibility",
+      body: "Closes #42040\nStabilize context bundle visibility across cluster surfaces.",
+      updatedAt: "2026-03-13T10:00:00.000Z",
+    });
+    const ignoredSibling = makePullRequest(50041, {
+      title: "fix: stabilize context bundle visibility in same cluster",
+      body: "Closes #42040\nSame cluster candidate that should stay ignored in bundle surfaces.",
+      updatedAt: "2026-03-13T09:00:00.000Z",
+    });
+
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([seed, ignoredSibling]),
+      full: true,
+      hydrateAll: true,
+    });
+    await store.syncIssues({
+      repo,
+      source: new FakeIssueDataSource([
+        makeIssue(42040, {
+          title: "Context bundle visibility",
+          body: "Ignored PRs should not leak back into context surfaces.",
+        }),
+      ]),
+      full: true,
+    });
+    await store.setPrAttentionState(repo, 50041, "ignore");
+
+    const bundle = await store.getPrContextBundle(repo, 50040);
+
+    expect(bundle?.relatedPullRequests).toEqual([]);
+    expect(
+      bundle?.cluster?.sameClusterCandidates.some((candidate) => candidate.prNumber === 50041),
+    ).toBe(false);
+  });
+
+  it("uses the requested repo when resolving merge readiness inside a shared db", async () => {
+    const store = await createStore();
+    const otherRepo: RepoRef = { owner: "frankekn", name: "other-repo" };
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([
+        makePullRequest(50060, {
+          title: "fix: use requested repo for readiness",
+          body: "Closes #42060\nResolve merge readiness using the requested repo context.",
+        }),
+      ]),
+      full: true,
+      hydrateAll: true,
+    });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(50060, {
+        headSha: "head-50060",
+      }),
+    );
+    await store.recordReviewFact(
+      makeReviewFact(50060, {
+        repo: "openclaw/openclaw",
+        headSha: "head-50060",
+        summary: "Repo A review fact should win.",
+      }),
+    );
+
+    await store.sync({
+      repo: otherRepo,
+      source: new FakePullRequestDataSource([
+        makePullRequest(60060, {
+          title: "feat: unrelated shared db repo",
+          body: "Closes #62060\nMove shared-db meta to a different repo after repo A is stored.",
+        }),
+      ]),
+      full: true,
+      hydrateAll: true,
+    });
+
+    const bundle = await store.getPrContextBundle(repo, 50060);
+
+    expect(bundle?.latestReviewFact?.repo).toBe("openclaw/openclaw");
+    expect(bundle?.mergeReadiness).toMatchObject({
+      source: "review_fact",
+      summary: "Repo A review fact should win.",
+    });
   });
 });

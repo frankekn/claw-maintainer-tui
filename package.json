@@ -2,22 +2,31 @@
   "name": "clawlens",
   "version": "0.1.0",
   "private": true,
+  "bin": {
+    "clawlens": "./bin/clawlens.js"
+  },
   "type": "module",
   "scripts": {
     "clawlens": "tsx bin/clawlens.ts",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "verify": "pnpm typecheck && pnpm test && pnpm format",
+    "dev": "pnpm clawlens tui --repo openclaw/openclaw",
+    "dev:sync": "pnpm clawlens sync --repo openclaw/openclaw && pnpm clawlens sync-issues --repo openclaw/openclaw",
+    "dev:full": "pnpm clawlens sync --full --repo openclaw/openclaw && pnpm clawlens sync-issues --full --repo openclaw/openclaw",
     "format": "oxfmt --check .",
     "format:fix": "oxfmt --write ."
   },
   "dependencies": {
+    "blessed": "^0.1.81",
     "node-llama-cpp": "3.16.2",
-    "sqlite-vec": "0.1.7-alpha.2"
+    "sqlite-vec": "0.1.7-alpha.2",
+    "tsx": "^4.21.0"
   },
   "devDependencies": {
+    "@types/blessed": "^0.1.27",
     "@types/node": "^25.3.5",
     "oxfmt": "^0.38.0",
-    "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vitest": "^4.0.18"
   },

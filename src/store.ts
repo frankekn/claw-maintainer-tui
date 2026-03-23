@@ -2,27 +2,105 @@ import * as path from "node:path";
 import { runTasksWithConcurrency } from "./lib/concurrency.js";
 import { buildFtsQuery, bm25RankToScore } from "./lib/hybrid.js";
 import { ensureDir, hashText } from "./lib/internal.js";
+import { collectLinkedIssuesFromPrText } from "./lib/pull-request-facts.js";
+import {
+  FACT_OWNED_PULL_REQUEST_LINK_SOURCES,
+  TEXT_DERIVED_PULL_REQUEST_LINK_SOURCES,
+  isFactOwnedPullRequestLinkSource,
+} from "./lib/pull-request-links.js";
 import { loadSqliteVecExtension } from "./lib/sqlite-vec.js";
 import { requireNodeSqlite } from "./lib/sqlite.js";
 import { truncateUtf16Safe } from "./lib/text.js";
+import { isoNow } from "./lib/time.js";
+import {
+  annotateRelevantCoverage,
+  buildLiveSemanticQueries,
+  buildRelevantPathSets,
+  computeSemanticScore,
+  rankClusterCandidates,
+} from "./store/cluster-logic.js";
+import {
+  buildClusterDecisionTrace,
+  buildExcludedTrace,
+  withClusterFeatures,
+} from "./store/cluster-analysis.js";
+import { buildPrContextBundle } from "./store/context-bundle.js";
+import {
+  buildLinkedIssueClusterResult,
+  buildSemanticOnlyClusterResult,
+  classifyNearbyExcludedCandidate,
+  evaluateSemanticOnlyCandidate,
+  orderSemanticOnlyCandidates,
+  rankClusterDecisionSet,
+} from "./store/cluster-workflow.js";
+import { parseIssueSearchQuery, parseSearchQuery } from "./store/query.js";
+import {
+  buildPriorityCandidateBase as buildPriorityCandidateBaseModel,
+  enrichPriorityCandidate as enrichPriorityCandidateModel,
+  freshnessReason as computeFreshnessReason,
+} from "./store/priority.js";
+import {
+  getChangedFilesForPr,
+  getIssueRow,
+  getLabelsForIssue,
+  getLabelsForPr,
+  getLinkedIssuesForPr,
+  getPrRow,
+  type IssueRow,
+  type PrRow,
+} from "./store/read-model.js";
+import {
+  limitRelatedPullRequests,
+  rankSearchDocRows,
+  type SearchDocRow,
+} from "./store/search-workflow.js";
+import { buildIssueFilterClause, buildPrFilterClause } from "./store/search-sql.js";
+import { resolveMergeReadiness as resolveMergeReadinessModel } from "./store/merge-readiness.js";
+import { mergeSummaryPullRequestRecord } from "./store/pull-request-sync-contract.js";
+import { syncIssuesWorkflow, syncPullRequestsWorkflow } from "./store/sync-workflow.js";
+import { buildCrossReferenceQuery, normalizeSearchText, uniqueStrings } from "./store/text.js";
+import { pullRequestUpsertParams, UPSERT_PULL_REQUEST_SQL } from "./store/upsert.js";
 import {
   createLocalEmbeddingProvider,
   DEFAULT_GH_INTEL_LOCAL_MODEL,
   type LocalEmbeddingProvider,
 } from "./embedding.js";
 import type {
+  AttentionState,
+  ClusterCandidate,
+  ClusterDecisionTrace,
+  ClusterExcludedCandidate,
+  ClusterMatchSource,
+  ClusterPullRequestAnalysis,
+  ClusterReasonCode,
   HydratedPullRequest,
   IssueDataSource,
   IssueRecord,
   IssueSearchFilters,
   IssueSearchResult,
+  MergeReadiness,
   ParsedSearchQuery,
+  PullRequestChangedFile,
   PullRequestDataSource,
+  PullRequestFactRecord,
+  PullRequestLinkSource,
+  PullRequestLinkedIssue,
+  PullRequestRecord,
+  PullRequestReviewFact,
+  PullRequestShowResult,
+  PrContextBundle,
+  PriorityCandidate,
+  PriorityClusterSummary,
+  PriorityInboxItem,
+  PriorityReason,
+  PriorityAttentionState,
+  ReviewFactDecision,
   RepoRef,
   SemanticCorpusDocument,
   SearchDocument,
   SearchFilters,
   SearchResult,
+  SyncProgressEvent,
   StatusSnapshot,
   SyncSummary,
 } from "./types.js";
@@ -36,18 +114,6 @@ const EMBEDDING_CACHE_TABLE = "embedding_cache";
 const DEFAULT_SYNC_CONCURRENCY = 4;
 const DEFAULT_SEARCH_LIMIT = 20;
 const VECTOR_FALLBACK_WEIGHT = 0.05;
-const XREF_STOP_WORDS = new Set([
-  "after",
-  "again",
-  "content",
-  "issue",
-  "message",
-  "still",
-  "their",
-  "there",
-  "users",
-  "using",
-]);
 const META_LAST_SYNC_AT = "last_sync_at";
 const META_LAST_SYNC_WATERMARK = "last_sync_watermark";
 const META_ISSUE_LAST_SYNC_AT = "issue_last_sync_at";
@@ -55,44 +121,8 @@ const META_ISSUE_LAST_SYNC_WATERMARK = "issue_last_sync_watermark";
 const META_REPO = "repo";
 const META_EMBEDDING_MODEL = "embedding_model";
 const META_VECTOR_DIMS = "vector_dims";
-
-type PrRow = {
-  number: number;
-  title: string;
-  body: string;
-  state: "open" | "closed" | "merged";
-  is_draft: number;
-  author: string;
-  base_ref: string;
-  head_ref: string;
-  url: string;
-  created_at: string;
-  updated_at: string;
-  closed_at: string | null;
-  merged_at: string | null;
-};
-
-type SearchDocRow = {
-  doc_id: string;
-  pr_number: number;
-  doc_kind: "pr_body" | "comment";
-  title: string;
-  text: string;
-  updated_at: string;
-  score: number;
-};
-
-type IssueRow = {
-  number: number;
-  title: string;
-  body: string;
-  state: "open" | "closed";
-  author: string;
-  url: string;
-  created_at: string;
-  updated_at: string;
-  closed_at: string | null;
-};
+const META_DERIVED_ISSUE_LINKS_BACKFILLED_AT = "derived_issue_links_backfilled_at";
+const SUCCESSFUL_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
 
 type IssueDocRow = {
   issue_number: number;
@@ -102,63 +132,45 @@ type IssueDocRow = {
   score: number;
 };
 
+type PullRequestFactSnapshotRow = {
+  pr_number: number;
+  head_sha: string;
+  review_decision: string | null;
+  merge_state_status: string | null;
+  mergeable: string | null;
+  status_rollup_json: string;
+  fetched_at: string;
+};
+
+type PullRequestReviewFactRow = {
+  repo: string;
+  pr_number: number;
+  head_sha: string;
+  decision: ReviewFactDecision;
+  summary: string;
+  commands_json: string;
+  failing_tests_json: string;
+  source: string;
+  recorded_at: string;
+};
+
+type PrTriageStateRow = {
+  repo: string;
+  pr_number: number;
+  attention_state: AttentionState;
+  updated_at: string;
+};
+
 function toVectorBlob(values: number[]): Buffer {
   return Buffer.from(new Float32Array(values).buffer);
-}
-
-function normalizeSearchText(value: string): string {
-  return value.replace(/\r\n/g, "\n").trim();
-}
-
-function buildCrossReferenceQuery(title: string, body: string): string {
-  const normalizedBody = normalizeSearchText(body);
-  const firstSentence = normalizedBody
-    .split(/[\n.!?]+/g)
-    .map((value) => value.trim())
-    .find(Boolean);
-  const source =
-    firstSentence && firstSentence.length >= 24 ? firstSentence : title || normalizedBody;
-  const terms = Array.from(
-    new Set(
-      (source.match(/[\p{L}\p{N}_]+/gu) ?? [])
-        .map((value) => value.trim())
-        .filter((value) => value.length >= 5 && !XREF_STOP_WORDS.has(value.toLowerCase())),
-    ),
-  )
-    .sort((left, right) => right.length - left.length || left.localeCompare(right))
-    .slice(0, 4);
-  if (terms.length > 0) {
-    return terms.join(" ");
-  }
-  return normalizeSearchText(title) || normalizedBody;
-}
-
-function isoNow(): string {
-  return new Date().toISOString();
-}
-
-function uniqueSorted(values: string[]): string[] {
-  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean))).sort((a, b) =>
-    a.localeCompare(b),
-  );
 }
 
 function buildSearchDocuments(payload: HydratedPullRequest): SearchDocument[] {
   const docs: SearchDocument[] = [];
   const prTitle = payload.pr.title.trim();
-  const prText = normalizeSearchText(
-    [payload.pr.title, payload.pr.body].filter(Boolean).join("\n\n"),
-  );
-  if (prText) {
-    docs.push({
-      docId: `pr:${payload.pr.number}`,
-      prNumber: payload.pr.number,
-      kind: "pr_body",
-      title: prTitle,
-      text: prText,
-      updatedAt: payload.pr.updatedAt,
-      hash: hashText(prText),
-    });
+  const prDoc = buildPullRequestBodyDocument(payload.pr);
+  if (prDoc) {
+    docs.push(prDoc);
   }
   for (const comment of payload.comments) {
     const text = normalizeSearchText(comment.body);
@@ -180,152 +192,19 @@ function buildSearchDocuments(payload: HydratedPullRequest): SearchDocument[] {
   return docs;
 }
 
-function parseQuotedValue(value: string): string {
-  const trimmed = value.trim();
-  if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) {
-    return trimmed.slice(1, -1);
+function buildPullRequestBodyDocument(pr: PullRequestRecord): SearchDocument | null {
+  const text = normalizeSearchText([pr.title, pr.body].filter(Boolean).join("\n\n"));
+  if (!text) {
+    return null;
   }
-  return trimmed;
-}
-
-export function parseSearchQuery(raw: string): ParsedSearchQuery {
-  let remaining = raw.trim();
-  const filters: SearchFilters = { labels: [] };
-
-  remaining = remaining.replace(/#(\d+)/g, (_, value: string) => {
-    filters.prNumber = Number(value);
-    return " ";
-  });
-
-  remaining = remaining.replace(/label:(".*?"|\S+)/g, (_, value: string) => {
-    filters.labels.push(parseQuotedValue(value));
-    return " ";
-  });
-
-  remaining = remaining.replace(/state:(open|closed|merged|all)\b/gi, (_, value: string) => {
-    filters.state = value.toLowerCase() as SearchFilters["state"];
-    return " ";
-  });
-
-  remaining = remaining.replace(/author:(\S+)/gi, (_, value: string) => {
-    filters.author = value.trim();
-    return " ";
-  });
-
-  remaining = remaining.replace(/branch:(\S+)/gi, (_, value: string) => {
-    filters.branch = value.trim();
-    return " ";
-  });
-
-  filters.labels = uniqueSorted(filters.labels);
   return {
-    raw,
-    text: remaining.replace(/\s+/g, " ").trim(),
-    filters,
-  };
-}
-
-export function parseIssueSearchQuery(raw: string): {
-  raw: string;
-  text: string;
-  filters: IssueSearchFilters;
-} {
-  let remaining = raw.trim();
-  const filters: IssueSearchFilters = { labels: [] };
-
-  remaining = remaining.replace(/#(\d+)/g, (_, value: string) => {
-    filters.issueNumber = Number(value);
-    return " ";
-  });
-
-  remaining = remaining.replace(/label:(".*?"|\S+)/g, (_, value: string) => {
-    filters.labels.push(parseQuotedValue(value));
-    return " ";
-  });
-
-  remaining = remaining.replace(/state:(open|closed|all)\b/gi, (_, value: string) => {
-    filters.state = value.toLowerCase() as IssueSearchFilters["state"];
-    return " ";
-  });
-
-  remaining = remaining.replace(/author:(\S+)/gi, (_, value: string) => {
-    filters.author = value.trim();
-    return " ";
-  });
-
-  filters.labels = uniqueSorted(filters.labels);
-  return {
-    raw,
-    text: remaining.replace(/\s+/g, " ").trim(),
-    filters,
-  };
-}
-
-function buildPrFilterClause(
-  filters: SearchFilters,
-  prAlias: string,
-): { sql: string; params: Array<string | number> } {
-  const clauses: string[] = [];
-  const params: Array<string | number> = [];
-
-  if (filters.prNumber !== undefined) {
-    clauses.push(`${prAlias}.number = ?`);
-    params.push(filters.prNumber);
-  }
-  if (filters.state && filters.state !== "all") {
-    clauses.push(`${prAlias}.state = ?`);
-    params.push(filters.state);
-  }
-  if (filters.author) {
-    clauses.push(`${prAlias}.author = ?`);
-    params.push(filters.author);
-  }
-  if (filters.branch) {
-    clauses.push(`${prAlias}.head_ref = ?`);
-    params.push(filters.branch);
-  }
-  for (const label of filters.labels) {
-    clauses.push(
-      `EXISTS (SELECT 1 FROM pr_labels label_filter WHERE label_filter.pr_number = ${prAlias}.number AND label_filter.label_name = ?)`,
-    );
-    params.push(label);
-  }
-
-  return {
-    sql: clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "",
-    params,
-  };
-}
-
-function buildIssueFilterClause(
-  filters: IssueSearchFilters,
-  issueAlias: string,
-): { sql: string; params: Array<string | number> } {
-  const clauses: string[] = [];
-  const params: Array<string | number> = [];
-
-  if (filters.issueNumber !== undefined) {
-    clauses.push(`${issueAlias}.number = ?`);
-    params.push(filters.issueNumber);
-  }
-  if (filters.state && filters.state !== "all") {
-    clauses.push(`${issueAlias}.state = ?`);
-    params.push(filters.state);
-  }
-  if (filters.author) {
-    clauses.push(`${issueAlias}.author = ?`);
-    params.push(filters.author);
-  }
-  for (const label of filters.labels) {
-    clauses.push(
-      `EXISTS (SELECT 1 FROM issue_labels label_filter WHERE label_filter.issue_number = ${issueAlias}.number AND label_filter.label_name = ?)`,
-    );
-    params.push(label);
-  }
-
-  return {
-    sql: clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "",
-    params,
+    docId: `pr:${pr.number}`,
+    prNumber: pr.number,
+    kind: "pr_body",
+    title: pr.title.trim(),
+    text,
+    updatedAt: pr.updatedAt,
+    hash: hashText(text),
   };
 }
 
@@ -452,6 +331,51 @@ export class PrIndexStore {
         updated_at TEXT NOT NULL,
         PRIMARY KEY (provider, model, hash)
       );
+
+      CREATE TABLE IF NOT EXISTS pr_fact_snapshots (
+        pr_number INTEGER PRIMARY KEY,
+        head_sha TEXT NOT NULL,
+        review_decision TEXT,
+        merge_state_status TEXT,
+        mergeable TEXT,
+        status_rollup_json TEXT NOT NULL,
+        fetched_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS pr_linked_issues (
+        pr_number INTEGER NOT NULL,
+        issue_number INTEGER NOT NULL,
+        link_source TEXT NOT NULL,
+        PRIMARY KEY (pr_number, issue_number, link_source)
+      );
+
+      CREATE TABLE IF NOT EXISTS pr_changed_files (
+        pr_number INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        PRIMARY KEY (pr_number, path)
+      );
+
+      CREATE TABLE IF NOT EXISTS pr_review_facts (
+        repo TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        head_sha TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        commands_json TEXT NOT NULL,
+        failing_tests_json TEXT NOT NULL,
+        source TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY (repo, pr_number, head_sha, source)
+      );
+
+      CREATE TABLE IF NOT EXISTS pr_triage_state (
+        repo TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        attention_state TEXT NOT NULL CHECK(attention_state IN ('seen', 'watch', 'ignore')),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (repo, pr_number)
+      );
     `);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_prs_updated_at ON prs(updated_at);`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_prs_state ON prs(state);`);
@@ -464,6 +388,19 @@ export class PrIndexStore {
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_issue_labels_name ON issue_labels(label_name);`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_pr_comments_pr_number ON pr_comments(pr_number);`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_search_docs_pr_number ON search_docs(pr_number);`);
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_pr_linked_issues_issue ON pr_linked_issues(issue_number);`,
+    );
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_pr_changed_files_pr_number ON pr_changed_files(pr_number);`,
+    );
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_pr_review_facts_pr_number ON pr_review_facts(pr_number);`,
+    );
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_pr_triage_state_attention
+         ON pr_triage_state(repo, attention_state, updated_at);`,
+    );
     this.db.exec(
       `CREATE VIRTUAL TABLE IF NOT EXISTS ${FTS_TABLE} USING fts5(
         title,
@@ -555,6 +492,375 @@ export class PrIndexStore {
          ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
       )
       .run(key, value);
+  }
+
+  private clearIssueLinksForSources(prNumber: number, sources: PullRequestLinkSource[]): void {
+    if (sources.length === 0) {
+      return;
+    }
+    const placeholders = sources.map(() => "?").join(", ");
+    this.db
+      .prepare(
+        `DELETE FROM pr_linked_issues WHERE pr_number = ? AND link_source IN (${placeholders})`,
+      )
+      .run(prNumber, ...sources);
+  }
+
+  private upsertDerivedIssueLinksForPr(prNumber: number, title: string, body: string): void {
+    this.clearIssueLinksForSources(prNumber, TEXT_DERIVED_PULL_REQUEST_LINK_SOURCES);
+    for (const issue of collectLinkedIssuesFromPrText(title, body)) {
+      this.db
+        .prepare(
+          `INSERT INTO pr_linked_issues (pr_number, issue_number, link_source) VALUES (?, ?, ?)`,
+        )
+        .run(prNumber, issue.issueNumber, issue.linkSource);
+    }
+  }
+
+  async ensureDerivedIssueLinksBackfilled(): Promise<void> {
+    await this.init();
+    if (this.getMeta(META_DERIVED_ISSUE_LINKS_BACKFILLED_AT)) {
+      return;
+    }
+    const rows = this.db.prepare("SELECT number, title, body FROM prs").all() as Array<{
+      number: number;
+      title: string;
+      body: string;
+    }>;
+    this.db.exec("BEGIN");
+    try {
+      this.db
+        .prepare(
+          `DELETE FROM pr_linked_issues WHERE link_source IN (${TEXT_DERIVED_PULL_REQUEST_LINK_SOURCES.map(() => "?").join(", ")})`,
+        )
+        .run(...TEXT_DERIVED_PULL_REQUEST_LINK_SOURCES);
+      for (const row of rows) {
+        this.upsertDerivedIssueLinksForPr(row.number, row.title, row.body);
+      }
+      this.setMeta(META_DERIVED_ISSUE_LINKS_BACKFILLED_AT, isoNow());
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async recordPullRequestFacts(facts: PullRequestFactRecord): Promise<void> {
+    await this.init();
+    this.db.exec("BEGIN");
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO pr_fact_snapshots (
+            pr_number, head_sha, review_decision, merge_state_status, mergeable,
+            status_rollup_json, fetched_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(pr_number) DO UPDATE SET
+            head_sha = excluded.head_sha,
+            review_decision = excluded.review_decision,
+            merge_state_status = excluded.merge_state_status,
+            mergeable = excluded.mergeable,
+            status_rollup_json = excluded.status_rollup_json,
+            fetched_at = excluded.fetched_at`,
+        )
+        .run(
+          facts.prNumber,
+          facts.headSha,
+          facts.reviewDecision,
+          facts.mergeStateStatus,
+          facts.mergeable,
+          JSON.stringify(facts.statusChecks),
+          facts.fetchedAt,
+        );
+      this.clearIssueLinksForSources(facts.prNumber, FACT_OWNED_PULL_REQUEST_LINK_SOURCES);
+      for (const issue of facts.linkedIssues.filter((linkedIssue) =>
+        isFactOwnedPullRequestLinkSource(linkedIssue.linkSource),
+      )) {
+        this.db
+          .prepare(
+            `INSERT INTO pr_linked_issues (pr_number, issue_number, link_source) VALUES (?, ?, ?)
+             ON CONFLICT(pr_number, issue_number, link_source) DO NOTHING`,
+          )
+          .run(facts.prNumber, issue.issueNumber, issue.linkSource);
+      }
+      this.db.prepare("DELETE FROM pr_changed_files WHERE pr_number = ?").run(facts.prNumber);
+      for (const file of facts.changedFiles) {
+        this.db
+          .prepare(`INSERT INTO pr_changed_files (pr_number, path, kind) VALUES (?, ?, ?)`)
+          .run(facts.prNumber, file.path, file.kind);
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async getPullRequestFacts(prNumber: number): Promise<PullRequestFactRecord | null> {
+    await this.init();
+    const snapshot = this.db
+      .prepare(
+        `SELECT pr_number, head_sha, review_decision, merge_state_status, mergeable, status_rollup_json, fetched_at
+           FROM pr_fact_snapshots
+          WHERE pr_number = ?`,
+      )
+      .get(prNumber) as PullRequestFactSnapshotRow | undefined;
+    if (!snapshot) {
+      return null;
+    }
+    const linkedIssues = this.db
+      .prepare(
+        `SELECT issue_number, link_source FROM pr_linked_issues WHERE pr_number = ? ORDER BY issue_number ASC, link_source ASC`,
+      )
+      .all(prNumber) as Array<{ issue_number: number; link_source: PullRequestLinkSource }>;
+    const changedFiles = this.db
+      .prepare(`SELECT path, kind FROM pr_changed_files WHERE pr_number = ? ORDER BY path ASC`)
+      .all(prNumber) as Array<{ path: string; kind: PullRequestChangedFile["kind"] }>;
+    return {
+      prNumber: snapshot.pr_number,
+      headSha: snapshot.head_sha,
+      reviewDecision: snapshot.review_decision,
+      mergeStateStatus: snapshot.merge_state_status,
+      mergeable: snapshot.mergeable,
+      statusChecks: JSON.parse(
+        snapshot.status_rollup_json,
+      ) as PullRequestFactRecord["statusChecks"],
+      linkedIssues: linkedIssues.map((issue) => ({
+        issueNumber: issue.issue_number,
+        linkSource: issue.link_source,
+      })),
+      changedFiles: changedFiles.map((file) => ({ path: file.path, kind: file.kind })),
+      fetchedAt: snapshot.fetched_at,
+    };
+  }
+
+  async recordReviewFact(fact: PullRequestReviewFact): Promise<void> {
+    await this.init();
+    this.db
+      .prepare(
+        `INSERT INTO pr_review_facts (
+          repo, pr_number, head_sha, decision, summary, commands_json, failing_tests_json, source, recorded_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(repo, pr_number, head_sha, source) DO UPDATE SET
+          decision = excluded.decision,
+          summary = excluded.summary,
+          commands_json = excluded.commands_json,
+          failing_tests_json = excluded.failing_tests_json,
+          recorded_at = excluded.recorded_at`,
+      )
+      .run(
+        fact.repo,
+        fact.prNumber,
+        fact.headSha,
+        fact.decision,
+        fact.summary,
+        JSON.stringify(fact.commands),
+        JSON.stringify(fact.failingTests),
+        fact.source,
+        fact.recordedAt,
+      );
+  }
+
+  private getLatestReviewFact(prNumber: number, repo: string): PullRequestReviewFact | null {
+    const row = this.db
+      .prepare(
+        `SELECT repo, pr_number, head_sha, decision, summary, commands_json, failing_tests_json, source, recorded_at
+           FROM pr_review_facts
+          WHERE repo = ? AND pr_number = ?
+          ORDER BY recorded_at DESC
+          LIMIT 1`,
+      )
+      .get(repo, prNumber) as PullRequestReviewFactRow | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      repo: row.repo,
+      prNumber: row.pr_number,
+      headSha: row.head_sha,
+      decision: row.decision,
+      summary: row.summary,
+      commands: JSON.parse(row.commands_json) as string[],
+      failingTests: JSON.parse(row.failing_tests_json) as string[],
+      source: row.source,
+      recordedAt: row.recorded_at,
+    };
+  }
+
+  private repoKey(repo: RepoRef | string): string {
+    return typeof repo === "string" ? repo : `${repo.owner}/${repo.name}`;
+  }
+
+  private getAttentionState(repo: string, prNumber: number): PriorityAttentionState {
+    const row = this.db
+      .prepare(
+        `SELECT attention_state
+           FROM pr_triage_state
+          WHERE repo = ? AND pr_number = ?`,
+      )
+      .get(repo, prNumber) as Pick<PrTriageStateRow, "attention_state"> | undefined;
+    return row?.attention_state ?? "new";
+  }
+
+  private isVisibleOnPrioritySurfaces(repo: string, prNumber: number): boolean {
+    return this.getAttentionState(repo, prNumber) !== "ignore";
+  }
+
+  private filterVisibleSearchResults(
+    repo: string,
+    results: Iterable<SearchResult>,
+  ): SearchResult[] {
+    return Array.from(results).filter((result) =>
+      this.isVisibleOnPrioritySurfaces(repo, result.prNumber),
+    );
+  }
+
+  private filterVisibleClusterAnalysis(
+    repo: string,
+    analysis: ClusterPullRequestAnalysis | null,
+  ): ClusterPullRequestAnalysis | null {
+    if (!analysis) {
+      return null;
+    }
+    return {
+      ...analysis,
+      sameClusterCandidates: analysis.sameClusterCandidates.filter((candidate) =>
+        this.isVisibleOnPrioritySurfaces(repo, candidate.prNumber),
+      ),
+      nearbyButExcluded: analysis.nearbyButExcluded.filter((candidate) =>
+        this.isVisibleOnPrioritySurfaces(repo, candidate.prNumber),
+      ),
+    };
+  }
+
+  private buildSearchResultFromPrRow(pr: PrRow, score: number): SearchResult {
+    return {
+      prNumber: pr.number,
+      title: pr.title,
+      url: pr.url,
+      state: pr.state,
+      author: pr.author,
+      labels: this.getLabelsForPr(pr.number),
+      updatedAt: pr.updated_at,
+      score,
+      matchedDocKind: "pr_body",
+      matchedExcerpt: truncateUtf16Safe(normalizeSearchText(pr.body || pr.title), 280),
+    };
+  }
+
+  private freshnessReason(updatedAt: string): PriorityReason | null {
+    return computeFreshnessReason(updatedAt);
+  }
+
+  private buildPriorityCandidateBase(pr: PrRow, repo: string): PriorityCandidate {
+    const attentionState = this.getAttentionState(repo, pr.number);
+    const labels = this.getLabelsForPr(pr.number);
+    return buildPriorityCandidateBaseModel({
+      pr: this.buildSearchResultFromPrRow(pr, 0),
+      attentionState,
+      labels,
+      isDraft: Boolean(pr.is_draft),
+    });
+  }
+
+  private comparePriorityCandidates(left: PriorityCandidate, right: PriorityCandidate): number {
+    return (
+      right.score - left.score ||
+      right.pr.updatedAt.localeCompare(left.pr.updatedAt) ||
+      right.pr.prNumber - left.pr.prNumber
+    );
+  }
+
+  private async enrichPriorityCandidate(
+    candidate: PriorityCandidate,
+    options: { relatedLimit?: number; clusterLimit?: number; repoKey?: string } = {},
+  ): Promise<PriorityCandidate> {
+    const linkedIssues = this.getLinkedIssuesForPr(candidate.pr.prNumber);
+    const relatedPullRequests = await this.findRelatedPullRequests(
+      candidate.pr.prNumber,
+      options.relatedLimit ?? 5,
+      { ftsOnly: true },
+    );
+    const cluster = await this.clusterPullRequest({
+      prNumber: candidate.pr.prNumber,
+      limit: options.clusterLimit ?? 5,
+      ftsOnly: true,
+      repoKey: options.repoKey,
+    });
+    const relatedNumbers = new Set<number>(relatedPullRequests.map((pr) => pr.prNumber));
+    for (const clusterCandidate of cluster?.sameClusterCandidates ?? []) {
+      relatedNumbers.add(clusterCandidate.prNumber);
+    }
+    relatedNumbers.delete(candidate.pr.prNumber);
+
+    return enrichPriorityCandidateModel({
+      candidate,
+      linkedIssueCount: linkedIssues.length,
+      relatedPullRequestCount: relatedNumbers.size,
+    });
+  }
+
+  private async collectPrioritizedOpenCandidates(params: {
+    repoKey: string;
+    limit: number;
+    scanLimit?: number;
+  }): Promise<PriorityCandidate[]> {
+    const scanLimit = Math.max(params.limit, params.scanLimit ?? 300);
+    const recentOpen = this.db
+      .prepare(
+        `SELECT *
+           FROM prs
+          WHERE state = 'open'
+          ORDER BY updated_at DESC, number DESC
+          LIMIT ?`,
+      )
+      .all(scanLimit) as PrRow[];
+    const watchedOpen = this.db
+      .prepare(
+        `SELECT p.*
+           FROM prs p
+           JOIN pr_triage_state t
+             ON t.repo = ?
+            AND t.pr_number = p.number
+          WHERE p.state = 'open'
+            AND t.attention_state = 'watch'
+          ORDER BY p.updated_at DESC, p.number DESC`,
+      )
+      .all(params.repoKey) as PrRow[];
+
+    const byNumber = new Map<number, PrRow>();
+    for (const row of recentOpen) {
+      byNumber.set(row.number, row);
+    }
+    for (const row of watchedOpen) {
+      byNumber.set(row.number, row);
+    }
+
+    const baseline = Array.from(byNumber.values())
+      .map((row) => this.buildPriorityCandidateBase(row, params.repoKey))
+      .filter((candidate) => candidate.attentionState !== "ignore")
+      .sort((left, right) => this.comparePriorityCandidates(left, right));
+
+    const topForEnrichment = baseline.slice(0, Math.min(80, baseline.length));
+    const enriched = new Map<number, PriorityCandidate>();
+    const result = await runTasksWithConcurrency({
+      tasks: topForEnrichment.map((candidate) => async () => {
+        enriched.set(
+          candidate.pr.prNumber,
+          await this.enrichPriorityCandidate(candidate, { repoKey: params.repoKey }),
+        );
+        return candidate.pr.prNumber;
+      }),
+      limit: 6,
+      errorMode: "stop",
+    });
+    if (result.hasError) {
+      throw result.firstError;
+    }
+
+    return baseline
+      .map((candidate) => enriched.get(candidate.pr.prNumber) ?? candidate)
+      .sort((left, right) => this.comparePriorityCandidates(left, right));
   }
 
   private getStoredUpdatedAt(prNumber: number): string | null {
@@ -743,6 +1049,95 @@ export class PrIndexStore {
     }
   }
 
+  private upsertPullRequestSummary(
+    pr: PullRequestRecord,
+    authority: "authoritative" | "partial",
+  ): void {
+    const existing = this.db
+      .prepare(
+        `SELECT state, is_draft, base_ref, head_ref, url, closed_at, merged_at
+           FROM prs
+          WHERE number = ?`,
+      )
+      .get(pr.number) as
+      | {
+          state: PullRequestRecord["state"];
+          is_draft: number;
+          base_ref: string;
+          head_ref: string;
+          url: string;
+          closed_at: string | null;
+          merged_at: string | null;
+        }
+      | undefined;
+    const mergedRecord = mergeSummaryPullRequestRecord({
+      pr,
+      authority,
+      existing: existing
+        ? {
+            state: existing.state,
+            isDraft: Boolean(existing.is_draft),
+            baseRef: existing.base_ref,
+            headRef: existing.head_ref,
+            url: existing.url,
+            closedAt: existing.closed_at,
+            mergedAt: existing.merged_at,
+          }
+        : null,
+    });
+    const prDoc = buildPullRequestBodyDocument(mergedRecord);
+
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare(UPSERT_PULL_REQUEST_SQL).run(...pullRequestUpsertParams(mergedRecord));
+
+      this.upsertDerivedIssueLinksForPr(mergedRecord.number, mergedRecord.title, mergedRecord.body);
+
+      this.db.prepare("DELETE FROM pr_labels WHERE pr_number = ?").run(mergedRecord.number);
+      for (const label of mergedRecord.labels) {
+        this.db
+          .prepare("INSERT INTO pr_labels (pr_number, label_name) VALUES (?, ?)")
+          .run(mergedRecord.number, label);
+      }
+
+      this.db.prepare("DELETE FROM search_docs WHERE doc_id = ?").run(`pr:${mergedRecord.number}`);
+      this.db.prepare(`DELETE FROM ${FTS_TABLE} WHERE doc_id = ?`).run(`pr:${mergedRecord.number}`);
+      if (this.vectorDims) {
+        this.db
+          .prepare(`DELETE FROM ${VECTOR_TABLE} WHERE id = ?`)
+          .run(`pr:${mergedRecord.number}`);
+      }
+
+      if (prDoc) {
+        this.db
+          .prepare(
+            `INSERT INTO search_docs (doc_id, pr_number, doc_kind, title, text, updated_at, hash)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            prDoc.docId,
+            prDoc.prNumber,
+            prDoc.kind,
+            prDoc.title,
+            prDoc.text,
+            prDoc.updatedAt,
+            prDoc.hash,
+          );
+        this.db
+          .prepare(
+            `INSERT INTO ${FTS_TABLE} (title, text, doc_id, pr_number, doc_kind)
+             VALUES (?, ?, ?, ?, ?)`,
+          )
+          .run(prDoc.title, prDoc.text, prDoc.docId, prDoc.prNumber, prDoc.kind);
+      }
+
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   private upsertHydratedPullRequest(
     payload: HydratedPullRequest,
     options: { indexVectors?: boolean } = {},
@@ -760,41 +1155,9 @@ export class PrIndexStore {
 
       this.db.exec("BEGIN");
       try {
-        this.db
-          .prepare(
-            `INSERT INTO prs (
-              number, title, body, state, is_draft, author, base_ref, head_ref, url,
-              created_at, updated_at, closed_at, merged_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(number) DO UPDATE SET
-              title = excluded.title,
-              body = excluded.body,
-              state = excluded.state,
-              is_draft = excluded.is_draft,
-              author = excluded.author,
-              base_ref = excluded.base_ref,
-              head_ref = excluded.head_ref,
-              url = excluded.url,
-              created_at = excluded.created_at,
-              updated_at = excluded.updated_at,
-              closed_at = excluded.closed_at,
-              merged_at = excluded.merged_at`,
-          )
-          .run(
-            payload.pr.number,
-            payload.pr.title,
-            payload.pr.body,
-            payload.pr.state,
-            payload.pr.isDraft ? 1 : 0,
-            payload.pr.author,
-            payload.pr.baseRef,
-            payload.pr.headRef,
-            payload.pr.url,
-            payload.pr.createdAt,
-            payload.pr.updatedAt,
-            payload.pr.closedAt,
-            payload.pr.mergedAt,
-          );
+        this.db.prepare(UPSERT_PULL_REQUEST_SQL).run(...pullRequestUpsertParams(payload.pr));
+
+        this.upsertDerivedIssueLinksForPr(payload.pr.number, payload.pr.title, payload.pr.body);
 
         this.db.prepare("DELETE FROM pr_labels WHERE pr_number = ?").run(payload.pr.number);
         for (const label of payload.pr.labels) {
@@ -876,143 +1239,54 @@ export class PrIndexStore {
     source: PullRequestDataSource;
     full?: boolean;
     hydrateAll?: boolean;
+    onProgress?: (event: SyncProgressEvent) => void;
   }): Promise<SyncSummary> {
     await this.init();
-    const mode = params.full || !this.getMeta(META_LAST_SYNC_WATERMARK) ? "full" : "incremental";
-    const watermark = this.getMeta(META_LAST_SYNC_WATERMARK);
     const repoName = `${params.repo.owner}/${params.repo.name}`;
-    this.setMeta(META_REPO, repoName);
-
-    const toProcess: number[] = [];
-    const shallowPullRequests: HydratedPullRequest[] = [];
-    let skippedPrs = 0;
-
-    if (mode === "full") {
-      for await (const pr of params.source.listAllPullRequests(params.repo)) {
-        const existingUpdatedAt = this.getStoredUpdatedAt(pr.number);
-        if (existingUpdatedAt === pr.updatedAt) {
-          skippedPrs += 1;
-          continue;
-        }
-        if (params.hydrateAll) {
-          toProcess.push(pr.number);
-        } else {
-          shallowPullRequests.push({ pr, comments: [] });
-        }
-      }
-    } else if (watermark) {
-      toProcess.push(
-        ...(await params.source.listChangedPullRequestNumbersSince(params.repo, watermark)),
-      );
-    }
-
-    for (const payload of shallowPullRequests) {
-      await this.upsertHydratedPullRequest(payload, { indexVectors: false });
-    }
-
-    const tasks = toProcess.map((prNumber) => async () => {
-      const hydrated = await params.source.hydratePullRequest(params.repo, prNumber);
-      await this.upsertHydratedPullRequest(hydrated, { indexVectors: false });
-      return prNumber;
-    });
-
-    const result = await runTasksWithConcurrency({
-      tasks,
-      limit: this.syncConcurrency,
-      errorMode: "stop",
-    });
-    if (result.hasError) {
-      throw result.firstError;
-    }
-
-    const syncedAt = isoNow();
-    this.setMeta(META_LAST_SYNC_AT, syncedAt);
-    this.setMeta(META_LAST_SYNC_WATERMARK, syncedAt);
-
-    return {
-      mode,
-      entity: "prs",
-      repo: repoName,
-      processedPrs: toProcess.length + shallowPullRequests.length,
-      processedIssues: 0,
-      skippedPrs,
-      skippedIssues: 0,
-      docCount: this.countRows("search_docs"),
-      commentCount: this.countRows("pr_comments"),
-      labelCount: this.countRows("pr_labels"),
+    return syncPullRequestsWorkflow({
+      ...params,
+      syncConcurrency: this.syncConcurrency,
+      lastSyncWatermark: this.getMeta(META_LAST_SYNC_WATERMARK),
+      repoName,
       vectorAvailable: this.vectorAvailable,
-      lastSyncAt: syncedAt,
-      lastSyncWatermark: syncedAt,
-    };
+      getStoredUpdatedAt: (prNumber) => this.getStoredUpdatedAt(prNumber),
+      upsertHydratedPullRequest: (payload, options) =>
+        this.upsertHydratedPullRequest(payload, options),
+      upsertPullRequestSummary: (pr, authority) => this.upsertPullRequestSummary(pr, authority),
+      setMeta: (key, value) => this.setMeta(key, value),
+      countRows: (table) => this.countRows(table),
+      metaKeys: {
+        repo: META_REPO,
+        lastSyncAt: META_LAST_SYNC_AT,
+        lastSyncWatermark: META_LAST_SYNC_WATERMARK,
+      },
+    });
   }
 
   async syncIssues(params: {
     repo: RepoRef;
     source: IssueDataSource;
     full?: boolean;
+    onProgress?: (event: SyncProgressEvent) => void;
   }): Promise<SyncSummary> {
     await this.init();
-    const mode =
-      params.full || !this.getMeta(META_ISSUE_LAST_SYNC_WATERMARK) ? "full" : "incremental";
-    const watermark = this.getMeta(META_ISSUE_LAST_SYNC_WATERMARK);
     const repoName = `${params.repo.owner}/${params.repo.name}`;
-    this.setMeta(META_REPO, repoName);
-
-    const toProcess: number[] = [];
-    const shallowIssues: IssueRecord[] = [];
-    let skippedIssues = 0;
-
-    if (mode === "full") {
-      for await (const issue of params.source.listAllIssues(params.repo)) {
-        const existingUpdatedAt = this.getStoredIssueUpdatedAt(issue.number);
-        if (existingUpdatedAt === issue.updatedAt) {
-          skippedIssues += 1;
-          continue;
-        }
-        shallowIssues.push(issue);
-      }
-    } else if (watermark) {
-      toProcess.push(...(await params.source.listChangedIssueNumbersSince(params.repo, watermark)));
-    }
-
-    for (const issue of shallowIssues) {
-      this.upsertIssue(issue);
-    }
-
-    const tasks = toProcess.map((issueNumber) => async () => {
-      const issue = await params.source.getIssue(params.repo, issueNumber);
-      this.upsertIssue(issue);
-      return issueNumber;
-    });
-
-    const result = await runTasksWithConcurrency({
-      tasks,
-      limit: this.syncConcurrency,
-      errorMode: "stop",
-    });
-    if (result.hasError) {
-      throw result.firstError;
-    }
-
-    const syncedAt = isoNow();
-    this.setMeta(META_ISSUE_LAST_SYNC_AT, syncedAt);
-    this.setMeta(META_ISSUE_LAST_SYNC_WATERMARK, syncedAt);
-
-    return {
-      mode,
-      entity: "issues",
-      repo: repoName,
-      processedPrs: 0,
-      processedIssues: toProcess.length + shallowIssues.length,
-      skippedPrs: 0,
-      skippedIssues,
-      docCount: this.countRows("search_docs"),
-      commentCount: this.countRows("pr_comments"),
-      labelCount: this.countRows("issue_labels"),
+    return syncIssuesWorkflow({
+      ...params,
+      syncConcurrency: this.syncConcurrency,
+      lastSyncWatermark: this.getMeta(META_ISSUE_LAST_SYNC_WATERMARK),
+      repoName,
       vectorAvailable: this.vectorAvailable,
-      lastSyncAt: syncedAt,
-      lastSyncWatermark: syncedAt,
-    };
+      getStoredIssueUpdatedAt: (issueNumber) => this.getStoredIssueUpdatedAt(issueNumber),
+      upsertIssue: (issue) => this.upsertIssue(issue),
+      setMeta: (key, value) => this.setMeta(key, value),
+      countRows: (table) => this.countRows(table),
+      metaKeys: {
+        repo: META_REPO,
+        lastSyncAt: META_ISSUE_LAST_SYNC_AT,
+        lastSyncWatermark: META_ISSUE_LAST_SYNC_WATERMARK,
+      },
+    });
   }
 
   private countRows(table: string): number {
@@ -1022,46 +1296,523 @@ export class PrIndexStore {
     return row.count;
   }
 
+  async setPrAttentionState(
+    repo: RepoRef | string,
+    prNumber: number,
+    state: AttentionState | null,
+  ): Promise<void> {
+    await this.init();
+    const repoKey = this.repoKey(repo);
+    if (state === null) {
+      this.db
+        .prepare(`DELETE FROM pr_triage_state WHERE repo = ? AND pr_number = ?`)
+        .run(repoKey, prNumber);
+      return;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO pr_triage_state (repo, pr_number, attention_state, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(repo, pr_number) DO UPDATE SET
+           attention_state = excluded.attention_state,
+           updated_at = excluded.updated_at`,
+      )
+      .run(repoKey, prNumber, state, isoNow());
+  }
+
+  async listPriorityQueue(params: {
+    repo: RepoRef | string;
+    limit: number;
+    scanLimit?: number;
+  }): Promise<PriorityCandidate[]> {
+    await this.init();
+    await this.ensureDerivedIssueLinksBackfilled();
+    const repoKey = this.repoKey(params.repo);
+    return (
+      await this.collectPrioritizedOpenCandidates({
+        repoKey,
+        limit: params.limit,
+        scanLimit: params.scanLimit,
+      })
+    ).slice(0, params.limit);
+  }
+
+  private async getOrBuildPriorityCandidate(
+    prNumber: number,
+    repoKey: string,
+    cache: Map<number, PriorityCandidate>,
+  ): Promise<PriorityCandidate | null> {
+    const cached = cache.get(prNumber);
+    if (cached) {
+      return cached;
+    }
+    const pr = this.getPrRow(prNumber);
+    if (!pr || pr.state !== "open") {
+      return null;
+    }
+    const candidate = await this.enrichPriorityCandidate(
+      this.buildPriorityCandidateBase(pr, repoKey),
+      { repoKey },
+    );
+    if (!this.isVisibleOnPrioritySurfaces(repoKey, candidate.pr.prNumber)) {
+      return null;
+    }
+    cache.set(prNumber, candidate);
+    return candidate;
+  }
+
+  private buildPriorityClusterSummary(params: {
+    clusterKey: string;
+    basis: PriorityClusterSummary["basis"];
+    issueNumbers: number[];
+    openMembers: PriorityCandidate[];
+    allStateRows: Array<Pick<ClusterCandidate, "prNumber" | "state" | "updatedAt">>;
+    representativeHints: Set<number>;
+  }): PriorityClusterSummary {
+    const openMembers = [...params.openMembers].sort((left, right) =>
+      this.comparePriorityCandidates(left, right),
+    );
+    const hintedRepresentative =
+      openMembers.find((candidate) => params.representativeHints.has(candidate.pr.prNumber)) ??
+      null;
+    const representative = hintedRepresentative ?? openMembers[0]!;
+    const mergedRows = params.allStateRows
+      .filter((row) => row.state === "merged")
+      .sort(
+        (left, right) =>
+          right.updatedAt.localeCompare(left.updatedAt) || right.prNumber - left.prNumber,
+      );
+    const openPrCount = params.allStateRows.filter((row) => row.state === "open").length;
+    const mergedPrCount = mergedRows.length;
+    const totalPrCount = params.allStateRows.length;
+    const solvedByPrNumber = mergedRows[0]?.prNumber ?? null;
+
+    let recommendation: PriorityClusterSummary["recommendation"];
+    let statusLabel: string;
+    let statusReason: string;
+    let score = representative.score;
+
+    if (solvedByPrNumber !== null) {
+      recommendation = "merged_exists";
+      statusLabel = "merged exists";
+      statusReason = `Merged PR #${solvedByPrNumber} already covers this cluster.`;
+      score -= 18;
+    } else if (openPrCount > 1) {
+      recommendation = "open_variants";
+      statusLabel = `${openPrCount} open variants`;
+      statusReason = `${openPrCount} open PRs are competing in the same cluster.`;
+      score += Math.min(12, 4 + Math.max(0, openPrCount - 2) * 2);
+    } else {
+      recommendation = "semantic_family";
+      statusLabel = "semantic family";
+      statusReason = "Strong semantic overlap groups these PRs together.";
+      score -= 6;
+    }
+
+    return {
+      clusterKey: params.clusterKey,
+      basis: params.basis,
+      representative,
+      openMembers,
+      score,
+      totalPrCount,
+      openPrCount,
+      mergedPrCount,
+      linkedIssueCount: params.issueNumbers.length,
+      clusterIssueNumbers: [...params.issueNumbers].sort((left, right) => left - right),
+      statusLabel,
+      statusReason,
+      recommendation,
+      solvedByPrNumber,
+    };
+  }
+
+  async listPriorityInbox(params: {
+    repo: RepoRef | string;
+    limit: number;
+    scanLimit?: number;
+  }): Promise<PriorityInboxItem[]> {
+    await this.init();
+    await this.ensureDerivedIssueLinksBackfilled();
+    const repoKey = this.repoKey(params.repo);
+    const prioritized = await this.collectPrioritizedOpenCandidates({
+      repoKey,
+      limit: params.limit,
+      scanLimit: params.scanLimit,
+    });
+    const seedWindow = prioritized.slice(
+      0,
+      Math.min(prioritized.length, Math.max(params.limit * 4, 60)),
+    );
+    const candidateCache = new Map<number, PriorityCandidate>(
+      prioritized.map((candidate) => [candidate.pr.prNumber, candidate]),
+    );
+    const analysisByNumber = new Map<number, ClusterPullRequestAnalysis | null>();
+    const analysisResult = await runTasksWithConcurrency({
+      tasks: seedWindow.map((candidate) => async () => {
+        analysisByNumber.set(
+          candidate.pr.prNumber,
+          await this.clusterPullRequest({
+            prNumber: candidate.pr.prNumber,
+            limit: 12,
+            ftsOnly: true,
+            repoKey,
+          }),
+        );
+        return candidate.pr.prNumber;
+      }),
+      limit: 6,
+      errorMode: "stop",
+    });
+    if (analysisResult.hasError) {
+      throw analysisResult.firstError;
+    }
+
+    const exactGroups = new Map<string, { issueNumbers: number[]; openNumbers: Set<number> }>();
+    const semanticAdjacent = new Map<number, Set<number>>();
+    const semanticMergedBySeed = new Map<
+      number,
+      Array<Pick<ClusterCandidate, "prNumber" | "state" | "updatedAt">>
+    >();
+
+    for (const candidate of seedWindow) {
+      const analysis = analysisByNumber.get(candidate.pr.prNumber);
+      if (!analysis) {
+        continue;
+      }
+      if (analysis.clusterBasis === "linked_issue" && analysis.clusterIssueNumbers.length > 0) {
+        const clusterKey = `issue:${[...analysis.clusterIssueNumbers].sort((left, right) => left - right).join(",")}`;
+        const group = exactGroups.get(clusterKey) ?? {
+          issueNumbers: [...analysis.clusterIssueNumbers],
+          openNumbers: new Set<number>(),
+        };
+        group.openNumbers.add(candidate.pr.prNumber);
+        for (const clusterCandidate of analysis.sameClusterCandidates) {
+          if (clusterCandidate.state === "open") {
+            group.openNumbers.add(clusterCandidate.prNumber);
+          }
+        }
+        exactGroups.set(clusterKey, group);
+        continue;
+      }
+
+      if (analysis.clusterBasis === "semantic_only") {
+        const mergedRows = analysis.sameClusterCandidates
+          .filter((clusterCandidate) => clusterCandidate.state === "merged")
+          .map((clusterCandidate) => ({
+            prNumber: clusterCandidate.prNumber,
+            state: clusterCandidate.state,
+            updatedAt: clusterCandidate.updatedAt,
+          }));
+        if (mergedRows.length > 0) {
+          semanticMergedBySeed.set(candidate.pr.prNumber, mergedRows);
+        }
+        for (const clusterCandidate of analysis.sameClusterCandidates) {
+          if (clusterCandidate.state !== "open") {
+            continue;
+          }
+          const existing = semanticAdjacent.get(candidate.pr.prNumber) ?? new Set<number>();
+          existing.add(clusterCandidate.prNumber);
+          semanticAdjacent.set(candidate.pr.prNumber, existing);
+          const reverse = semanticAdjacent.get(clusterCandidate.prNumber) ?? new Set<number>();
+          reverse.add(candidate.pr.prNumber);
+          semanticAdjacent.set(clusterCandidate.prNumber, reverse);
+        }
+      }
+    }
+
+    const consumedOpenNumbers = new Set<number>();
+    const clusterSummaries: PriorityClusterSummary[] = [];
+
+    for (const [clusterKey, group] of exactGroups) {
+      const allNumbers = new Set(this.findPullRequestsByLinkedIssues(group.issueNumbers));
+      const allRows = Array.from(allNumbers)
+        .map((prNumber) => this.getPrRow(prNumber))
+        .filter((row): row is PrRow => Boolean(row));
+      if (allRows.length <= 1) {
+        continue;
+      }
+      const openMembers = (
+        await Promise.all(
+          allRows
+            .filter((row) => row.state === "open")
+            .map((row) => this.getOrBuildPriorityCandidate(row.number, repoKey, candidateCache)),
+        )
+      ).filter((candidate): candidate is PriorityCandidate => Boolean(candidate));
+      const unconsumedOpenMembers = openMembers.filter(
+        (member) => !consumedOpenNumbers.has(member.pr.prNumber),
+      );
+      if (unconsumedOpenMembers.length === 0) {
+        continue;
+      }
+      const representativeHints = new Set<number>();
+      for (const member of unconsumedOpenMembers) {
+        const analysis = analysisByNumber.get(member.pr.prNumber);
+        if (analysis?.bestBase?.state === "open") {
+          representativeHints.add(analysis.bestBase.prNumber);
+        }
+      }
+      clusterSummaries.push(
+        this.buildPriorityClusterSummary({
+          clusterKey,
+          basis: "linked_issue",
+          issueNumbers: group.issueNumbers,
+          openMembers: unconsumedOpenMembers,
+          allStateRows: allRows.map((row) => ({
+            prNumber: row.number,
+            state: row.state,
+            updatedAt: row.updated_at,
+          })),
+          representativeHints,
+        }),
+      );
+      for (const member of unconsumedOpenMembers) {
+        consumedOpenNumbers.add(member.pr.prNumber);
+      }
+    }
+
+    const semanticVisited = new Set<number>();
+    for (const candidate of seedWindow) {
+      if (
+        consumedOpenNumbers.has(candidate.pr.prNumber) ||
+        semanticVisited.has(candidate.pr.prNumber)
+      ) {
+        continue;
+      }
+      const queue = [candidate.pr.prNumber];
+      const component = new Set<number>();
+      while (queue.length > 0) {
+        const current = queue.pop()!;
+        if (semanticVisited.has(current) || consumedOpenNumbers.has(current)) {
+          continue;
+        }
+        semanticVisited.add(current);
+        component.add(current);
+        for (const next of semanticAdjacent.get(current) ?? []) {
+          if (!semanticVisited.has(next) && !consumedOpenNumbers.has(next)) {
+            queue.push(next);
+          }
+        }
+      }
+
+      const mergedRows = Array.from(component).flatMap(
+        (prNumber) => semanticMergedBySeed.get(prNumber) ?? [],
+      );
+      if (component.size <= 1 && mergedRows.length === 0) {
+        continue;
+      }
+
+      const openMembers = (
+        await Promise.all(
+          Array.from(component).map((prNumber) =>
+            this.getOrBuildPriorityCandidate(prNumber, repoKey, candidateCache),
+          ),
+        )
+      ).filter((member): member is PriorityCandidate => Boolean(member));
+      if (openMembers.length === 0) {
+        continue;
+      }
+
+      const clusterKey = `semantic:${openMembers
+        .map((member) => member.pr.prNumber)
+        .sort((left, right) => left - right)
+        .join(",")}`;
+      const allStateRows = [
+        ...openMembers.map((member) => ({
+          prNumber: member.pr.prNumber,
+          state: member.pr.state,
+          updatedAt: member.pr.updatedAt,
+        })),
+        ...mergedRows,
+      ].filter(
+        (row, index, rows) =>
+          rows.findIndex((candidateRow) => candidateRow.prNumber === row.prNumber) === index,
+      );
+      clusterSummaries.push(
+        this.buildPriorityClusterSummary({
+          clusterKey,
+          basis: "semantic_only",
+          issueNumbers: [],
+          openMembers,
+          allStateRows,
+          representativeHints: new Set<number>(),
+        }),
+      );
+      for (const member of openMembers) {
+        consumedOpenNumbers.add(member.pr.prNumber);
+      }
+    }
+
+    const items: PriorityInboxItem[] = [
+      ...clusterSummaries.map(
+        (cluster) => ({ kind: "cluster", cluster }) satisfies PriorityInboxItem,
+      ),
+      ...prioritized
+        .filter((candidate) => !consumedOpenNumbers.has(candidate.pr.prNumber))
+        .map((candidate) => ({ kind: "pr", candidate }) satisfies PriorityInboxItem),
+    ];
+
+    return items
+      .sort((left, right) => {
+        const leftScore = left.kind === "cluster" ? left.cluster.score : left.candidate.score;
+        const rightScore = right.kind === "cluster" ? right.cluster.score : right.candidate.score;
+        if (leftScore !== rightScore) {
+          return rightScore - leftScore;
+        }
+        const leftUpdatedAt =
+          left.kind === "cluster"
+            ? left.cluster.representative.pr.updatedAt
+            : left.candidate.pr.updatedAt;
+        const rightUpdatedAt =
+          right.kind === "cluster"
+            ? right.cluster.representative.pr.updatedAt
+            : right.candidate.pr.updatedAt;
+        return rightUpdatedAt.localeCompare(leftUpdatedAt);
+      })
+      .slice(0, params.limit);
+  }
+
+  async listWatchlist(
+    repo: RepoRef | string,
+    limit = DEFAULT_SEARCH_LIMIT,
+  ): Promise<PriorityCandidate[]> {
+    await this.init();
+    await this.ensureDerivedIssueLinksBackfilled();
+    const repoKey = this.repoKey(repo);
+    const rows = this.db
+      .prepare(
+        `SELECT p.*
+           FROM prs p
+           JOIN pr_triage_state t
+             ON t.repo = ?
+            AND t.pr_number = p.number
+          WHERE p.state = 'open'
+            AND t.attention_state = 'watch'
+          ORDER BY p.updated_at DESC, p.number DESC
+          LIMIT ?`,
+      )
+      .all(repoKey, limit) as PrRow[];
+    const result = await runTasksWithConcurrency({
+      tasks: rows.map(
+        (row) => async () =>
+          this.enrichPriorityCandidate(this.buildPriorityCandidateBase(row, repoKey), { repoKey }),
+      ),
+      limit: 6,
+      errorMode: "stop",
+    });
+    if (result.hasError) {
+      throw result.firstError;
+    }
+    return result.results
+      .filter((value): value is PriorityCandidate => Boolean(value))
+      .sort(
+        (left, right) =>
+          right.score - left.score ||
+          right.pr.updatedAt.localeCompare(left.pr.updatedAt) ||
+          right.pr.prNumber - left.pr.prNumber,
+      );
+  }
+
+  async getPrContextBundle(
+    repo: RepoRef | string,
+    prNumber: number,
+  ): Promise<PrContextBundle | null> {
+    await this.init();
+    await this.ensureDerivedIssueLinksBackfilled();
+    const repoKey = this.repoKey(repo);
+    const pr = this.getPrRow(prNumber);
+    if (!pr) {
+      return null;
+    }
+    const payload = await this.show(prNumber);
+    const candidate = await this.enrichPriorityCandidate(
+      this.buildPriorityCandidateBase(pr, repoKey),
+      { repoKey },
+    );
+    const linkedIssues = this.getLinkedIssuesForPr(prNumber)
+      .map((issue) => this.getIssueRow(issue.issueNumber))
+      .filter((issue): issue is IssueRow => Boolean(issue))
+      .map((issue) => ({
+        issueNumber: issue.number,
+        title: issue.title,
+        url: issue.url,
+        state: issue.state,
+        author: issue.author,
+        labels: this.getLabelsForIssue(issue.number),
+        updatedAt: issue.updated_at,
+        score: 1,
+        matchedExcerpt: truncateUtf16Safe(normalizeSearchText(issue.body || issue.title), 280),
+      }));
+    const cluster = this.filterVisibleClusterAnalysis(
+      repoKey,
+      await this.clusterPullRequest({
+        prNumber,
+        limit: 5,
+        ftsOnly: true,
+        repoKey,
+      }),
+    );
+    const relatedPullRequests = new Map<number, SearchResult>();
+    for (const relatedPullRequest of this.filterVisibleSearchResults(
+      repoKey,
+      await this.findRelatedPullRequests(prNumber, 5, {
+        ftsOnly: true,
+      }),
+    )) {
+      relatedPullRequests.set(relatedPullRequest.prNumber, relatedPullRequest);
+    }
+    for (const clusterCandidate of cluster?.sameClusterCandidates ?? []) {
+      if (clusterCandidate.prNumber === prNumber) {
+        continue;
+      }
+      if (relatedPullRequests.has(clusterCandidate.prNumber)) {
+        continue;
+      }
+      const clusterPr = this.getPrRow(clusterCandidate.prNumber);
+      if (!clusterPr) {
+        continue;
+      }
+      relatedPullRequests.set(
+        clusterCandidate.prNumber,
+        this.buildSearchResultFromPrRow(clusterPr, clusterCandidate.semanticScore ?? 1),
+      );
+    }
+    return buildPrContextBundle({
+      candidate,
+      payload,
+      linkedIssues,
+      relatedPullRequests: relatedPullRequests.values(),
+      cluster,
+      latestReviewFact: this.getLatestReviewFact(prNumber, repoKey),
+      mergeReadiness: this.resolveMergeReadiness(
+        this.buildClusterCandidate(prNumber, "same_cluster_candidate", "linked_issue"),
+        repoKey,
+      ),
+    });
+  }
+
   async search(rawQuery: string, limit = DEFAULT_SEARCH_LIMIT): Promise<SearchResult[]> {
     await this.init();
     const parsed = parseSearchQuery(rawQuery);
+    return this.searchParsed(parsed, limit);
+  }
+
+  private async searchParsed(
+    parsed: ParsedSearchQuery,
+    limit: number,
+    options: { ftsOnly?: boolean } = {},
+  ): Promise<SearchResult[]> {
     if (!parsed.text) {
       return this.searchByFiltersOnly(parsed.filters, limit);
     }
 
     const keywordHits = this.searchKeywordDocs(parsed, limit * 5);
-    const vectorHits = await this.searchVectorDocs(parsed, limit * 5);
-    const byDoc = new Map<
-      string,
-      SearchDocRow & {
-        vectorScore: number;
-        textScore: number;
-      }
-    >();
-
-    for (const hit of keywordHits) {
-      byDoc.set(hit.doc_id, { ...hit, vectorScore: 0, textScore: hit.score });
-    }
-    for (const hit of vectorHits) {
-      const existing = byDoc.get(hit.doc_id);
-      if (existing) {
-        existing.vectorScore = hit.score;
-      } else {
-        byDoc.set(hit.doc_id, { ...hit, vectorScore: hit.score, textScore: 0 });
-      }
-    }
-
-    const ranked = Array.from(byDoc.values())
-      .map((row) => ({
-        ...row,
-        score:
-          keywordHits.length > 0
-            ? row.textScore > 0
-              ? row.textScore
-              : row.vectorScore * VECTOR_FALLBACK_WEIGHT
-            : row.vectorScore,
-      }))
-      .sort((a, b) => b.score - a.score);
+    const vectorHits = options.ftsOnly ? [] : await this.searchVectorDocs(parsed, limit * 5);
+    const ranked = rankSearchDocRows({
+      keywordHits,
+      vectorHits,
+      vectorFallbackWeight: VECTOR_FALLBACK_WEIGHT,
+    });
 
     const seen = new Set<number>();
     const results: SearchResult[] = [];
@@ -1091,6 +1842,21 @@ export class PrIndexStore {
       }
     }
     return results;
+  }
+
+  async findRelatedPullRequests(
+    prNumber: number,
+    limit = DEFAULT_SEARCH_LIMIT,
+    options: { ftsOnly?: boolean } = {},
+  ): Promise<SearchResult[]> {
+    await this.init();
+    const payload = await this.show(prNumber);
+    if (!payload.pr) {
+      return [];
+    }
+    const query = buildCrossReferenceQuery(payload.pr.title, payload.pr.matchedExcerpt);
+    const results = await this.searchParsed(parseSearchQuery(query), limit + 1, options);
+    return limitRelatedPullRequests(results, prNumber, limit);
   }
 
   async searchIssues(rawQuery: string, limit = DEFAULT_SEARCH_LIMIT): Promise<IssueSearchResult[]> {
@@ -1279,44 +2045,426 @@ export class PrIndexStore {
   }
 
   private getPrRow(prNumber: number): PrRow | null {
-    return (
-      (this.db.prepare("SELECT * FROM prs WHERE number = ?").get(prNumber) as PrRow | undefined) ??
-      null
-    );
+    return getPrRow(this.db, prNumber);
   }
 
   private getIssueRow(issueNumber: number): IssueRow | null {
-    return (
-      (this.db.prepare("SELECT * FROM issues WHERE number = ?").get(issueNumber) as
-        | IssueRow
-        | undefined) ?? null
+    return getIssueRow(this.db, issueNumber);
+  }
+
+  private getLinkedIssuesForPr(prNumber: number): PullRequestLinkedIssue[] {
+    return getLinkedIssuesForPr(this.db, prNumber);
+  }
+
+  private getChangedFilesForPr(prNumber: number): PullRequestChangedFile[] {
+    return getChangedFilesForPr(this.db, prNumber);
+  }
+
+  private findPullRequestsByLinkedIssues(issueNumbers: number[]): number[] {
+    if (issueNumbers.length === 0) {
+      return [];
+    }
+    const placeholders = issueNumbers.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT pr_number
+           FROM pr_linked_issues
+          WHERE issue_number IN (${placeholders})
+          ORDER BY pr_number DESC`,
+      )
+      .all(...issueNumbers) as Array<{ pr_number: number }>;
+    return rows.map((row) => row.pr_number);
+  }
+
+  private async ensurePullRequestCached(
+    repo: RepoRef,
+    source: PullRequestDataSource,
+    prNumber: number,
+    refresh = false,
+  ): Promise<void> {
+    const hasPrRow = this.getPrRow(prNumber) !== null;
+    if (!hasPrRow || refresh) {
+      const hydrated = await source.hydratePullRequest(repo, prNumber);
+      await this.upsertHydratedPullRequest(hydrated, { indexVectors: false });
+    }
+    if (!source.fetchPullRequestFacts) {
+      return;
+    }
+    const facts = await this.getPullRequestFacts(prNumber);
+    if (!facts || refresh) {
+      await this.recordPullRequestFacts(await source.fetchPullRequestFacts(repo, prNumber));
+    }
+  }
+
+  async refreshPullRequestDetail(
+    repo: RepoRef,
+    source: PullRequestDataSource,
+    prNumber: number,
+  ): Promise<void> {
+    await this.init();
+    await this.ensurePullRequestCached(repo, source, prNumber, true);
+  }
+
+  async refreshIssueDetail(
+    repo: RepoRef,
+    source: IssueDataSource,
+    issueNumber: number,
+  ): Promise<void> {
+    await this.init();
+    const issue = await source.getIssue(repo, issueNumber);
+    this.upsertIssue(issue);
+  }
+
+  private buildClusterCandidate(
+    prNumber: number,
+    status: ClusterCandidate["status"],
+    matchedBy: ClusterMatchSource,
+    reason?: string,
+    reasonCodes: ClusterReasonCode[] = [],
+    semanticScore?: number,
+    supersededBy?: number,
+  ): ClusterCandidate | null {
+    const pr = this.getPrRow(prNumber);
+    if (!pr) {
+      return null;
+    }
+    const facts = this.getChangedFilesForPr(prNumber);
+    const linkedIssues = this.getLinkedIssuesForPr(prNumber).map((issue) => issue.issueNumber);
+    return withClusterFeatures(
+      {
+        prNumber,
+        title: pr.title,
+        url: pr.url,
+        state: pr.state,
+        updatedAt: pr.updated_at,
+        matchedBy,
+        headSha:
+          (
+            this.db
+              .prepare(`SELECT head_sha FROM pr_fact_snapshots WHERE pr_number = ?`)
+              .get(prNumber) as { head_sha: string } | undefined
+          )?.head_sha ?? null,
+        linkedIssues,
+        prodFiles: facts.filter((file) => file.kind === "prod").map((file) => file.path),
+        testFiles: facts.filter((file) => file.kind === "test").map((file) => file.path),
+        otherFiles: facts.filter((file) => file.kind === "other").map((file) => file.path),
+        relevantProdFiles: [],
+        relevantTestFiles: [],
+        noiseFilesCount: 0,
+        status,
+        reasonCodes,
+        semanticScore,
+        supersededBy,
+        reason,
+      },
+      [],
     );
   }
 
+  private async collectLiveIssueSearchCandidates(
+    repo: RepoRef,
+    source: PullRequestDataSource,
+    issueNumbers: number[],
+    limit: number,
+  ): Promise<Map<number, ClusterMatchSource>> {
+    const out = new Map<number, ClusterMatchSource>();
+    if (!source.searchPullRequestNumbers) {
+      return out;
+    }
+    for (const issueNumber of issueNumbers) {
+      for (const state of ["open", "closed"] as const) {
+        const numbers = await source.searchPullRequestNumbers(repo, String(issueNumber), {
+          state,
+          limit,
+        });
+        for (const prNumber of numbers) {
+          out.set(prNumber, "live_issue_search");
+        }
+      }
+    }
+    return out;
+  }
+
+  private async collectLiveSemanticCandidates(
+    repo: RepoRef,
+    source: PullRequestDataSource,
+    seed: PrRow,
+    limit: number,
+  ): Promise<Map<number, ClusterMatchSource>> {
+    const out = new Map<number, ClusterMatchSource>();
+    if (!source.searchPullRequestNumbers) {
+      return out;
+    }
+    for (const query of buildLiveSemanticQueries(seed)) {
+      for (const state of ["open", "closed"] as const) {
+        const numbers = await source.searchPullRequestNumbers(repo, query, {
+          state,
+          limit,
+        });
+        for (const prNumber of numbers) {
+          if (prNumber !== seed.number) {
+            out.set(prNumber, "live_semantic");
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  private async collectLinkedIssueCandidateSet(params: {
+    seed: PrRow;
+    clusterIssueNumbers: number[];
+    liveIssueSearchLimit: number;
+    repo?: RepoRef;
+    source?: PullRequestDataSource;
+    refresh?: boolean;
+  }): Promise<{
+    rawCandidates: ClusterCandidate[];
+    decisionTrace: ClusterDecisionTrace[];
+  }> {
+    const exactMatches = new Map<number, ClusterMatchSource>([
+      [params.seed.number, "linked_issue"],
+    ]);
+    for (const prNumber of this.findPullRequestsByLinkedIssues(params.clusterIssueNumbers)) {
+      exactMatches.set(prNumber, "linked_issue");
+    }
+
+    if (params.repo && params.source) {
+      const liveIssueMatches = await this.collectLiveIssueSearchCandidates(
+        params.repo,
+        params.source,
+        params.clusterIssueNumbers,
+        params.liveIssueSearchLimit,
+      );
+      for (const [prNumber, matchedBy] of liveIssueMatches) {
+        await this.ensurePullRequestCached(
+          params.repo,
+          params.source,
+          prNumber,
+          params.refresh ?? false,
+        );
+        const linkedIssues = this.getLinkedIssuesForPr(prNumber).map((issue) => issue.issueNumber);
+        if (linkedIssues.some((issue) => params.clusterIssueNumbers.includes(issue))) {
+          exactMatches.set(prNumber, exactMatches.get(prNumber) ?? matchedBy);
+        }
+      }
+    }
+
+    const rawCandidates = Array.from(exactMatches.entries())
+      .map(([prNumber, matchedBy]) =>
+        this.buildClusterCandidate(
+          prNumber,
+          "same_cluster_candidate",
+          matchedBy,
+          matchedBy === "live_issue_search" ? "discovered via live issue search" : undefined,
+          matchedBy === "live_issue_search"
+            ? ["same_linked_issue", "discovered_via_live_issue_search"]
+            : ["same_linked_issue"],
+        ),
+      )
+      .filter((candidate): candidate is ClusterCandidate => Boolean(candidate));
+
+    return {
+      rawCandidates,
+      decisionTrace: [
+        buildClusterDecisionTrace({
+          phase: "seed",
+          prNumber: params.seed.number,
+          matchedBy: null,
+          outcome: "linked_issue_seed",
+          summary: `Seed PR links issues ${params.clusterIssueNumbers.map((issue) => `#${issue}`).join(", ")}.`,
+        }),
+        ...rawCandidates.map((candidate) =>
+          buildClusterDecisionTrace({
+            phase: "candidate",
+            prNumber: candidate.prNumber,
+            matchedBy: candidate.matchedBy,
+            outcome: "candidate_generated",
+            summary:
+              candidate.reason ??
+              (candidate.matchedBy === "live_issue_search"
+                ? "Candidate discovered via live issue search."
+                : "Candidate shares the linked issue."),
+            featureVector: candidate.featureVector,
+            reasonCodes: candidate.reasonCodes,
+          }),
+        ),
+      ],
+    };
+  }
+
+  private async collectSemanticOnlyDecisionSet(params: {
+    seed: PrRow;
+    semanticNumbers: Map<number, ClusterMatchSource>;
+    repo?: RepoRef;
+    source?: PullRequestDataSource;
+    refresh?: boolean;
+  }): Promise<{
+    sameClusterCandidates: ClusterCandidate[];
+    nearbyButExcluded: ClusterExcludedCandidate[];
+    decisionTrace: ClusterDecisionTrace[];
+  }> {
+    const sameClusterCandidates: ClusterCandidate[] = [];
+    const nearbyButExcluded: ClusterExcludedCandidate[] = [];
+    const decisionTrace: ClusterDecisionTrace[] = [];
+    const seedChangedFiles = this.getChangedFilesForPr(params.seed.number);
+
+    for (const [prNumber, matchedBy] of params.semanticNumbers) {
+      if (params.repo && params.source) {
+        await this.ensurePullRequestCached(
+          params.repo,
+          params.source,
+          prNumber,
+          params.refresh ?? false,
+        );
+      }
+      const candidateRow = this.getPrRow(prNumber);
+      if (!candidateRow) {
+        continue;
+      }
+      const semanticScore = computeSemanticScore({
+        seed: {
+          title: params.seed.title,
+          body: params.seed.body,
+          changedFiles: seedChangedFiles,
+        },
+        candidate: {
+          title: candidateRow.title,
+          body: candidateRow.body,
+          changedFiles: this.getChangedFilesForPr(candidateRow.number),
+        },
+      });
+      const candidate = this.buildClusterCandidate(
+        prNumber,
+        "possible_same_cluster",
+        matchedBy,
+        undefined,
+        ["semantic_only_candidate"],
+        semanticScore,
+      );
+      if (!candidate) {
+        continue;
+      }
+      const evaluation = evaluateSemanticOnlyCandidate(candidate);
+      decisionTrace.push(...evaluation.decisionTrace);
+      if (evaluation.included) {
+        sameClusterCandidates.push(evaluation.included);
+        continue;
+      }
+      if (evaluation.excluded) {
+        nearbyButExcluded.push(evaluation.excluded);
+      }
+    }
+
+    return {
+      sameClusterCandidates,
+      nearbyButExcluded,
+      decisionTrace,
+    };
+  }
+
+  private async collectNearbyExcludedCandidates(params: {
+    nearbyNumbers: Map<number, ClusterMatchSource>;
+    sameClusterSet: Set<number>;
+    relevantPaths: {
+      relevantProdFiles: Set<string>;
+      relevantTestFiles: Set<string>;
+    };
+    clusterIssueNumbers: number[];
+    repo?: RepoRef;
+    source?: PullRequestDataSource;
+    refresh?: boolean;
+  }): Promise<{
+    nearbyButExcluded: ClusterExcludedCandidate[];
+    decisionTrace: ClusterDecisionTrace[];
+  }> {
+    const nearbyButExcluded: ClusterExcludedCandidate[] = [];
+    const decisionTrace: ClusterDecisionTrace[] = [];
+
+    for (const [prNumber, matchedBy] of params.nearbyNumbers) {
+      if (params.sameClusterSet.has(prNumber)) {
+        continue;
+      }
+      if (params.repo && params.source) {
+        await this.ensurePullRequestCached(
+          params.repo,
+          params.source,
+          prNumber,
+          params.refresh ?? false,
+        );
+      }
+      const candidate = this.buildClusterCandidate(prNumber, "same_cluster_candidate", matchedBy);
+      if (!candidate) {
+        continue;
+      }
+      const annotated = annotateRelevantCoverage(
+        candidate,
+        params.relevantPaths.relevantProdFiles,
+        params.relevantPaths.relevantTestFiles,
+        params.clusterIssueNumbers,
+      );
+      const excluded = classifyNearbyExcludedCandidate({
+        candidate: annotated,
+        clusterIssueNumbers: params.clusterIssueNumbers,
+      });
+      nearbyButExcluded.push(excluded);
+      decisionTrace.push(buildExcludedTrace(excluded));
+    }
+
+    return {
+      nearbyButExcluded,
+      decisionTrace,
+    };
+  }
+
+  private resolveMergeReadiness(
+    candidate: ClusterCandidate | null,
+    repoKey: string | null = null,
+  ): MergeReadiness | null {
+    if (!candidate) {
+      return null;
+    }
+    const repo = repoKey ?? this.getMeta(META_REPO) ?? "";
+    const latestReviewFact = repo ? this.getLatestReviewFact(candidate.prNumber, repo) : null;
+    const snapshot = this.db
+      .prepare(
+        `SELECT review_decision, merge_state_status, mergeable, status_rollup_json
+           FROM pr_fact_snapshots
+          WHERE pr_number = ?`,
+      )
+      .get(candidate.prNumber) as
+      | {
+          review_decision: string | null;
+          merge_state_status: string | null;
+          mergeable: string | null;
+          status_rollup_json: string;
+        }
+      | undefined;
+    return resolveMergeReadinessModel({
+      candidate,
+      latestReviewFact,
+      githubSnapshot: snapshot
+        ? {
+            reviewDecision: snapshot.review_decision,
+            mergeStateStatus: snapshot.merge_state_status,
+            mergeable: snapshot.mergeable,
+            statusChecks: JSON.parse(
+              snapshot.status_rollup_json,
+            ) as PullRequestFactRecord["statusChecks"],
+          }
+        : null,
+    });
+  }
+
   private getLabelsForPr(prNumber: number): string[] {
-    const rows = this.db
-      .prepare("SELECT label_name FROM pr_labels WHERE pr_number = ? ORDER BY label_name ASC")
-      .all(prNumber) as Array<{ label_name: string }>;
-    return rows.map((row) => row.label_name);
+    return getLabelsForPr(this.db, prNumber);
   }
 
   private getLabelsForIssue(issueNumber: number): string[] {
-    const rows = this.db
-      .prepare("SELECT label_name FROM issue_labels WHERE issue_number = ? ORDER BY label_name ASC")
-      .all(issueNumber) as Array<{ label_name: string }>;
-    return rows.map((row) => row.label_name);
+    return getLabelsForIssue(this.db, issueNumber);
   }
 
-  async show(prNumber: number): Promise<{
-    pr: SearchResult | null;
-    comments: Array<{
-      kind: string;
-      author: string;
-      createdAt: string;
-      url: string;
-      excerpt: string;
-    }>;
-  }> {
+  async show(prNumber: number): Promise<PullRequestShowResult> {
     await this.init();
     const pr = this.getPrRow(prNumber);
     if (!pr) {
@@ -1407,6 +2555,152 @@ export class PrIndexStore {
       pullRequest: payload.pr,
       issues: await this.searchIssues(query, limit),
     };
+  }
+
+  async clusterPullRequest(params: {
+    prNumber: number;
+    limit?: number;
+    ftsOnly?: boolean;
+    repo?: RepoRef;
+    repoKey?: string;
+    source?: PullRequestDataSource;
+    refresh?: boolean;
+  }): Promise<ClusterPullRequestAnalysis | null> {
+    await this.init();
+    await this.ensureDerivedIssueLinksBackfilled();
+    const limit = params.limit ?? DEFAULT_SEARCH_LIMIT;
+    if (params.repo && params.source) {
+      await this.ensurePullRequestCached(
+        params.repo,
+        params.source,
+        params.prNumber,
+        params.refresh ?? false,
+      );
+    }
+    const seed = this.getPrRow(params.prNumber);
+    if (!seed) {
+      return null;
+    }
+    const seedLinkedIssues = this.getLinkedIssuesForPr(params.prNumber).map(
+      (issue) => issue.issueNumber,
+    );
+    const localNearbyResults = await this.findRelatedPullRequests(params.prNumber, limit * 4, {
+      ftsOnly: params.ftsOnly,
+    });
+    const localNearbyNumbers = new Map<number, ClusterMatchSource>(
+      localNearbyResults.map((result) => [result.prNumber, "local_semantic"]),
+    );
+
+    if (seedLinkedIssues.length === 0) {
+      const decisionTrace = [
+        buildClusterDecisionTrace({
+          phase: "seed",
+          prNumber: seed.number,
+          matchedBy: null,
+          outcome: "semantic_only",
+          summary: "Seed PR has no exact linked issues; falling back to semantic-only clustering.",
+        }),
+      ];
+      const semanticNumbers = new Map<number, ClusterMatchSource>(localNearbyNumbers);
+      if (params.repo && params.source) {
+        const liveSemanticNumbers = await this.collectLiveSemanticCandidates(
+          params.repo,
+          params.source,
+          seed,
+          limit * 2,
+        );
+        for (const [prNumber, matchedBy] of liveSemanticNumbers) {
+          semanticNumbers.set(prNumber, semanticNumbers.get(prNumber) ?? matchedBy);
+        }
+      }
+      const semanticDecisionSet = await this.collectSemanticOnlyDecisionSet({
+        seed,
+        semanticNumbers,
+        repo: params.repo,
+        source: params.source,
+        refresh: params.refresh ?? false,
+      });
+      const sameClusterCandidates = semanticDecisionSet.sameClusterCandidates;
+      const nearbyButExcluded = semanticDecisionSet.nearbyButExcluded;
+      decisionTrace.push(...semanticDecisionSet.decisionTrace);
+      const orderedCandidates = orderSemanticOnlyCandidates(sameClusterCandidates, limit);
+      return buildSemanticOnlyClusterResult({
+        seed,
+        sameClusterCandidates: orderedCandidates,
+        nearbyButExcluded,
+        decisionTrace,
+        limit,
+      });
+    }
+
+    const linkedIssueCandidateSet = await this.collectLinkedIssueCandidateSet({
+      seed,
+      clusterIssueNumbers: seedLinkedIssues,
+      liveIssueSearchLimit: limit * 3,
+      repo: params.repo,
+      source: params.source,
+      refresh: params.refresh ?? false,
+    });
+    const rawCandidates = linkedIssueCandidateSet.rawCandidates;
+    const decisionTrace = [...linkedIssueCandidateSet.decisionTrace];
+    const relevantPaths = buildRelevantPathSets(params.prNumber, rawCandidates);
+    const rankedCandidates = rawCandidates
+      .map((candidate) =>
+        annotateRelevantCoverage(
+          candidate,
+          relevantPaths.relevantProdFiles,
+          relevantPaths.relevantTestFiles,
+          seedLinkedIssues,
+        ),
+      )
+      .sort((left, right) => rankClusterCandidates(seedLinkedIssues, left, right));
+
+    const rankedDecisionSet = rankClusterDecisionSet({
+      rankedCandidates,
+      limit,
+    });
+    const bestBase = rankedDecisionSet.bestBase;
+    const sameClusterCandidates = rankedDecisionSet.sameClusterCandidates;
+    decisionTrace.push(...rankedDecisionSet.decisionTrace);
+
+    const nearbyNumbers = new Map<number, ClusterMatchSource>(localNearbyNumbers);
+    if (params.repo && params.source && nearbyNumbers.size < limit) {
+      const liveSemanticNumbers = await this.collectLiveSemanticCandidates(
+        params.repo,
+        params.source,
+        seed,
+        limit * 2,
+      );
+      for (const [prNumber, matchedBy] of liveSemanticNumbers) {
+        nearbyNumbers.set(prNumber, nearbyNumbers.get(prNumber) ?? matchedBy);
+      }
+    }
+
+    const sameClusterSet = new Set(rankedCandidates.map((candidate) => candidate.prNumber));
+    const nearbyDecisionSet = await this.collectNearbyExcludedCandidates({
+      nearbyNumbers,
+      sameClusterSet,
+      relevantPaths,
+      clusterIssueNumbers: seedLinkedIssues,
+      repo: params.repo,
+      source: params.source,
+      refresh: params.refresh ?? false,
+    });
+    const nearbyButExcluded = nearbyDecisionSet.nearbyButExcluded;
+    decisionTrace.push(...nearbyDecisionSet.decisionTrace);
+    return buildLinkedIssueClusterResult({
+      seed,
+      clusterIssueNumbers: seedLinkedIssues,
+      bestBase,
+      sameClusterCandidates,
+      nearbyButExcluded,
+      mergeReadiness: this.resolveMergeReadiness(
+        bestBase,
+        params.repoKey ?? (params.repo ? this.repoKey(params.repo) : null),
+      ),
+      decisionTrace,
+      limit,
+    });
   }
 
   async listSemanticCorpusDocuments(): Promise<SemanticCorpusDocument[]> {
