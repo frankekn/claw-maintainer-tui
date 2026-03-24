@@ -1486,7 +1486,7 @@ describe("PrIndexStore", () => {
     );
   });
 
-  it("reuses cached linked-issue cluster evaluations across seeds in the same family", async () => {
+  it("reuses cached linked-issue cluster evaluations for the same seed and limit", async () => {
     const store = await createStore();
     const first = makePullRequest(39680, {
       title: "fix: stabilize retry budget accounting",
@@ -1520,10 +1520,92 @@ describe("PrIndexStore", () => {
     await store.clusterPullRequest({ prNumber: 39680, limit: 10, ftsOnly: true, repo, source });
     const issueSearchCallCount = source.searchCalls.filter((call) => call.query === "39600").length;
 
-    await store.clusterPullRequest({ prNumber: 39681, limit: 10, ftsOnly: true, repo, source });
+    await store.clusterPullRequest({ prNumber: 39680, limit: 10, ftsOnly: true, repo, source });
 
     expect(issueSearchCallCount).toBeGreaterThan(0);
     expect(source.searchCalls.filter((call) => call.query === "39600")).toHaveLength(
+      issueSearchCallCount,
+    );
+  });
+
+  it("does not reuse the linked-issue cluster cache across different limits", async () => {
+    const store = await createStore();
+    const first = makePullRequest(39684, {
+      title: "fix: stabilize cache limit handling",
+      body: "Closes #39602\nStabilize cache limit handling.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const second = makePullRequest(39685, {
+      title: "fix: stabilize cache limit handling follow-up",
+      body: "Closes #39602\nFollow-up cache limit handling fix.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([first, second]);
+    source.setSearchResults("39602", "open", [39684, 39685]);
+
+    await store.sync({ repo, source: new FakePullRequestDataSource([first, second]), full: true });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39684, {
+        headSha: "head-39684-a",
+        linkedIssues: [{ issueNumber: 39602, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/cache-limit.ts", kind: "prod" }],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39685, {
+        headSha: "head-39685-a",
+        linkedIssues: [{ issueNumber: 39602, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/cache-limit.ts", kind: "prod" }],
+      }),
+    );
+
+    await store.clusterPullRequest({ prNumber: 39684, limit: 5, ftsOnly: true, repo, source });
+    const issueSearchCallCount = source.searchCalls.filter((call) => call.query === "39602").length;
+
+    await store.clusterPullRequest({ prNumber: 39684, limit: 10, ftsOnly: true, repo, source });
+
+    expect(source.searchCalls.filter((call) => call.query === "39602").length).toBeGreaterThan(
+      issueSearchCallCount,
+    );
+  });
+
+  it("does not reuse the linked-issue cluster cache across different seeds in the same family", async () => {
+    const store = await createStore();
+    const first = makePullRequest(39686, {
+      title: "fix: stabilize sibling cluster seed coverage",
+      body: "Closes #39603\nFirst sibling cluster seed coverage fix.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const second = makePullRequest(39687, {
+      title: "fix: stabilize sibling cluster seed coverage follow-up",
+      body: "Closes #39603\nSecond sibling cluster seed coverage fix.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([first, second]);
+    source.setSearchResults("39603", "open", [39686, 39687]);
+
+    await store.sync({ repo, source: new FakePullRequestDataSource([first, second]), full: true });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39686, {
+        headSha: "head-39686-a",
+        linkedIssues: [{ issueNumber: 39603, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/seed-a.ts", kind: "prod" }],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39687, {
+        headSha: "head-39687-a",
+        linkedIssues: [{ issueNumber: 39603, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/seed-b.ts", kind: "prod" }],
+      }),
+    );
+
+    await store.clusterPullRequest({ prNumber: 39686, limit: 10, ftsOnly: true, repo, source });
+    const issueSearchCallCount = source.searchCalls.filter((call) => call.query === "39603").length;
+
+    await store.clusterPullRequest({ prNumber: 39687, limit: 10, ftsOnly: true, repo, source });
+
+    expect(source.searchCalls.filter((call) => call.query === "39603").length).toBeGreaterThan(
       issueSearchCallCount,
     );
   });

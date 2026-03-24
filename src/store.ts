@@ -2756,15 +2756,17 @@ export class PrIndexStore {
 
   private buildLinkedIssueClusterCacheKey(
     repoKey: string,
+    seedPrNumber: number,
     clusterIssueNumbers: number[],
     bundles: Map<number, ClusterInputBundle>,
+    limit: number,
   ): string {
     const issueKey = [...clusterIssueNumbers].sort((left, right) => left - right).join(",");
     const memberSignature = Array.from(bundles.values())
       .sort((left, right) => left.pr.number - right.pr.number)
       .map((bundle) => `${bundle.pr.number}@${bundle.headSha ?? bundle.pr.updated_at}`)
       .join("|");
-    return `${repoKey}:${issueKey}:${memberSignature}`;
+    return `${repoKey}:${seedPrNumber}:${limit}:${issueKey}:${memberSignature}`;
   }
 
   private async computeLinkedIssueClusterEvaluation(params: {
@@ -2785,8 +2787,10 @@ export class PrIndexStore {
     let bundles = this.loadClusterInputs(Array.from(exactMatches.keys()));
     const initialCacheKey = this.buildLinkedIssueClusterCacheKey(
       params.repoKey,
+      params.seed.number,
       params.clusterIssueNumbers,
       bundles,
+      params.limit,
     );
     const cached = !params.refresh ? this.linkedIssueClusterCache.get(initialCacheKey) : undefined;
     if (cached) {
@@ -2891,7 +2895,13 @@ export class PrIndexStore {
       sameClusterCandidates: rankedDecisionSet.sameClusterCandidates,
     };
     this.linkedIssueClusterCache.set(
-      this.buildLinkedIssueClusterCacheKey(params.repoKey, params.clusterIssueNumbers, bundles),
+      this.buildLinkedIssueClusterCacheKey(
+        params.repoKey,
+        params.seed.number,
+        params.clusterIssueNumbers,
+        bundles,
+        params.limit,
+      ),
       cacheEntry,
     );
     return cacheEntry;
