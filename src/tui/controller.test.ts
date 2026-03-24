@@ -564,6 +564,50 @@ describe("TuiController", () => {
     expect(model.detailPane.lines.join("\n")).toContain("CLUSTER");
   });
 
+  it("starts Sparse Extras collapsed and can expand it in detail", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.openSelected();
+
+    let model = controller.getRenderModel();
+    expect(model.detailPane.lines.join("\n")).toContain("SPARSE EXTRAS");
+    expect(model.detailPane.lines.join("\n")).toContain("[collapsed]");
+    expect(model.detailPane.lines.join("\n")).not.toContain("recent_comments");
+
+    controller.focusNext();
+    await controller.dispatch({ type: "toggle_detail_section_fold" });
+
+    model = controller.getRenderModel();
+    expect(model.detailPane.lines.join("\n")).toContain("recent_comments");
+    expect(model.footer.message).toContain("Sparse Extras expanded");
+  });
+
+  it("collapses the focused linked-issues section from detail focus", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.crossReferenceSelected();
+    controller.focusNext();
+    await controller.dispatch({ type: "toggle_detail_section_fold" });
+
+    const model = controller.getRenderModel();
+    expect(model.detailPane.lines.join("\n")).toContain("LINKED ISSUES");
+    expect(model.detailPane.lines.join("\n")).toContain("[collapsed]");
+    expect(model.detailPane.lines.join("\n")).not.toContain("Issue #41789");
+    expect(model.footer.message).toContain("Linked Issues collapsed");
+  });
+
   it("toggles detail fullscreen and resizes split detail panes", async () => {
     const service = new FakeTuiDataService();
     const controller = new TuiController(service, {

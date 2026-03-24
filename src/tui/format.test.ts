@@ -280,9 +280,19 @@ describe("tui formatting", () => {
     expect(detail.lines.join("\n")).toContain("WHY PRIORITIZED");
     expect(detail.lines.join("\n")).toContain("LINKED ISSUES");
     expect(detail.lines.join("\n")).toContain("MAINTAINER STATE");
+    expect(detail.lines.join("\n")).toContain("SPARSE EXTRAS");
     expect(detail.lines.join("\n")).toContain("best base");
     expect(detail.lines.join("\n")).toContain("excluded");
     expect(detail.anchorLine).not.toBeNull();
+
+    const collapsed = formatPriorityPrDetail(makeBundle(), "sparse-extras", {
+      "sparse-extras": true,
+      "linked-issues": true,
+    });
+    expect(collapsed.lines.join("\n")).toContain("SPARSE EXTRAS");
+    expect(collapsed.lines.join("\n")).toContain("[collapsed]");
+    expect(collapsed.lines.join("\n")).not.toContain("recent_comments");
+    expect(collapsed.lines.join("\n")).not.toContain("Issue 41789");
   });
 
   it("formats Inbox landing copy and mode tabs", () => {

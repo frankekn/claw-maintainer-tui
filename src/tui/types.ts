@@ -34,7 +34,9 @@ export type TuiDetailSection =
   | "linked-issues"
   | "related-prs"
   | "cluster"
-  | "maintainer-state";
+  | "maintainer-state"
+  | "sparse-extras";
+export type TuiDetailFoldState = Partial<Record<TuiDetailSection, boolean>>;
 
 export type TuiModeMeta = {
   id: TuiMode;
@@ -222,6 +224,7 @@ export type TuiDetailState = {
   identity: string | null;
   focusSection: TuiDetailSection | null;
   anchorKey: string | null;
+  foldedSections: TuiDetailFoldState;
 };
 
 export type TuiSessionState = {
@@ -274,6 +277,7 @@ export type TuiCommand =
   | { type: "toggle_detail" }
   | { type: "toggle_detail_layout" }
   | { type: "resize_detail"; delta: -1 | 1 }
+  | { type: "toggle_detail_section_fold" }
   | { type: "expand_cluster" }
   | { type: "jump_detail_section"; section: Extract<TuiDetailSection, "linked-issues" | "cluster"> }
   | { type: "toggle_help" }

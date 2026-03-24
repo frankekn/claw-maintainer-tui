@@ -66,6 +66,9 @@ export function resolveKeyAction(
     if (key.name === "tab") {
       return { kind: "command", command: { type: "focus_next" } };
     }
+    if (key.name === "space") {
+      return { kind: "command", command: { type: "toggle_detail_section_fold" } };
+    }
     if (key.name === "up" || key.name === "k") {
       return { kind: "detail-scroll", delta: -1 };
     }

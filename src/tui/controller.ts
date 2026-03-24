@@ -39,6 +39,7 @@ import type {
   TuiBanner,
   TuiCommand,
   TuiContext,
+  TuiDetailFoldState,
   TuiDetailState,
   TuiDetailSection,
   TuiFocus,
@@ -335,13 +336,34 @@ export class TuiController {
     this.detailState.focusSection = value;
   }
 
+  private get detailFoldedSections(): TuiDetailFoldState {
+    return this.detailState.foldedSections;
+  }
+
+  private set detailFoldedSections(value: TuiDetailFoldState) {
+    this.detailState.foldedSections = value;
+  }
+
   private resetDetailState(mode = this.mode): void {
     this.detailRequestId += 1;
     this.detailState = createLandingDetailState(mode, this.statusSnapshot);
   }
 
   private setDetailPayload(next: TuiDetailState): void {
-    this.detailState = next;
+    const foldedSections =
+      next.payload.kind === "pr"
+        ? next.identity === this.detailState.identity
+          ? {
+              ...defaultFoldedSections(next.payload),
+              ...this.detailState.foldedSections,
+              ...next.foldedSections,
+            }
+          : {
+              ...defaultFoldedSections(next.payload),
+              ...next.foldedSections,
+            }
+        : next.foldedSections;
+    this.detailState = { ...next, foldedSections };
   }
 
   async initialize(): Promise<void> {
@@ -415,6 +437,9 @@ export class TuiController {
         return;
       case "resize_detail":
         this.resizeDetail(command.delta);
+        return;
+      case "toggle_detail_section_fold":
+        this.toggleCurrentDetailSectionFold();
         return;
       case "expand_cluster":
         await this.expandSelectedCluster();
@@ -891,7 +916,7 @@ export class TuiController {
     this.browseLimit = snapshot.session.browseLimit;
     this.detailLayoutMode = snapshot.session.detailLayoutMode;
     this.detailWidthIndex = snapshot.session.detailWidthIndex;
-    this.setDetailPayload(snapshot.detail);
+    this.detailState = snapshot.detail;
     this.errorMessage = null;
     this.focus = "results";
     this.message = "Returned to previous view.";
@@ -927,6 +952,25 @@ export class TuiController {
     }
     this.detailWidthIndex = nextIndex;
     this.message = `Detail width ${DETAIL_WIDTH_PRESETS[nextIndex]?.label ?? ""}.`;
+    this.emit();
+  }
+
+  toggleCurrentDetailSectionFold(): void {
+    if (!this.showDetail) {
+      return;
+    }
+    const section = currentFoldableSection(this.detailState);
+    if (!section) {
+      return;
+    }
+    const nextFolded = !this.detailFoldedSections[section];
+    this.detailFoldedSections = {
+      ...this.detailFoldedSections,
+      [section]: nextFolded,
+    };
+    this.detailFocusSection = section;
+    this.detailAnchorKey = `${this.detailIdentity ?? "detail"}:${section}:${++this.detailAnchorNonce}`;
+    this.message = `${detailSectionLabel(section)} ${nextFolded ? "collapsed" : "expanded"}.`;
     this.emit();
   }
 
@@ -1272,6 +1316,7 @@ export class TuiController {
           anchorKey: focusSection
             ? `pr:${bundle.candidate.pr.prNumber}:${focusSection}:${++this.detailAnchorNonce}`
             : null,
+          foldedSections: {},
         });
         this.context = { kind: "pr", prNumber: bundle.candidate.pr.prNumber };
         this.activeUrl = bundle.candidate.pr.url;
@@ -1294,6 +1339,7 @@ export class TuiController {
           status: `${row.cluster.statusLabel} · ${row.cluster.openPrCount} open / ${row.cluster.totalPrCount} total`,
           focusSection: targetSection,
           anchorKey: `${row.cluster.clusterKey}:${targetSection}:${++this.detailAnchorNonce}`,
+          foldedSections: {},
         });
         this.context = { kind: "pr", prNumber: bundle.candidate.pr.prNumber };
         this.activeUrl = row.cluster.representative.pr.url;
@@ -1313,6 +1359,7 @@ export class TuiController {
           status: `Freshness: ${this.rowFreshness(row).toUpperCase()}`,
           focusSection: null,
           anchorKey: null,
+          foldedSections: {},
         });
         this.context = { kind: "issue", issueNumber: issue.issueNumber };
         this.activeUrl = issue.url;
@@ -1328,6 +1375,7 @@ export class TuiController {
           status: null,
           focusSection: null,
           anchorKey: null,
+          foldedSections: {},
         });
         this.activeUrl = null;
         this.emit();
@@ -1768,5 +1816,58 @@ export class TuiController {
     for (const listener of this.listeners) {
       listener();
     }
+  }
+}
+
+function defaultFoldedSections(payload: TuiDetailState["payload"]): TuiDetailFoldState {
+  if (
+    payload.kind !== "pr" ||
+    (!payload.bundle.comments.length &&
+      !payload.bundle.latestReviewFact &&
+      !payload.bundle.mergeReadiness)
+  ) {
+    return {};
+  }
+  return { "sparse-extras": true };
+}
+
+function currentFoldableSection(detail: TuiDetailState): TuiDetailSection | null {
+  if (detail.payload.kind !== "pr") {
+    return null;
+  }
+  if (
+    detail.focusSection &&
+    ["linked-issues", "related-prs", "cluster", "maintainer-state", "sparse-extras"].includes(
+      detail.focusSection,
+    )
+  ) {
+    return detail.focusSection;
+  }
+  if (
+    detail.payload.bundle.comments.length > 0 ||
+    detail.payload.bundle.latestReviewFact ||
+    detail.payload.bundle.mergeReadiness
+  ) {
+    return "sparse-extras";
+  }
+  return null;
+}
+
+function detailSectionLabel(section: TuiDetailSection): string {
+  switch (section) {
+    case "linked-issues":
+      return "Linked Issues";
+    case "related-prs":
+      return "Related PRs";
+    case "cluster":
+      return "Cluster";
+    case "maintainer-state":
+      return "Maintainer State";
+    case "sparse-extras":
+      return "Sparse Extras";
+    case "summary":
+      return "Summary";
+    default:
+      return "Section";
   }
 }

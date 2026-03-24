@@ -37,6 +37,7 @@ function buildGlobalKeys(): TuiAction[] {
     { id: "detail", label: "Focus", shortcut: "Tab", enabled: true },
     { id: "detail", label: "Zoom", shortcut: "z", enabled: true },
     { id: "detail", label: "Resize", shortcut: "[ ]", enabled: true },
+    { id: "detail", label: "Fold", shortcut: "Space", enabled: true },
     { id: "detail", label: "Help", shortcut: "?", enabled: true },
     { id: "detail", label: "Quit", shortcut: "q", enabled: true },
   ];
@@ -138,6 +139,7 @@ export function buildRenderModel(
     identity: detail.identity,
     anchorKey: detail.anchorKey,
     focusSection: detail.focusSection,
+    foldedSections: detail.foldedSections,
   });
   const globalKeys = buildGlobalKeys();
   const banner = buildBanner(session, options);

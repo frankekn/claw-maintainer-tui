@@ -47,6 +47,7 @@ export function createLandingDetailState(
     identity: mode === "status" ? "status" : `landing:${mode}`,
     focusSection: null,
     anchorKey: null,
+    foldedSections: {},
   };
 }
 
@@ -99,6 +100,7 @@ export function createViewSnapshot(
       identity: detail.identity,
       focusSection: detail.focusSection,
       anchorKey: detail.anchorKey,
+      foldedSections: detail.foldedSections,
     },
   };
 }

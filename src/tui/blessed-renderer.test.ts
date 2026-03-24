@@ -211,6 +211,25 @@ describe("BlessedTuiRenderer", () => {
     });
   });
 
+  it("routes space to detail section folding when detail is focused", async () => {
+    const controller = createControllerStub();
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness;
+    renderers.push(harness);
+
+    renderModel.focus = "detail";
+    renderModel.detailPane.visible = true;
+
+    await harness.handleKeypress(" ", { name: "space" } as blessed.Widgets.Events.IKeyEventArg);
+
+    expect(controller.dispatch).toHaveBeenCalledWith({
+      type: "toggle_detail_section_fold",
+    });
+
+    renderModel.focus = "results";
+    renderModel.detailPane.visible = false;
+  });
+
   it("deduplicates enter and return keypresses fired back-to-back", async () => {
     const controller = createControllerStub();
     const renderer = new BlessedTuiRenderer(controller as never);
