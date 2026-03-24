@@ -237,7 +237,7 @@ describe("tui formatting", () => {
     expect(detail.join("\n")).toContain("Press e to expand");
     expect(detail.join("\n")).toContain("v / w / i / u");
 
-    const tabs = formatModeTabs("inbox", "nav");
+    const tabs = formatModeTabs("inbox", "results");
     expect(tabs).toContain("Inbox");
     expect(tabs).toContain("Watchlist");
     expect(tabs).toContain("Explore");

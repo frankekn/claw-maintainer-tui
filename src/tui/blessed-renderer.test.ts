@@ -20,10 +20,19 @@ const renderModel: TuiRenderModel = {
   footer: {
     hintText: "",
     message: "Ready.",
+    banner: null,
     queryPrompt: "Inbox",
     queryValue: "",
+    queryPlaceholder: "Browse-only mode",
+    queryHelpText: "Browse-only mode",
     actions: [],
+    keys: [],
     autoUpdateHint: null,
+  },
+  helpOverlay: {
+    visible: false,
+    title: "Inbox Help",
+    lines: [],
   },
   mode: "inbox",
   focus: "results",
@@ -47,7 +56,6 @@ const renderModel: TuiRenderModel = {
   activeUrl: null,
   query: "",
   context: null,
-  queryPlaceholder: "",
   busy: false,
 };
 
@@ -180,7 +188,7 @@ describe("BlessedTuiRenderer", () => {
     expect(controller.reportError).toHaveBeenCalledWith("detail boom", "UI action");
   });
 
-  it("stops the spinner and disposes the controller when destroyed", async () => {
+  it("disposes the controller when destroyed during inline busy state", async () => {
     const controller = createControllerStub();
     controller.getRenderModel.mockReturnValue({
       ...renderModel,
@@ -193,7 +201,7 @@ describe("BlessedTuiRenderer", () => {
     const renderer = new BlessedTuiRenderer(controller as never);
     const harness = renderer as unknown as RendererHarness & {
       screen: blessed.Widgets.Screen;
-      spinnerInterval: NodeJS.Timeout | null;
+      helpBox: blessed.Widgets.BoxElement;
     };
     renderers.push(harness);
     const runPromise = renderer.run();
@@ -201,7 +209,7 @@ describe("BlessedTuiRenderer", () => {
     harness.screen.destroy();
     await runPromise;
 
-    expect(harness.spinnerInterval).toBeNull();
+    expect(harness.helpBox.hidden).toBe(true);
     expect(controller.dispose).toHaveBeenCalledTimes(1);
   });
 

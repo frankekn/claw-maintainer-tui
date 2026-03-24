@@ -15,12 +15,20 @@ export function createInitialSessionState(resultLimit: number): TuiSessionState 
     selectedIndex: 0,
     activeUrl: null,
     query: "",
+    queryState: {
+      "cross-search": { value: "", history: [], historyIndex: null },
+      "pr-search": { value: "", history: [], historyIndex: null },
+      "issue-search": { value: "", history: [], historyIndex: null },
+    },
     context: null,
     resultTitle: "Inbox",
     message: "Loading Inbox...",
     errorMessage: null,
     browseLimit: resultLimit,
     isLandingView: false,
+    banner: null,
+    bannerHidden: false,
+    helpVisible: false,
     history: [],
   };
 }
@@ -40,7 +48,7 @@ export function createLandingDetailState(
 }
 
 export function availableFocuses(session: TuiSessionState, detail: TuiDetailState): TuiFocus[] {
-  const focuses: TuiFocus[] = ["nav", "results"];
+  const focuses: TuiFocus[] = ["results"];
   if (detail.visible) {
     focuses.push("detail");
   }
@@ -72,6 +80,10 @@ export function createViewSnapshot(
       errorMessage: session.errorMessage,
       browseLimit: session.browseLimit,
       isLandingView: session.isLandingView,
+      queryState: session.queryState,
+      banner: session.banner,
+      bannerHidden: session.bannerHidden,
+      helpVisible: session.helpVisible,
     },
     detail: {
       visible: detail.visible,

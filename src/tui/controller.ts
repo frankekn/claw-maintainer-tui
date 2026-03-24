@@ -36,6 +36,7 @@ import type {
 import type {
   TuiAction,
   TuiActionId,
+  TuiBanner,
   TuiCommand,
   TuiContext,
   TuiDetailState,
@@ -193,6 +194,30 @@ export class TuiController {
     this.sessionState.query = value;
   }
 
+  private get banner(): TuiBanner | null {
+    return this.sessionState.banner;
+  }
+
+  private set banner(value: TuiBanner | null) {
+    this.sessionState.banner = value;
+  }
+
+  private get bannerHidden(): boolean {
+    return this.sessionState.bannerHidden;
+  }
+
+  private set bannerHidden(value: boolean) {
+    this.sessionState.bannerHidden = value;
+  }
+
+  private get helpVisible(): boolean {
+    return this.sessionState.helpVisible;
+  }
+
+  private set helpVisible(value: boolean) {
+    this.sessionState.helpVisible = value;
+  }
+
   private get context(): TuiContext {
     return this.sessionState.context;
   }
@@ -322,6 +347,13 @@ export class TuiController {
   reportError(message: string, context = "Operation"): void {
     this.errorMessage = message;
     this.message = `${context} failed.`;
+    this.banner = {
+      tone: "error",
+      message: `${context} failed: ${message}`,
+      actions: ["Esc dismiss"],
+      dismissible: true,
+    };
+    this.bannerHidden = false;
     this.emit();
   }
 
@@ -344,6 +376,9 @@ export class TuiController {
       case "activate_mode":
         this.moveMode(command.delta);
         return;
+      case "activate_mode_index":
+        this.activateModeByIndex(command.index);
+        return;
       case "move_selection":
         this.moveSelection(command.delta);
         return;
@@ -360,6 +395,12 @@ export class TuiController {
         }
         await this.clusterSelected();
         return;
+      case "toggle_help":
+        this.toggleHelp();
+        return;
+      case "dismiss_banner":
+        this.dismissBanner();
+        return;
       case "start_query":
         this.startQueryEntry();
         return;
@@ -372,11 +413,14 @@ export class TuiController {
       case "backspace_query":
         this.backspaceQuery();
         return;
+      case "query_history_prev":
+        this.moveQueryHistory(-1);
+        return;
+      case "query_history_next":
+        this.moveQueryHistory(1);
+        return;
       case "submit_query":
         await this.submitCurrentQuery();
-        return;
-      case "trigger_action":
-        await this.triggerAction(command.slot);
         return;
       case "go_back":
         this.goBack();
@@ -415,7 +459,7 @@ export class TuiController {
   }
 
   isNavFocus(): boolean {
-    return this.focus === "nav";
+    return false;
   }
 
   isDetailFocus(): boolean {
@@ -449,9 +493,12 @@ export class TuiController {
     this.detailAutoRefreshInFlight = false;
     this.context = null;
     this.activeUrl = null;
-    this.query = "";
+    this.query = this.queryForMode(mode);
     this.browseLimit = this.resultLimit;
     this.errorMessage = null;
+    this.banner = null;
+    this.bannerHidden = false;
+    this.helpVisible = false;
     this.isLandingView = false;
     this.resultTitle = this.modeLabel(mode);
     this.message = this.isListMode(mode)
@@ -472,10 +519,19 @@ export class TuiController {
     }
   }
 
+  activateModeByIndex(index: number): void {
+    const target = TUI_MODE_ORDER[index];
+    if (!target) {
+      return;
+    }
+    this.activateMode(target.id);
+  }
+
   startQueryEntry(): void {
     if (!this.isQueryMode(this.mode)) {
       return;
     }
+    this.helpVisible = false;
     this.focus = "query";
     this.emit();
   }
@@ -488,6 +544,9 @@ export class TuiController {
     if (this.focus !== "query") {
       return;
     }
+    if (this.isQueryMode(this.mode)) {
+      this.syncQueryState(this.mode, this.query);
+    }
     this.focus = "results";
     this.emit();
   }
@@ -497,6 +556,9 @@ export class TuiController {
       return;
     }
     this.query += value;
+    if (this.isQueryMode(this.mode)) {
+      this.syncQueryState(this.mode, this.query);
+    }
     this.emit();
   }
 
@@ -505,6 +567,25 @@ export class TuiController {
       return;
     }
     this.query = this.query.slice(0, -1);
+    if (this.isQueryMode(this.mode)) {
+      this.syncQueryState(this.mode, this.query);
+    }
+    this.emit();
+  }
+
+  moveQueryHistory(delta: -1 | 1): void {
+    if (this.focus !== "query" || !this.isQueryMode(this.mode)) {
+      return;
+    }
+    const state = this.sessionState.queryState[this.mode];
+    if (state.history.length === 0) {
+      return;
+    }
+    const currentIndex = state.historyIndex ?? state.history.length;
+    const nextIndex = Math.max(0, Math.min(state.history.length, currentIndex + delta));
+    state.historyIndex = nextIndex;
+    this.query =
+      nextIndex === state.history.length ? state.value : (state.history[nextIndex] ?? "");
     this.emit();
   }
 
@@ -519,10 +600,6 @@ export class TuiController {
   }
 
   moveSelection(delta: number): void {
-    if (this.focus === "nav") {
-      this.moveMode(delta);
-      return;
-    }
     if (this.focus !== "results" || this.rows.length === 0) {
       return;
     }
@@ -540,13 +617,50 @@ export class TuiController {
     this.activateMode(TUI_MODE_ORDER[nextIndex]!.id);
   }
 
+  toggleHelp(): void {
+    this.helpVisible = !this.helpVisible;
+    this.bannerHidden = false;
+    this.emit();
+  }
+
+  dismissBanner(): void {
+    this.bannerHidden = true;
+    this.helpVisible = false;
+    this.emit();
+  }
+
+  private queryForMode(mode: TuiMode): string {
+    return this.isQueryMode(mode) ? this.sessionState.queryState[mode].value : "";
+  }
+
+  private syncQueryState(mode: SearchMode, value: string): void {
+    const state = this.sessionState.queryState[mode];
+    state.value = value;
+    if (state.historyIndex !== null && state.historyIndex >= state.history.length) {
+      state.historyIndex = state.history.length;
+    }
+  }
+
+  private pushQueryHistory(mode: SearchMode, value: string): void {
+    if (!value) {
+      this.sessionState.queryState[mode].historyIndex = null;
+      return;
+    }
+    const state = this.sessionState.queryState[mode];
+    state.history = [value, ...state.history.filter((item) => item !== value)].slice(0, 12);
+    state.historyIndex = null;
+  }
+
   async submitQuery(value: string): Promise<void> {
     if (!this.isQueryMode(this.mode)) {
       return;
     }
     const mode = this.mode;
     this.query = value.trim();
+    this.syncQueryState(mode, this.query);
     this.errorMessage = null;
+    this.banner = null;
+    this.bannerHidden = false;
     this.isLandingView = false;
     this.resetDetailState(this.mode);
     this.activeUrl = null;
@@ -560,6 +674,7 @@ export class TuiController {
       if (requestId !== this.listRequestId || this.mode !== mode) {
         return;
       }
+      this.pushQueryHistory(mode, this.query);
       this.applyListResult(result);
       this.context = null;
       this.emit();
@@ -582,60 +697,6 @@ export class TuiController {
     this.showDetail = true;
     this.isLandingView = false;
     await this.refreshDetailForSelection(true, row.kind === "priority-cluster" ? "cluster" : null);
-  }
-
-  async triggerAction(slot: number): Promise<void> {
-    const action = this.buildActions().find((item) => item.slot === slot && item.enabled);
-    if (!action) {
-      return;
-    }
-    switch (action.id) {
-      case "query":
-        this.startQueryEntry();
-        return;
-      case "detail":
-        await this.openSelected();
-        return;
-      case "expand-cluster":
-        await this.expandSelectedCluster();
-        return;
-      case "jump-linked-issues":
-        await this.crossReferenceSelected();
-        return;
-      case "cluster":
-        await this.clusterSelected();
-        return;
-      case "mark-seen":
-        await this.markSeenSelected();
-        return;
-      case "toggle-watch":
-        await this.toggleWatchSelected();
-        return;
-      case "toggle-ignore":
-        await this.toggleIgnoreSelected();
-        return;
-      case "clear-state":
-        await this.clearSelectedAttentionState();
-        return;
-      case "sync-prs":
-        await this.syncPrs();
-        return;
-      case "sync-issues":
-        await this.syncIssues();
-        return;
-      case "refresh":
-        await this.refreshSelected();
-        return;
-      case "load-more":
-        await this.loadMore();
-        return;
-      case "back":
-        this.goBack();
-        return;
-      case "open-url":
-      default:
-        return;
-    }
   }
 
   async crossReferenceSelected(): Promise<void> {
@@ -796,6 +857,13 @@ export class TuiController {
       return;
     }
     this.message = message;
+    this.banner = {
+      tone: "success",
+      message,
+      actions: ["Esc dismiss"],
+      dismissible: true,
+    };
+    this.bannerHidden = false;
     await this.refreshActiveListPreservingUi();
   }
 
@@ -843,76 +911,74 @@ export class TuiController {
         : row?.kind === "priority-cluster"
           ? this.clusterAttentionState(row) !== "new"
           : false;
+    const canOpenUrl = Boolean(this.getActiveUrl());
 
     switch (this.mode) {
       case "inbox":
       case "watchlist":
         return [
-          this.action(1, "detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
+          this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
           this.action(
-            2,
             row?.kind === "priority-cluster" ? "expand-cluster" : "jump-linked-issues",
             row?.kind === "priority-cluster" ? "Expand" : "Linked",
             row?.kind === "priority-cluster" ? "e" : "x",
             row?.kind === "priority-cluster" ? canExpand : canLinked,
           ),
-          this.action(3, "cluster", "Cluster", "c", canCluster),
-          this.action(4, "mark-seen", "Seen", "v", canTriage),
-          this.action(5, "toggle-watch", "Watch", "w", canTriage),
-          this.action(6, "toggle-ignore", "Ignore", "i", canTriage),
-          this.action(7, "clear-state", "Clear", "u", hasLocalState),
-          this.action(8, "load-more", "More", "m", this.canLoadMore()),
+          this.action("cluster", "Cluster", "c", canCluster),
+          this.action("mark-seen", "Seen", "v", canTriage),
+          this.action("toggle-watch", "Watch", "w", canTriage),
+          this.action("toggle-ignore", "Ignore", "i", canTriage),
+          this.action("clear-state", "Clear", "u", hasLocalState),
+          this.action("load-more", "More", "m", this.canLoadMore()),
+          this.action("open-url", "Open URL", "o", canOpenUrl),
         ];
       case "cross-search":
         return [
-          this.action(1, "query", "Search", "/"),
-          this.action(2, "detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
-          this.action(3, "jump-linked-issues", "Linked", "x", canLinked),
-          this.action(4, "cluster", "Cluster", "c", canCluster),
-          this.action(5, "sync-prs", "Sync PRs", "s"),
-          this.action(6, "sync-issues", "Sync Issues", "S"),
-          this.action(7, "refresh", "Refresh", "r", canRefresh),
-          this.action(8, "load-more", "More", "m", this.canLoadMore()),
+          this.action("query", "Search", "/"),
+          this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
+          this.action("jump-linked-issues", "Linked", "x", canLinked),
+          this.action("cluster", "Cluster", "c", canCluster),
+          this.action("sync-prs", "Sync PRs", "s"),
+          this.action("sync-issues", "Sync Issues", "S"),
+          this.action("refresh", "Refresh", "r", canRefresh),
+          this.action("load-more", "More", "m", this.canLoadMore()),
+          this.action("open-url", "Open URL", "o", canOpenUrl),
         ];
       case "pr-search":
         return [
-          this.action(1, "query", "Search", "/"),
-          this.action(2, "detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
-          this.action(3, "jump-linked-issues", "Linked", "x", canLinked),
-          this.action(4, "cluster", "Cluster", "c", canCluster),
-          this.action(5, "mark-seen", "Seen", "v", canTriage),
-          this.action(6, "toggle-watch", "Watch", "w", canTriage),
-          this.action(7, "refresh", "Refresh", "r", canRefresh),
-          this.action(8, "load-more", "More", "m", this.canLoadMore()),
+          this.action("query", "Search", "/"),
+          this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
+          this.action("jump-linked-issues", "Linked", "x", canLinked),
+          this.action("cluster", "Cluster", "c", canCluster),
+          this.action("mark-seen", "Seen", "v", canTriage),
+          this.action("toggle-watch", "Watch", "w", canTriage),
+          this.action("refresh", "Refresh", "r", canRefresh),
+          this.action("load-more", "More", "m", this.canLoadMore()),
+          this.action("open-url", "Open URL", "o", canOpenUrl),
         ];
       case "issue-search":
         return [
-          this.action(1, "query", "Search", "/"),
-          this.action(2, "detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
-          this.action(3, "sync-issues", "Sync Issues", "S"),
-          this.action(4, "refresh", "Refresh", "r", canRefresh),
-          this.action(5, "back", "Back", "b", hasHistory),
-          this.action(6, "load-more", "More", "m", this.canLoadMore()),
+          this.action("query", "Search", "/"),
+          this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
+          this.action("sync-issues", "Sync Issues", "S"),
+          this.action("refresh", "Refresh", "r", canRefresh),
+          this.action("back", "Back", "b", hasHistory),
+          this.action("load-more", "More", "m", this.canLoadMore()),
+          this.action("open-url", "Open URL", "o", canOpenUrl),
         ];
       case "status":
         return [
-          this.action(1, "sync-prs", "Sync PRs", "s"),
-          this.action(2, "sync-issues", "Sync Issues", "S"),
-          this.action(3, "back", "Back", "b", hasHistory),
+          this.action("sync-prs", "Sync PRs", "s"),
+          this.action("sync-issues", "Sync Issues", "S"),
+          this.action("back", "Back", "b", hasHistory),
         ];
       default:
         return [];
     }
   }
 
-  private action(
-    slot: number,
-    id: TuiActionId,
-    label: string,
-    shortcut: string,
-    enabled = true,
-  ): TuiAction {
-    return { slot, id, label, shortcut, enabled };
+  private action(id: TuiActionId, label: string, shortcut: string, enabled = true): TuiAction {
+    return { id, label, shortcut, enabled };
   }
 
   private pushHistory(): void {
@@ -1143,12 +1209,20 @@ export class TuiController {
     }
     this.busyMessage = label;
     this.errorMessage = null;
+    this.bannerHidden = false;
     this.emit();
     try {
       await task();
     } catch (error) {
       this.errorMessage = error instanceof Error ? error.message : String(error);
       this.message = "Operation failed.";
+      this.banner = {
+        tone: "error",
+        message: `${label} failed: ${this.errorMessage}`,
+        actions: ["Esc dismiss"],
+        dismissible: true,
+      };
+      this.bannerHidden = false;
     } finally {
       this.busyMessage = null;
       this.emit();
