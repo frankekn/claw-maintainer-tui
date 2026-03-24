@@ -813,7 +813,7 @@ export class TuiController {
       return;
     }
     if (row.kind === "cluster-candidate" || row.kind === "cluster-excluded") {
-      this.toggleClusterExcludedRows();
+      await this.toggleClusterExcludedRows();
       return;
     }
     if (!isPriorityDetailRow(row)) {
@@ -945,7 +945,10 @@ export class TuiController {
     this.clusterWorkspace = snapshot.session.clusterWorkspace;
     this.detailState = snapshot.detail;
     this.errorMessage = null;
-    this.focus = "results";
+    this.focus =
+      snapshot.detail.visible && snapshot.session.detailLayoutMode === "detail-fullscreen"
+        ? "detail"
+        : "results";
     this.message = "Returned to previous view.";
     this.emit();
   }
@@ -1034,7 +1037,7 @@ export class TuiController {
     });
   }
 
-  private toggleClusterExcludedRows(): void {
+  private async toggleClusterExcludedRows(): Promise<void> {
     if (!this.clusterWorkspace) {
       return;
     }
@@ -1054,6 +1057,10 @@ export class TuiController {
       ? `Showing ${this.clusterWorkspace.analysis.nearbyButExcluded.length} excluded cluster candidate${this.clusterWorkspace.analysis.nearbyButExcluded.length === 1 ? "" : "s"}.`
       : "Hid excluded cluster candidates.";
     this.activeUrl = this.rowUrl(this.rows[this.selectedIndex]);
+    if (this.showDetail && this.rows[this.selectedIndex]) {
+      await this.refreshDetailForSelection(true);
+      return;
+    }
     this.emit();
   }
 
