@@ -794,6 +794,9 @@ export class TuiController {
     }
     this.showDetail = true;
     this.isLandingView = false;
+    if (this.detailLayoutMode === "detail-fullscreen") {
+      this.focus = "detail";
+    }
     await this.refreshDetailForSelection(true, row.kind === "priority-cluster" ? "cluster" : null);
   }
 
@@ -1160,6 +1163,12 @@ export class TuiController {
 
   async refreshSelected(): Promise<void> {
     const row = this.rows[this.selectedIndex];
+    if (!row && this.clusterWorkspace) {
+      await this.openClusterWorkspace(this.clusterWorkspace.seedPrNumber, {
+        showExcluded: this.clusterWorkspace.showExcluded,
+      });
+      return;
+    }
     if (!row) {
       return;
     }
@@ -1316,13 +1325,16 @@ export class TuiController {
     const row = this.rows[this.selectedIndex];
     const hasRow = Boolean(row);
     const hasHistory = this.history.length > 0;
+    const clusterWorkspace = this.clusterWorkspace;
+    const inClusterWorkspace = clusterWorkspace !== null;
     const canLinked = row?.kind === "pr";
     const canCluster = isPriorityDetailRow(row);
     const canOpenClusterWorkspace = isPriorityDetailRow(row);
     const canToggleExcluded =
-      this.clusterWorkspace !== null && this.clusterWorkspace.analysis.nearbyButExcluded.length > 0;
+      inClusterWorkspace && clusterWorkspace.analysis.nearbyButExcluded.length > 0;
     const canTriage = isPriorityDetailRow(row);
     const canRefresh =
+      inClusterWorkspace ||
       row?.kind === "pr" ||
       row?.kind === "issue" ||
       row?.kind === "priority-cluster" ||
@@ -1339,11 +1351,12 @@ export class TuiController {
     const canPageSeen = this.visiblePriorityPrNumbers().length > 0;
     const isClusterWorkspaceRow =
       row?.kind === "cluster-candidate" || row?.kind === "cluster-excluded";
+    const useClusterWorkspaceActions = inClusterWorkspace && (isClusterWorkspaceRow || !hasRow);
 
     switch (this.mode) {
       case "inbox":
       case "watchlist":
-        if (isClusterWorkspaceRow) {
+        if (useClusterWorkspaceActions) {
           return [
             this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
             this.action("expand-cluster", "Excluded", "e", canToggleExcluded),
@@ -1373,7 +1386,7 @@ export class TuiController {
           this.action("open-url", "Open URL", "o", canOpenUrl),
         ];
       case "cross-search":
-        if (isClusterWorkspaceRow) {
+        if (useClusterWorkspaceActions) {
           return [
             this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
             this.action("expand-cluster", "Excluded", "e", canToggleExcluded),
@@ -1396,7 +1409,7 @@ export class TuiController {
           this.action("open-url", "Open URL", "o", canOpenUrl),
         ];
       case "pr-search":
-        if (isClusterWorkspaceRow) {
+        if (useClusterWorkspaceActions) {
           return [
             this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
             this.action("expand-cluster", "Excluded", "e", canToggleExcluded),

@@ -599,6 +599,31 @@ describe("TuiController", () => {
     expect(model.footer.message).toContain("Hid excluded cluster candidates.");
     expect(model.detailPane.visible).toBe(false);
     expect(model.detailPane.title).toBe("Start Here");
+    expect(model.footer.actions.find((action) => action.id === "expand-cluster")).toMatchObject({
+      label: "Excluded",
+      shortcut: "e",
+      enabled: true,
+    });
+    expect(model.footer.actions.find((action) => action.id === "detail")).toMatchObject({
+      label: "Detail",
+      shortcut: "Enter",
+      enabled: false,
+    });
+
+    await controller.refreshSelected();
+    model = controller.getRenderModel();
+    expect(model.resultsPane.title).toContain("Cluster");
+    expect(model.resultsPane.rows).toHaveLength(1);
+    expect(model.resultsPane.rows[0]?.kind).toBe("cluster-excluded");
+    expect(model.footer.actions.find((action) => action.id === "refresh")).toMatchObject({
+      label: "Refresh",
+      shortcut: "r",
+      enabled: true,
+    });
+
+    await controller.expandSelectedCluster();
+    model = controller.getRenderModel();
+    expect(model.resultsPane.rows).toHaveLength(0);
 
     await controller.expandSelectedCluster();
     model = controller.getRenderModel();
@@ -911,6 +936,32 @@ describe("TuiController", () => {
     model = controller.getRenderModel();
     expect(model.layoutMode).toBe("split-pane");
     expect(model.detailWidth).toBe("42%");
+  });
+
+  it("restores detail focus when reopening fullscreen detail", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.openSelected();
+    await controller.dispatch({ type: "toggle_detail_layout" });
+    await controller.openSelected();
+
+    let model = controller.getRenderModel();
+    expect(model.layoutMode).toBe("single-pane");
+    expect(model.detailPane.visible).toBe(false);
+    expect(model.focus).toBe("results");
+
+    await controller.openSelected();
+
+    model = controller.getRenderModel();
+    expect(model.layoutMode).toBe("detail-fullscreen");
+    expect(model.detailPane.visible).toBe(true);
+    expect(model.focus).toBe("detail");
   });
 
   it("does not reopen detail if a background list replay finishes after closing it", async () => {
