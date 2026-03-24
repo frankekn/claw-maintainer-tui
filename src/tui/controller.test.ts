@@ -489,7 +489,7 @@ describe("TuiController", () => {
 
     await controller.initialize();
 
-    const model = controller.getRenderModel();
+    let model = controller.getRenderModel();
     expect(model.mode).toBe("inbox");
     expect(model.resultsPane.title).toBe("Inbox");
     expect(model.resultsPane.rows).toHaveLength(20);
@@ -586,12 +586,22 @@ describe("TuiController", () => {
     await controller.initialize();
     await controller.expandSelectedCluster();
 
-    const model = controller.getRenderModel();
+    let model = controller.getRenderModel();
     expect(model.resultsPane.title).toContain("Cluster");
     expect(model.resultsPane.rows).toHaveLength(1);
     expect(model.resultsPane.rows[0]?.kind).toBe("cluster-excluded");
     expect(model.resultsPane.lines.join("\n")).toContain("EXCLUDED");
     expect(model.detailPane.title).toBe("Cluster · #43001");
+
+    await controller.expandSelectedCluster();
+    model = controller.getRenderModel();
+    expect(model.resultsPane.rows).toHaveLength(0);
+    expect(model.footer.message).toContain("Hid excluded cluster candidates.");
+
+    await controller.expandSelectedCluster();
+    model = controller.getRenderModel();
+    expect(model.resultsPane.rows).toHaveLength(1);
+    expect(model.resultsPane.rows[0]?.kind).toBe("cluster-excluded");
   });
 
   it("refreshes detail when hiding the selected excluded cluster row", async () => {

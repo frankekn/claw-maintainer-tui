@@ -815,6 +815,12 @@ export class TuiController {
 
   async expandSelectedCluster(): Promise<void> {
     const row = this.rows[this.selectedIndex];
+    if (this.clusterWorkspace) {
+      if (!row || row.kind === "cluster-candidate" || row.kind === "cluster-excluded") {
+        await this.toggleClusterExcludedRows();
+        return;
+      }
+    }
     if (!row) {
       return;
     }
