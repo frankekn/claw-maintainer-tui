@@ -3,6 +3,7 @@ import type {
   TuiDetailState,
   TuiFocus,
   TuiMode,
+  TuiQueryState,
   TuiSessionState,
   TuiViewSnapshot,
 } from "./types.js";
@@ -86,7 +87,7 @@ export function createViewSnapshot(
       errorMessage: session.errorMessage,
       browseLimit: session.browseLimit,
       isLandingView: session.isLandingView,
-      queryState: session.queryState,
+      queryState: cloneQueryState(session.queryState),
       banner: session.banner,
       bannerHidden: session.bannerHidden,
       helpVisible: session.helpVisible,
@@ -103,6 +104,22 @@ export function createViewSnapshot(
       focusSection: detail.focusSection,
       anchorKey: detail.anchorKey,
       foldedSections: detail.foldedSections,
+    },
+  };
+}
+
+export function cloneQueryState(
+  queryState: Record<"cross-search" | "pr-search" | "issue-search", TuiQueryState>,
+): Record<"cross-search" | "pr-search" | "issue-search", TuiQueryState> {
+  return {
+    "cross-search": {
+      ...queryState["cross-search"],
+      history: [...queryState["cross-search"].history],
+    },
+    "pr-search": { ...queryState["pr-search"], history: [...queryState["pr-search"].history] },
+    "issue-search": {
+      ...queryState["issue-search"],
+      history: [...queryState["issue-search"].history],
     },
   };
 }

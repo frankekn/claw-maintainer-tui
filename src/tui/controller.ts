@@ -20,6 +20,7 @@ import type {
 import { buildRenderModel } from "./presenter.js";
 import {
   availableFocuses,
+  cloneQueryState,
   createInitialSessionState,
   createLandingDetailState,
   createViewSnapshot,
@@ -107,6 +108,7 @@ export class TuiController {
   };
   private activeMetadataJob: MetadataEntity | null = null;
   private readonly manualPriority = new Set<MetadataEntity>();
+  private pendingListReplay = false;
   private idleRefreshTimer: NodeJS.Timeout | null = null;
   private replayTimer: NodeJS.Timeout | null = null;
   private lastInteractionAt = Date.now();
@@ -562,6 +564,7 @@ export class TuiController {
     }
     this.pushHistory();
     this.mode = mode;
+    this.pendingListReplay = false;
     this.focus = "results";
     this.rows = [];
     this.selectedIndex = 0;
@@ -937,6 +940,7 @@ export class TuiController {
     this.clusterWorkspaceRequestId += 1;
     this.mode = snapshot.session.mode;
     this.query = snapshot.session.query;
+    this.sessionState.queryState = cloneQueryState(snapshot.session.queryState);
     this.rows = snapshot.session.rows;
     this.selectedIndex = snapshot.session.selectedIndex;
     this.activeUrl = snapshot.session.activeUrl;
@@ -944,9 +948,13 @@ export class TuiController {
     this.context = snapshot.session.context;
     this.isLandingView = snapshot.session.isLandingView;
     this.browseLimit = snapshot.session.browseLimit;
+    this.banner = snapshot.session.banner;
+    this.bannerHidden = snapshot.session.bannerHidden;
+    this.helpVisible = snapshot.session.helpVisible;
     this.detailLayoutMode = snapshot.session.detailLayoutMode;
     this.detailWidthIndex = snapshot.session.detailWidthIndex;
     this.clusterWorkspace = snapshot.session.clusterWorkspace;
+    this.lastAttentionMutation = snapshot.session.lastAttentionMutation;
     this.detailState = snapshot.detail;
     this.errorMessage = null;
     this.focus =
@@ -955,6 +963,7 @@ export class TuiController {
         : "results";
     this.message = "Returned to previous view.";
     this.emit();
+    this.flushPendingListReplayIfNeeded();
   }
 
   getActiveUrl(): string | null {
@@ -1008,9 +1017,18 @@ export class TuiController {
     this.emit();
   }
 
-  private async openClusterWorkspace(prNumber: number, pushHistory = true): Promise<void> {
+  private async openClusterWorkspace(
+    prNumber: number,
+    options: {
+      pushHistory?: boolean;
+      showExcluded?: boolean;
+      restoreSelectionIdentity?: string | null;
+    } = {},
+  ): Promise<void> {
     const mode = this.mode;
     const selectionIdentity = this.selectedRowIdentity();
+    const pushHistory = options.pushHistory ?? true;
+    const showExcluded = options.showExcluded ?? false;
     const requestId = ++this.clusterWorkspaceRequestId;
     await this.runBusy(`Opening cluster workspace for PR #${prNumber}`, async () => {
       const { analysis, summary } = await this.effects.verifyClusterPr(prNumber, this.resultLimit);
@@ -1025,7 +1043,7 @@ export class TuiController {
         this.message = `No cluster workspace found for PR #${prNumber}.`;
         return;
       }
-      const rows = this.buildClusterWorkspaceRows(analysis, summary, false);
+      const rows = this.buildClusterWorkspaceRows(analysis, summary, showExcluded);
       if (rows.length === 0) {
         this.message = `No alternate cluster candidates found for PR #${prNumber}.`;
         return;
@@ -1037,13 +1055,17 @@ export class TuiController {
         seedPrNumber: prNumber,
         analysis,
         verification: summary,
-        showExcluded: false,
+        showExcluded,
       };
       this.rows = rows;
-      this.selectedIndex = 0;
+      if (options.restoreSelectionIdentity) {
+        this.restoreSelection(options.restoreSelectionIdentity);
+      } else {
+        this.selectedIndex = 0;
+      }
       this.resultTitle = `Cluster · #${prNumber}`;
-      this.message = clusterWorkspaceMessage(analysis, summary, false);
-      this.activeUrl = this.rowUrl(this.rows[0]);
+      this.message = clusterWorkspaceMessage(analysis, summary, showExcluded);
+      this.activeUrl = this.rowUrl(this.rows[this.selectedIndex]);
       this.isLandingView = false;
       this.showDetail = true;
       this.focus = this.detailLayoutMode === "detail-fullscreen" ? "detail" : "results";
@@ -1137,7 +1159,11 @@ export class TuiController {
     if (row.kind === "cluster-candidate" || row.kind === "cluster-excluded") {
       await this.openClusterWorkspace(
         this.clusterWorkspace?.seedPrNumber ?? row.candidate.prNumber,
-        false,
+        {
+          pushHistory: false,
+          showExcluded: this.clusterWorkspace?.showExcluded ?? row.kind === "cluster-excluded",
+          restoreSelectionIdentity: this.selectedRowIdentity(),
+        },
       );
       return;
     }
@@ -1455,6 +1481,7 @@ export class TuiController {
     this.activeUrl = result.activeUrl;
     this.isLandingView = result.isLandingView;
     this.clusterWorkspace = null;
+    this.pendingListReplay = false;
     this.resetDetailState(result.mode);
   }
 
@@ -1998,11 +2025,13 @@ export class TuiController {
       return;
     }
     if (this.clusterWorkspace) {
+      this.pendingListReplay = true;
       return;
     }
     if (!this.isListMode(this.mode)) {
       return;
     }
+    this.pendingListReplay = false;
     const selectionIdentity = this.selectedRowIdentity();
     const requestId = ++this.listRequestId;
     const result = await this.resolveRows(this.mode, this.isQueryMode(this.mode) ? this.query : "");
@@ -2022,6 +2051,15 @@ export class TuiController {
     }
     this.loadLandingDetailForCurrentMode();
     this.emit();
+  }
+
+  private flushPendingListReplayIfNeeded(): void {
+    if (!this.pendingListReplay || this.clusterWorkspace || !this.isListMode(this.mode)) {
+      return;
+    }
+    void this.refreshActiveListPreservingUi().catch((error) => {
+      this.reportError(error instanceof Error ? error.message : String(error), "Replay refresh");
+    });
   }
 
   private modeLabel(mode: TuiMode): string {

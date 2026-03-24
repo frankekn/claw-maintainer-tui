@@ -601,6 +601,41 @@ describe("TuiController", () => {
     expect(model.footer.message).toContain("Hid excluded cluster candidates.");
   });
 
+  it("preserves cluster workspace selection and excluded rows on refresh", async () => {
+    const service = new FakeTuiDataService();
+    service.verifyClusterPr = vi.fn(async (prNumber) => ({
+      analysis: {
+        ...makeCluster(prNumber),
+        nearbyButExcluded: [makeExcludedClusterCandidate(43001)],
+      },
+      summary: {
+        verifiedPrCount: 2,
+        verifiedIssueCount: 1,
+        missingCount: 0,
+        state: "done" as const,
+      },
+    }));
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.expandSelectedCluster();
+    await controller.expandSelectedCluster();
+    controller.moveSelection(1);
+    await flushMicrotasks();
+
+    await controller.refreshSelected();
+
+    const model = controller.getRenderModel();
+    expect(model.resultsPane.rows).toHaveLength(2);
+    expect(model.resultsPane.rows[1]?.kind).toBe("cluster-excluded");
+    expect(model.resultsPane.selectedIndex).toBe(1);
+    expect(model.detailPane.title).toBe("Cluster · #43001");
+  });
+
   it("keeps detail focus when opening cluster workspace from fullscreen detail", async () => {
     const service = new FakeTuiDataService();
     service.inboxItems = [{ kind: "cluster", cluster: makePriorityCluster([41793, 42212]) }];
@@ -1054,6 +1089,36 @@ describe("TuiController", () => {
     expect(controller.getRenderModel().query).toBe("state:open ");
   });
 
+  it("restores saved query history when going back to a search view", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    controller.activateMode("cross-search");
+    await flushMicrotasks();
+    await controller.submitQuery("author:frank");
+
+    controller.activateMode("watchlist");
+    await flushMicrotasks();
+    controller.activateMode("cross-search");
+    await flushMicrotasks();
+    await controller.submitQuery("state:open");
+
+    controller.goBack();
+    controller.goBack();
+
+    expect(controller.getRenderModel().mode).toBe("cross-search");
+    expect(controller.getRenderModel().query).toBe("author:frank");
+
+    controller.startQueryEntry();
+    controller.moveQueryHistory(-1);
+
+    expect(controller.getRenderModel().query).toBe("author:frank");
+  });
+
   it("does not duplicate browse guidance in the footer query line", async () => {
     const service = new FakeTuiDataService();
     const controller = new TuiController(service, {
@@ -1123,6 +1188,55 @@ describe("TuiController", () => {
       const model = controller.getRenderModel();
       expect(model.header.errorMessage).toBe("replay boom");
       expect(model.footer.message).toBe("replay boom");
+    } finally {
+      controller?.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("replays deferred list refresh after leaving cluster workspace", async () => {
+    vi.useFakeTimers();
+    let controller: TuiController | null = null;
+    try {
+      const service = new FakeTuiDataService();
+      service.statusSnapshot = {
+        ...service.statusSnapshot,
+        lastSyncAt: new Date().toISOString(),
+        issueLastSyncAt: new Date().toISOString(),
+      };
+      service.inboxItems = [{ kind: "cluster", cluster: makePriorityCluster([41793, 42212]) }];
+      controller = new TuiController(service, {
+        repo: "openclaw/openclaw",
+        dbPath: "/tmp/clawlens.sqlite",
+        ftsOnly: false,
+      });
+
+      await controller.initialize();
+      await controller.expandSelectedCluster();
+      service.inboxItems = [{ kind: "pr", candidate: makePriorityCandidate(43001) }];
+
+      (
+        controller as unknown as {
+          scheduleListReplay: () => void;
+        }
+      ).scheduleListReplay();
+
+      await vi.advanceTimersByTimeAsync(200);
+      await flushMicrotasks();
+
+      let model = controller.getRenderModel();
+      expect(model.resultsPane.title).toContain("Cluster");
+
+      controller.goBack();
+      await flushMicrotasks(6);
+
+      model = controller.getRenderModel();
+      expect(model.mode).toBe("inbox");
+      expect(model.resultsPane.rows).toHaveLength(1);
+      expect(model.resultsPane.rows[0]?.kind).toBe("pr");
+      if (model.resultsPane.rows[0]?.kind === "pr") {
+        expect(model.resultsPane.rows[0].pr.prNumber).toBe(43001);
+      }
     } finally {
       controller?.dispose();
       vi.useRealTimers();
