@@ -12,6 +12,11 @@ import type {
   SyncSummary,
 } from "../types.js";
 
+export type PullRequestSyncWorkflowResult = {
+  summary: SyncSummary;
+  touchedPrNumbers: number[];
+};
+
 export async function syncPullRequestsWorkflow(params: {
   repo: RepoRef;
   source: PullRequestDataSource;
@@ -35,13 +40,14 @@ export async function syncPullRequestsWorkflow(params: {
     lastSyncAt: string;
     lastSyncWatermark: string;
   };
-}): Promise<SyncSummary> {
+}): Promise<PullRequestSyncWorkflowResult> {
   const mode = params.full || !params.lastSyncWatermark ? "full" : "incremental";
   const syncStartedAt = isoNow();
   params.setMeta(params.metaKeys.repo, params.repoName);
 
   const toProcess: number[] = [];
   const summaryPullRequests: PullRequestRecord[] = [];
+  const touchedPrNumbers = new Set<number>();
   let skippedPrs = 0;
   let processedPrs = 0;
   const emitProgress = (
@@ -78,8 +84,10 @@ export async function syncPullRequestsWorkflow(params: {
       });
       if (target.kind === "hydrate") {
         toProcess.push(target.prNumber);
+        touchedPrNumbers.add(target.prNumber);
       } else {
         summaryPullRequests.push(target.pr);
+        touchedPrNumbers.add(target.pr.number);
       }
     }
   } else if (params.lastSyncWatermark) {
@@ -96,17 +104,21 @@ export async function syncPullRequestsWorkflow(params: {
         });
         if (target.kind === "hydrate") {
           toProcess.push(target.prNumber);
+          touchedPrNumbers.add(target.prNumber);
           continue;
         }
         summaryPullRequests.push(target.pr);
+        touchedPrNumbers.add(target.pr.number);
       }
     } else {
-      toProcess.push(
-        ...(await params.source.listChangedPullRequestNumbersSince(
-          params.repo,
-          params.lastSyncWatermark,
-        )),
+      const changedNumbers = await params.source.listChangedPullRequestNumbersSince(
+        params.repo,
+        params.lastSyncWatermark,
       );
+      for (const prNumber of changedNumbers) {
+        toProcess.push(prNumber);
+        touchedPrNumbers.add(prNumber);
+      }
     }
   }
 
@@ -137,19 +149,22 @@ export async function syncPullRequestsWorkflow(params: {
   emitProgress("complete");
 
   return {
-    mode,
-    entity: "prs",
-    repo: params.repoName,
-    processedPrs,
-    processedIssues: 0,
-    skippedPrs,
-    skippedIssues: 0,
-    docCount: params.countRows("search_docs"),
-    commentCount: params.countRows("pr_comments"),
-    labelCount: params.countRows("pr_labels"),
-    vectorAvailable: params.vectorAvailable,
-    lastSyncAt: syncedAt,
-    lastSyncWatermark: syncStartedAt,
+    summary: {
+      mode,
+      entity: "prs",
+      repo: params.repoName,
+      processedPrs,
+      processedIssues: 0,
+      skippedPrs,
+      skippedIssues: 0,
+      docCount: params.countRows("search_docs"),
+      commentCount: params.countRows("pr_comments"),
+      labelCount: params.countRows("pr_labels"),
+      vectorAvailable: params.vectorAvailable,
+      lastSyncAt: syncedAt,
+      lastSyncWatermark: syncStartedAt,
+    },
+    touchedPrNumbers: Array.from(touchedPrNumbers).sort((a, b) => a - b),
   };
 }
 

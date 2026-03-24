@@ -28,6 +28,15 @@ class FakePullRequestDataSource implements PullRequestDataSource {
   changedPrNumbers: number[] = [];
   changedPrs: PullRequestRecord[] = [];
   hydrateCalls: number[] = [];
+  summaryCalls: number[] = [];
+  factCalls: number[] = [];
+  searchCalls: Array<{ query: string; state: "open" | "closed"; limit: number }> = [];
+  rateLimitCalls = 0;
+  rateLimitStatus: { limit: number; remaining: number; resetAt: string } | null = {
+    limit: 5000,
+    remaining: 5000,
+    resetAt: "2026-03-11T00:00:00.000Z",
+  };
 
   constructor(items: HydratedPullRequest[]) {
     for (const item of items) {
@@ -71,7 +80,17 @@ class FakePullRequestDataSource implements PullRequestDataSource {
     return payload;
   }
 
+  async getPullRequestSummary(_repo: RepoRef, prNumber: number): Promise<PullRequestRecord> {
+    this.summaryCalls.push(prNumber);
+    const payload = this.hydrated.get(prNumber);
+    if (!payload) {
+      throw new Error(`missing PR ${prNumber}`);
+    }
+    return payload.pr;
+  }
+
   async fetchPullRequestFacts(_repo: RepoRef, prNumber: number): Promise<PullRequestFactRecord> {
+    this.factCalls.push(prNumber);
     const payload = this.facts.get(prNumber);
     if (!payload) {
       throw new Error(`missing facts for PR ${prNumber}`);
@@ -79,11 +98,21 @@ class FakePullRequestDataSource implements PullRequestDataSource {
     return payload;
   }
 
+  async getRateLimitStatus(): Promise<{
+    limit: number;
+    remaining: number;
+    resetAt: string;
+  } | null> {
+    this.rateLimitCalls += 1;
+    return this.rateLimitStatus;
+  }
+
   async searchPullRequestNumbers(
     _repo: RepoRef,
     query: string,
     options: { state: "open" | "closed"; limit: number },
   ): Promise<number[]> {
+    this.searchCalls.push({ query, state: options.state, limit: options.limit });
     return [...(this.searchResults.get(`${options.state}:${query}`) ?? [])].slice(0, options.limit);
   }
 }
@@ -638,6 +667,82 @@ describe("PrIndexStore", () => {
 
     expect(summary.processedPrs).toBe(1);
     expect(createProvider).not.toHaveBeenCalled();
+  });
+
+  it("prewarms facts for family representatives, watched PRs, and ungrouped touched PRs", async () => {
+    const store = await createStore();
+    const groupedA = makePullRequest(50070, {
+      title: "fix: collapse family representative A",
+      body: "Closes #42070\nRepresentative A.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const groupedB = makePullRequest(50071, {
+      title: "fix: collapse family representative B",
+      body: "Closes #42070\nRepresentative B.",
+      updatedAt: "2026-03-10T01:00:00.000Z",
+    });
+    const watched = makePullRequest(50072, {
+      title: "fix: watched open PR",
+      body: "Watched but not touched in the incremental sync.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const ungrouped = makePullRequest(50073, {
+      title: "fix: ungrouped touched PR",
+      body: "Touched open PR with no linked issue family.",
+      updatedAt: "2026-03-10T02:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([groupedA, groupedB, watched, ungrouped]);
+    source.rateLimitStatus = {
+      limit: 5000,
+      remaining: 50,
+      resetAt: "2026-03-11T00:00:00.000Z",
+    };
+
+    await store.sync({ repo, source, full: true });
+    await store.setPrAttentionState(repo, 50072, "watch");
+
+    source.setFacts(makePullRequestFacts(50070));
+    source.setFacts(makePullRequestFacts(50071));
+    source.setFacts(makePullRequestFacts(50072));
+    source.setFacts(makePullRequestFacts(50073));
+    source.factCalls = [];
+    source.rateLimitStatus = {
+      limit: 5000,
+      remaining: 5000,
+      resetAt: "2026-03-11T00:00:00.000Z",
+    };
+    source.changedPrs = [
+      { ...groupedA.pr, updatedAt: "2026-03-11T00:00:00.000Z" },
+      { ...groupedB.pr, updatedAt: "2026-03-11T01:00:00.000Z" },
+      { ...ungrouped.pr, updatedAt: "2026-03-11T02:00:00.000Z" },
+    ];
+
+    const summary = await store.sync({ repo, source });
+
+    expect(summary.processedPrs).toBe(3);
+    expect(source.factCalls.sort((left, right) => left - right)).toEqual([50071, 50072, 50073]);
+    expect(source.factCalls).not.toContain(50070);
+  });
+
+  it("skips fact prewarm entirely when the rate limit budget is low", async () => {
+    const store = await createStore();
+    const pr = makePullRequest(50074, {
+      title: "fix: skip prewarm under low quota",
+      body: "Closes #42074\nSkip prewarm under low quota.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([pr]);
+    source.setFacts(makePullRequestFacts(50074));
+    source.rateLimitStatus = {
+      limit: 5000,
+      remaining: 50,
+      resetAt: "2026-03-11T00:00:00.000Z",
+    };
+
+    await store.sync({ repo, source, full: true });
+
+    expect(source.rateLimitCalls).toBeGreaterThan(0);
+    expect(source.factCalls).toEqual([]);
   });
 
   it("stores issues, supports issue search, and cross references issues to pull requests", async () => {
@@ -1273,7 +1378,7 @@ describe("PrIndexStore", () => {
     );
   });
 
-  it("hydrates the seed before cluster analysis when repo and source are provided", async () => {
+  it("refreshes cluster candidates through summary and fact fetches without hydrating detail", async () => {
     const store = await createStore();
     const refreshedSeed = makePullRequest(39672, {
       title: "feat: warn before compaction on large token usage",
@@ -1307,7 +1412,9 @@ describe("PrIndexStore", () => {
       refresh: true,
     });
 
-    expect(source.hydrateCalls).toContain(39672);
+    expect(source.hydrateCalls).toEqual([]);
+    expect(source.summaryCalls).toEqual(expect.arrayContaining([39672, 39673]));
+    expect(source.factCalls).toEqual(expect.arrayContaining([39672, 39673]));
     expect(analysis?.seedPr.title).toBe("feat: warn before compaction on large token usage");
     expect(analysis?.sameClusterCandidates).toEqual(
       expect.arrayContaining([
@@ -1317,6 +1424,95 @@ describe("PrIndexStore", () => {
         }),
       ]),
     );
+  });
+
+  it("reuses cached linked-issue cluster evaluations across seeds in the same family", async () => {
+    const store = await createStore();
+    const first = makePullRequest(39680, {
+      title: "fix: stabilize retry budget accounting",
+      body: "Closes #39600\nStabilize retry budget accounting.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const second = makePullRequest(39681, {
+      title: "fix: stabilize retry budget accounting in sibling path",
+      body: "Closes #39600\nSibling retry budget accounting fix.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([first, second]);
+    source.setSearchResults("39600", "open", [39680, 39681]);
+
+    await store.sync({ repo, source: new FakePullRequestDataSource([first, second]), full: true });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39680, {
+        headSha: "head-39680-a",
+        linkedIssues: [{ issueNumber: 39600, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/budget.ts", kind: "prod" }],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39681, {
+        headSha: "head-39681-a",
+        linkedIssues: [{ issueNumber: 39600, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/budget.ts", kind: "prod" }],
+      }),
+    );
+
+    await store.clusterPullRequest({ prNumber: 39680, limit: 10, ftsOnly: true, repo, source });
+    const issueSearchCallCount = source.searchCalls.filter((call) => call.query === "39600").length;
+
+    await store.clusterPullRequest({ prNumber: 39681, limit: 10, ftsOnly: true, repo, source });
+
+    expect(issueSearchCallCount).toBeGreaterThan(0);
+    expect(source.searchCalls.filter((call) => call.query === "39600")).toHaveLength(
+      issueSearchCallCount,
+    );
+  });
+
+  it("invalidates the linked-issue cluster cache when facts change", async () => {
+    const store = await createStore();
+    const first = makePullRequest(39682, {
+      title: "fix: stabilize cluster invalidation first variant",
+      body: "Closes #39601\nFirst variant.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const second = makePullRequest(39683, {
+      title: "fix: stabilize cluster invalidation second variant",
+      body: "Closes #39601\nSecond variant.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([first, second]);
+    source.setSearchResults("39601", "open", [39682, 39683]);
+
+    await store.sync({ repo, source: new FakePullRequestDataSource([first, second]), full: true });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39682, {
+        headSha: "head-39682-a",
+        linkedIssues: [{ issueNumber: 39601, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/invalidator.ts", kind: "prod" }],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39683, {
+        headSha: "head-39683-a",
+        linkedIssues: [{ issueNumber: 39601, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/invalidator.ts", kind: "prod" }],
+      }),
+    );
+
+    await store.clusterPullRequest({ prNumber: 39682, limit: 10, ftsOnly: true, repo, source });
+    const firstSearchCallCount = source.searchCalls.length;
+
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39683, {
+        headSha: "head-39683-b",
+        linkedIssues: [{ issueNumber: 39601, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/invalidator.ts", kind: "prod" }],
+      }),
+    );
+
+    await store.clusterPullRequest({ prNumber: 39682, limit: 10, ftsOnly: true, repo, source });
+
+    expect(source.searchCalls.length).toBeGreaterThan(firstSearchCallCount);
   });
 
   it("prioritizes issue-linked hub PRs above recency-only PRs", async () => {

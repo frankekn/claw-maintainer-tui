@@ -115,6 +115,7 @@ type RestRateLimit = {
 };
 
 type GhApiRunner = (path: string) => Promise<string>;
+type GhCommandRunner = (args: string[]) => Promise<string>;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -321,6 +322,13 @@ async function ghApiRaw(path: string): Promise<string> {
   return stdout;
 }
 
+async function ghCommandRaw(args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync("gh", args, {
+    maxBuffer: GH_MAX_BUFFER,
+  });
+  return stdout;
+}
+
 export function isRetryableGhApiError(error: unknown): boolean {
   const message =
     error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
@@ -351,6 +359,29 @@ export async function ghApiJsonWithRetry<T>(
   } = {},
 ): Promise<T> {
   const runner = options.runner ?? ghApiRaw;
+  return ghCommandJsonWithRetry<T>(["api", path], {
+    runner: async (args) => {
+      if (args[0] !== "api" || args[1] !== path) {
+        throw new Error(`unexpected gh api args: ${args.join(" ")}`);
+      }
+      return runner(path);
+    },
+    attempts: options.attempts,
+    backoffMs: options.backoffMs,
+    sleepFn: options.sleepFn,
+  });
+}
+
+export async function ghCommandJsonWithRetry<T>(
+  args: string[],
+  options: {
+    runner?: GhCommandRunner;
+    attempts?: number;
+    backoffMs?: number;
+    sleepFn?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<T> {
+  const runner = options.runner ?? ghCommandRaw;
   const attempts = Math.max(1, options.attempts ?? DEFAULT_GH_API_ATTEMPTS);
   const backoffMs = Math.max(0, options.backoffMs ?? DEFAULT_GH_API_BACKOFF_MS);
   const sleepFn = options.sleepFn ?? sleep;
@@ -358,7 +389,7 @@ export async function ghApiJsonWithRetry<T>(
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      const raw = await runner(path);
+      const raw = await runner(args);
       return JSON.parse(raw) as T;
     } catch (error) {
       lastError = error;
@@ -392,10 +423,7 @@ export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueD
     remaining: number;
     resetAt: string;
   } | null> {
-    const { stdout } = await execFileAsync("gh", ["api", "rate_limit"], {
-      maxBuffer: GH_MAX_BUFFER,
-    });
-    const payload = JSON.parse(stdout) as RestRateLimit;
+    const payload = await ghCommandJsonWithRetry<RestRateLimit>(["api", "rate_limit"]);
     const core = payload.resources?.core;
     if (
       !core ||
@@ -574,39 +602,40 @@ export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueD
     };
   }
 
+  async getPullRequestSummary(repo: RepoRef, prNumber: number): Promise<PullRequestRecord> {
+    const pr = await ghApiJsonWithRetry<RestPullRequest>(
+      `repos/${repo.owner}/${repo.name}/pulls/${prNumber}`,
+    );
+    return toPullRequestRecord(pr);
+  }
+
   async fetchPullRequestFacts(repo: RepoRef, prNumber: number): Promise<PullRequestFactRecord> {
     const repoRef = `${repo.owner}/${repo.name}`;
-    const { stdout } = await execFileAsync(
-      "gh",
+    const payload = await ghCommandJsonWithRetry<RestPullRequestView>([
+      "pr",
+      "view",
+      String(prNumber),
+      "-R",
+      repoRef,
+      "--json",
       [
-        "pr",
-        "view",
-        String(prNumber),
-        "-R",
-        repoRef,
-        "--json",
-        [
-          "number",
-          "title",
-          "body",
-          "state",
-          "isDraft",
-          "headRefOid",
-          "reviewDecision",
-          "mergeStateStatus",
-          "mergeable",
-          "statusCheckRollup",
-          "closingIssuesReferences",
-          "files",
-          "updatedAt",
-          "url",
-        ].join(","),
-      ],
-      {
-        maxBuffer: GH_MAX_BUFFER,
-      },
-    );
-    return normalizePullRequestFactRecord(JSON.parse(stdout) as RestPullRequestView);
+        "number",
+        "title",
+        "body",
+        "state",
+        "isDraft",
+        "headRefOid",
+        "reviewDecision",
+        "mergeStateStatus",
+        "mergeable",
+        "statusCheckRollup",
+        "closingIssuesReferences",
+        "files",
+        "updatedAt",
+        "url",
+      ].join(","),
+    ]);
+    return normalizePullRequestFactRecord(payload);
   }
 
   async searchPullRequestNumbers(
@@ -615,28 +644,20 @@ export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueD
     options: { state: "open" | "closed"; limit: number },
   ): Promise<number[]> {
     const repoRef = `${repo.owner}/${repo.name}`;
-    const { stdout } = await execFileAsync(
-      "gh",
-      [
-        "search",
-        "prs",
-        query,
-        "-R",
-        repoRef,
-        "--state",
-        options.state,
-        "--limit",
-        String(options.limit),
-        "--json",
-        "number",
-      ],
-      {
-        maxBuffer: GH_MAX_BUFFER,
-      },
-    );
-    return (JSON.parse(stdout) as SearchPullRequestResult[])
-      .map((item) => item.number)
-      .filter((number) => Number.isInteger(number));
+    const payload = await ghCommandJsonWithRetry<SearchPullRequestResult[]>([
+      "search",
+      "prs",
+      query,
+      "-R",
+      repoRef,
+      "--state",
+      options.state,
+      "--limit",
+      String(options.limit),
+      "--json",
+      "number",
+    ]);
+    return payload.map((item) => item.number).filter((number) => Number.isInteger(number));
   }
 }
 

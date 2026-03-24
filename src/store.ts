@@ -161,6 +161,25 @@ type PrTriageStateRow = {
   updated_at: string;
 };
 
+type ClusterInputBundle = {
+  pr: PrRow;
+  headSha: string | null;
+  linkedIssues: number[];
+  changedFiles: PullRequestChangedFile[];
+};
+
+type CachedLinkedIssueClusterEvaluation = {
+  clusterIssueNumbers: number[];
+  decisionTrace: ClusterDecisionTrace[];
+  rankedCandidates: ClusterCandidate[];
+  relevantPaths: {
+    relevantProdFiles: Set<string>;
+    relevantTestFiles: Set<string>;
+  };
+  bestBase: ClusterCandidate | null;
+  sameClusterCandidates: ClusterCandidate[];
+};
+
 function toVectorBlob(values: number[]): Buffer {
   return Buffer.from(new Float32Array(values).buffer);
 }
@@ -221,6 +240,7 @@ export class PrIndexStore {
   private vectorError: string | undefined;
   private initialized = false;
   private vectorDims: number | null = null;
+  private readonly linkedIssueClusterCache = new Map<string, CachedLinkedIssueClusterEvaluation>();
 
   constructor(params: {
     dbPath: string;
@@ -494,6 +514,10 @@ export class PrIndexStore {
       .run(key, value);
   }
 
+  private clearLinkedIssueClusterCache(): void {
+    this.linkedIssueClusterCache.clear();
+  }
+
   private clearIssueLinksForSources(prNumber: number, sources: PullRequestLinkSource[]): void {
     if (sources.length === 0) {
       return;
@@ -538,6 +562,7 @@ export class PrIndexStore {
         this.upsertDerivedIssueLinksForPr(row.number, row.title, row.body);
       }
       this.setMeta(META_DERIVED_ISSUE_LINKS_BACKFILLED_AT, isoNow());
+      this.clearLinkedIssueClusterCache();
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -589,6 +614,7 @@ export class PrIndexStore {
           .prepare(`INSERT INTO pr_changed_files (pr_number, path, kind) VALUES (?, ?, ?)`)
           .run(facts.prNumber, file.path, file.kind);
       }
+      this.clearLinkedIssueClusterCache();
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -1131,6 +1157,7 @@ export class PrIndexStore {
           .run(prDoc.title, prDoc.text, prDoc.docId, prDoc.prNumber, prDoc.kind);
       }
 
+      this.clearLinkedIssueClusterCache();
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -1226,6 +1253,7 @@ export class PrIndexStore {
           }
         }
 
+        this.clearLinkedIssueClusterCache();
         this.db.exec("COMMIT");
       } catch (error) {
         this.db.exec("ROLLBACK");
@@ -1243,7 +1271,7 @@ export class PrIndexStore {
   }): Promise<SyncSummary> {
     await this.init();
     const repoName = `${params.repo.owner}/${params.repo.name}`;
-    return syncPullRequestsWorkflow({
+    const workflow = await syncPullRequestsWorkflow({
       ...params,
       syncConcurrency: this.syncConcurrency,
       lastSyncWatermark: this.getMeta(META_LAST_SYNC_WATERMARK),
@@ -1261,6 +1289,12 @@ export class PrIndexStore {
         lastSyncWatermark: META_LAST_SYNC_WATERMARK,
       },
     });
+    await this.prewarmPullRequestFacts({
+      repo: params.repo,
+      source: params.source,
+      touchedPrNumbers: workflow.touchedPrNumbers,
+    });
+    return workflow.summary;
   }
 
   async syncIssues(params: {
@@ -1294,6 +1328,118 @@ export class PrIndexStore {
       count: number;
     };
     return row.count;
+  }
+
+  private getOpenPrRows(prNumbers: number[]): PrRow[] {
+    return Array.from(new Set(prNumbers))
+      .map((prNumber) => this.getPrRow(prNumber))
+      .filter((row): row is PrRow => row !== null && row.state === "open")
+      .sort(
+        (left, right) =>
+          right.updated_at.localeCompare(left.updated_at) || right.number - left.number,
+      );
+  }
+
+  private getWatchedOpenPrRows(repoKey: string): PrRow[] {
+    return this.db
+      .prepare(
+        `SELECT p.*
+           FROM prs p
+           JOIN pr_triage_state t
+             ON t.repo = ?
+            AND t.pr_number = p.number
+          WHERE p.state = 'open'
+            AND t.attention_state = 'watch'
+          ORDER BY p.updated_at DESC, p.number DESC`,
+      )
+      .all(repoKey) as PrRow[];
+  }
+
+  private buildPrewarmQueue(repoKey: string, touchedPrNumbers: number[]): number[] {
+    const touchedOpenRows = this.getOpenPrRows(touchedPrNumbers);
+    const familyRepresentatives = new Map<string, PrRow>();
+    const selected = new Set<number>();
+    const queue: number[] = [];
+
+    for (const row of touchedOpenRows) {
+      const issueNumbers = this.getLinkedIssuesForPr(row.number).map((issue) => issue.issueNumber);
+      if (issueNumbers.length === 0) {
+        continue;
+      }
+      const familyKey = issueNumbers.sort((left, right) => left - right).join(",");
+      const current = familyRepresentatives.get(familyKey);
+      if (
+        !current ||
+        row.updated_at > current.updated_at ||
+        (row.updated_at === current.updated_at && row.number > current.number)
+      ) {
+        familyRepresentatives.set(familyKey, row);
+      }
+    }
+
+    for (const row of Array.from(familyRepresentatives.values()).sort(
+      (left, right) =>
+        right.updated_at.localeCompare(left.updated_at) || right.number - left.number,
+    )) {
+      selected.add(row.number);
+      queue.push(row.number);
+    }
+
+    for (const row of this.getWatchedOpenPrRows(repoKey)) {
+      if (selected.has(row.number)) {
+        continue;
+      }
+      selected.add(row.number);
+      queue.push(row.number);
+    }
+
+    for (const row of touchedOpenRows) {
+      if (selected.has(row.number)) {
+        continue;
+      }
+      const issueNumbers = this.getLinkedIssuesForPr(row.number).map((issue) => issue.issueNumber);
+      if (issueNumbers.length > 0) {
+        continue;
+      }
+      selected.add(row.number);
+      queue.push(row.number);
+    }
+
+    return queue;
+  }
+
+  private async prewarmPullRequestFacts(params: {
+    repo: RepoRef;
+    source: PullRequestDataSource;
+    touchedPrNumbers: number[];
+  }): Promise<void> {
+    if (!params.source.fetchPullRequestFacts || params.touchedPrNumbers.length === 0) {
+      return;
+    }
+
+    const repoKey = this.repoKey(params.repo);
+    const queue = this.buildPrewarmQueue(repoKey, params.touchedPrNumbers);
+    if (queue.length === 0) {
+      return;
+    }
+
+    const rateLimit = await params.source.getRateLimitStatus?.();
+    if (rateLimit && rateLimit.remaining < 100) {
+      return;
+    }
+    const concurrency =
+      rateLimit && rateLimit.remaining < 250
+        ? 1
+        : Math.max(1, Math.floor(this.syncConcurrency / 2));
+
+    await runTasksWithConcurrency({
+      tasks: queue.map((prNumber) => async () => {
+        await this.ensurePullRequestFactsCached(params.repo, params.source, prNumber);
+        return prNumber;
+      }),
+      limit: concurrency,
+      errorMode: "continue",
+    });
   }
 
   async setPrAttentionState(
@@ -2076,7 +2222,7 @@ export class PrIndexStore {
     return rows.map((row) => row.pr_number);
   }
 
-  private async ensurePullRequestCached(
+  private async ensurePullRequestSummaryCached(
     repo: RepoRef,
     source: PullRequestDataSource,
     prNumber: number,
@@ -2084,9 +2230,24 @@ export class PrIndexStore {
   ): Promise<void> {
     const hasPrRow = this.getPrRow(prNumber) !== null;
     if (!hasPrRow || refresh) {
+      if (source.getPullRequestSummary) {
+        this.upsertPullRequestSummary(
+          await source.getPullRequestSummary(repo, prNumber),
+          "partial",
+        );
+        return;
+      }
       const hydrated = await source.hydratePullRequest(repo, prNumber);
-      await this.upsertHydratedPullRequest(hydrated, { indexVectors: false });
+      this.upsertPullRequestSummary(hydrated.pr, "partial");
     }
+  }
+
+  private async ensurePullRequestFactsCached(
+    repo: RepoRef,
+    source: PullRequestDataSource,
+    prNumber: number,
+    refresh = false,
+  ): Promise<void> {
     if (!source.fetchPullRequestFacts) {
       return;
     }
@@ -2096,13 +2257,145 @@ export class PrIndexStore {
     }
   }
 
+  private async ensureClusterCandidateCached(
+    repo: RepoRef,
+    source: PullRequestDataSource,
+    prNumber: number,
+    refresh = false,
+  ): Promise<void> {
+    await this.ensurePullRequestSummaryCached(repo, source, prNumber, refresh);
+    await this.ensurePullRequestFactsCached(repo, source, prNumber, refresh);
+  }
+
+  private loadClusterInputs(prNumbers: number[]): Map<number, ClusterInputBundle> {
+    const uniqueNumbers = Array.from(new Set(prNumbers)).sort((a, b) => a - b);
+    const bundles = new Map<number, ClusterInputBundle>();
+    if (uniqueNumbers.length === 0) {
+      return bundles;
+    }
+
+    const placeholders = uniqueNumbers.map(() => "?").join(", ");
+    const prRows = this.db
+      .prepare(`SELECT * FROM prs WHERE number IN (${placeholders})`)
+      .all(...uniqueNumbers) as PrRow[];
+    const factRows = this.db
+      .prepare(
+        `SELECT pr_number, head_sha
+           FROM pr_fact_snapshots
+          WHERE pr_number IN (${placeholders})`,
+      )
+      .all(...uniqueNumbers) as Array<{ pr_number: number; head_sha: string }>;
+    const linkedIssueRows = this.db
+      .prepare(
+        `SELECT pr_number, issue_number
+           FROM pr_linked_issues
+          WHERE pr_number IN (${placeholders})
+          ORDER BY pr_number ASC, issue_number ASC`,
+      )
+      .all(...uniqueNumbers) as Array<{ pr_number: number; issue_number: number }>;
+    const changedFileRows = this.db
+      .prepare(
+        `SELECT pr_number, path, kind
+           FROM pr_changed_files
+          WHERE pr_number IN (${placeholders})
+          ORDER BY pr_number ASC, path ASC`,
+      )
+      .all(...uniqueNumbers) as Array<{
+      pr_number: number;
+      path: string;
+      kind: PullRequestChangedFile["kind"];
+    }>;
+
+    for (const pr of prRows) {
+      bundles.set(pr.number, {
+        pr,
+        headSha: null,
+        linkedIssues: [],
+        changedFiles: [],
+      });
+    }
+    for (const factRow of factRows) {
+      const bundle = bundles.get(factRow.pr_number);
+      if (bundle) {
+        bundle.headSha = factRow.head_sha;
+      }
+    }
+    for (const linkedIssueRow of linkedIssueRows) {
+      const bundle = bundles.get(linkedIssueRow.pr_number);
+      if (!bundle) {
+        continue;
+      }
+      const lastIssue = bundle.linkedIssues.at(-1);
+      if (lastIssue !== linkedIssueRow.issue_number) {
+        bundle.linkedIssues.push(linkedIssueRow.issue_number);
+      }
+    }
+    for (const changedFileRow of changedFileRows) {
+      const bundle = bundles.get(changedFileRow.pr_number);
+      if (!bundle) {
+        continue;
+      }
+      bundle.changedFiles.push({
+        path: changedFileRow.path,
+        kind: changedFileRow.kind,
+      });
+    }
+    return bundles;
+  }
+
+  private buildClusterCandidateFromBundle(
+    bundle: ClusterInputBundle | null,
+    status: ClusterCandidate["status"],
+    matchedBy: ClusterMatchSource,
+    reason?: string,
+    reasonCodes: ClusterReasonCode[] = [],
+    semanticScore?: number,
+    supersededBy?: number,
+  ): ClusterCandidate | null {
+    if (!bundle) {
+      return null;
+    }
+    return withClusterFeatures(
+      {
+        prNumber: bundle.pr.number,
+        title: bundle.pr.title,
+        url: bundle.pr.url,
+        state: bundle.pr.state,
+        updatedAt: bundle.pr.updated_at,
+        matchedBy,
+        headSha: bundle.headSha,
+        linkedIssues: bundle.linkedIssues,
+        prodFiles: bundle.changedFiles
+          .filter((file) => file.kind === "prod")
+          .map((file) => file.path),
+        testFiles: bundle.changedFiles
+          .filter((file) => file.kind === "test")
+          .map((file) => file.path),
+        otherFiles: bundle.changedFiles
+          .filter((file) => file.kind === "other")
+          .map((file) => file.path),
+        relevantProdFiles: [],
+        relevantTestFiles: [],
+        noiseFilesCount: 0,
+        status,
+        reasonCodes,
+        semanticScore,
+        supersededBy,
+        reason,
+      },
+      [],
+    );
+  }
+
   async refreshPullRequestDetail(
     repo: RepoRef,
     source: PullRequestDataSource,
     prNumber: number,
   ): Promise<void> {
     await this.init();
-    await this.ensurePullRequestCached(repo, source, prNumber, true);
+    const hydrated = await source.hydratePullRequest(repo, prNumber);
+    await this.upsertHydratedPullRequest(hydrated, { indexVectors: false });
+    await this.ensurePullRequestFactsCached(repo, source, prNumber, true);
   }
 
   async refreshIssueDetail(
@@ -2124,40 +2417,14 @@ export class PrIndexStore {
     semanticScore?: number,
     supersededBy?: number,
   ): ClusterCandidate | null {
-    const pr = this.getPrRow(prNumber);
-    if (!pr) {
-      return null;
-    }
-    const facts = this.getChangedFilesForPr(prNumber);
-    const linkedIssues = this.getLinkedIssuesForPr(prNumber).map((issue) => issue.issueNumber);
-    return withClusterFeatures(
-      {
-        prNumber,
-        title: pr.title,
-        url: pr.url,
-        state: pr.state,
-        updatedAt: pr.updated_at,
-        matchedBy,
-        headSha:
-          (
-            this.db
-              .prepare(`SELECT head_sha FROM pr_fact_snapshots WHERE pr_number = ?`)
-              .get(prNumber) as { head_sha: string } | undefined
-          )?.head_sha ?? null,
-        linkedIssues,
-        prodFiles: facts.filter((file) => file.kind === "prod").map((file) => file.path),
-        testFiles: facts.filter((file) => file.kind === "test").map((file) => file.path),
-        otherFiles: facts.filter((file) => file.kind === "other").map((file) => file.path),
-        relevantProdFiles: [],
-        relevantTestFiles: [],
-        noiseFilesCount: 0,
-        status,
-        reasonCodes,
-        semanticScore,
-        supersededBy,
-        reason,
-      },
-      [],
+    return this.buildClusterCandidateFromBundle(
+      this.loadClusterInputs([prNumber]).get(prNumber) ?? null,
+      status,
+      matchedBy,
+      reason,
+      reasonCodes,
+      semanticScore,
+      supersededBy,
     );
   }
 
@@ -2211,22 +2478,43 @@ export class PrIndexStore {
     return out;
   }
 
-  private async collectLinkedIssueCandidateSet(params: {
+  private buildLinkedIssueClusterCacheKey(
+    repoKey: string,
+    clusterIssueNumbers: number[],
+    bundles: Map<number, ClusterInputBundle>,
+  ): string {
+    const issueKey = [...clusterIssueNumbers].sort((left, right) => left - right).join(",");
+    const memberSignature = Array.from(bundles.values())
+      .sort((left, right) => left.pr.number - right.pr.number)
+      .map((bundle) => `${bundle.pr.number}@${bundle.headSha ?? bundle.pr.updated_at}`)
+      .join("|");
+    return `${repoKey}:${issueKey}:${memberSignature}`;
+  }
+
+  private async computeLinkedIssueClusterEvaluation(params: {
     seed: PrRow;
     clusterIssueNumbers: number[];
     liveIssueSearchLimit: number;
+    limit: number;
+    repoKey: string;
     repo?: RepoRef;
     source?: PullRequestDataSource;
     refresh?: boolean;
-  }): Promise<{
-    rawCandidates: ClusterCandidate[];
-    decisionTrace: ClusterDecisionTrace[];
-  }> {
-    const exactMatches = new Map<number, ClusterMatchSource>([
-      [params.seed.number, "linked_issue"],
-    ]);
+  }): Promise<CachedLinkedIssueClusterEvaluation> {
+    let exactMatches = new Map<number, ClusterMatchSource>([[params.seed.number, "linked_issue"]]);
     for (const prNumber of this.findPullRequestsByLinkedIssues(params.clusterIssueNumbers)) {
       exactMatches.set(prNumber, "linked_issue");
+    }
+
+    let bundles = this.loadClusterInputs(Array.from(exactMatches.keys()));
+    const initialCacheKey = this.buildLinkedIssueClusterCacheKey(
+      params.repoKey,
+      params.clusterIssueNumbers,
+      bundles,
+    );
+    const cached = !params.refresh ? this.linkedIssueClusterCache.get(initialCacheKey) : undefined;
+    if (cached) {
+      return cached;
     }
 
     if (params.repo && params.source) {
@@ -2237,7 +2525,7 @@ export class PrIndexStore {
         params.liveIssueSearchLimit,
       );
       for (const [prNumber, matchedBy] of liveIssueMatches) {
-        await this.ensurePullRequestCached(
+        await this.ensureClusterCandidateCached(
           params.repo,
           params.source,
           prNumber,
@@ -2250,10 +2538,15 @@ export class PrIndexStore {
       }
     }
 
+    for (const prNumber of this.findPullRequestsByLinkedIssues(params.clusterIssueNumbers)) {
+      exactMatches.set(prNumber, exactMatches.get(prNumber) ?? "linked_issue");
+    }
+
+    bundles = this.loadClusterInputs(Array.from(exactMatches.keys()));
     const rawCandidates = Array.from(exactMatches.entries())
       .map(([prNumber, matchedBy]) =>
-        this.buildClusterCandidate(
-          prNumber,
+        this.buildClusterCandidateFromBundle(
+          bundles.get(prNumber) ?? null,
           "same_cluster_candidate",
           matchedBy,
           matchedBy === "live_issue_search" ? "discovered via live issue search" : undefined,
@@ -2263,34 +2556,65 @@ export class PrIndexStore {
         ),
       )
       .filter((candidate): candidate is ClusterCandidate => Boolean(candidate));
-
-    return {
-      rawCandidates,
-      decisionTrace: [
-        buildClusterDecisionTrace({
-          phase: "seed",
-          prNumber: params.seed.number,
-          matchedBy: null,
-          outcome: "linked_issue_seed",
-          summary: `Seed PR links issues ${params.clusterIssueNumbers.map((issue) => `#${issue}`).join(", ")}.`,
-        }),
-        ...rawCandidates.map((candidate) =>
-          buildClusterDecisionTrace({
-            phase: "candidate",
-            prNumber: candidate.prNumber,
-            matchedBy: candidate.matchedBy,
-            outcome: "candidate_generated",
-            summary:
-              candidate.reason ??
-              (candidate.matchedBy === "live_issue_search"
-                ? "Candidate discovered via live issue search."
-                : "Candidate shares the linked issue."),
-            featureVector: candidate.featureVector,
-            reasonCodes: candidate.reasonCodes,
-          }),
+    const relevantPaths = buildRelevantPathSets(params.seed.number, rawCandidates);
+    const rankedCandidates = rawCandidates
+      .map((candidate) =>
+        annotateRelevantCoverage(
+          candidate,
+          relevantPaths.relevantProdFiles,
+          relevantPaths.relevantTestFiles,
+          params.clusterIssueNumbers,
         ),
-      ],
+      )
+      .sort((left, right) => rankClusterCandidates(params.clusterIssueNumbers, left, right));
+    const rankedDecisionSet = rankClusterDecisionSet({
+      rankedCandidates,
+      limit: params.limit,
+    });
+    const decisionTrace = [
+      ...rawCandidates.map((candidate) =>
+        buildClusterDecisionTrace({
+          phase: "candidate",
+          prNumber: candidate.prNumber,
+          matchedBy: candidate.matchedBy,
+          outcome: "candidate_generated",
+          summary:
+            candidate.reason ??
+            (candidate.matchedBy === "live_issue_search"
+              ? "Candidate discovered via live issue search."
+              : "Candidate shares the linked issue."),
+          featureVector: candidate.featureVector,
+          reasonCodes: candidate.reasonCodes,
+        }),
+      ),
+      ...rankedDecisionSet.decisionTrace,
+    ];
+    const cacheEntry: CachedLinkedIssueClusterEvaluation = {
+      clusterIssueNumbers: [...params.clusterIssueNumbers],
+      decisionTrace,
+      rankedCandidates,
+      relevantPaths,
+      bestBase: rankedDecisionSet.bestBase,
+      sameClusterCandidates: rankedDecisionSet.sameClusterCandidates,
     };
+    this.linkedIssueClusterCache.set(
+      this.buildLinkedIssueClusterCacheKey(params.repoKey, params.clusterIssueNumbers, bundles),
+      cacheEntry,
+    );
+    return cacheEntry;
+  }
+
+  private async collectLinkedIssueCandidateSet(params: {
+    seed: PrRow;
+    clusterIssueNumbers: number[];
+    liveIssueSearchLimit: number;
+    limit: number;
+    repoKey: string;
+    repo?: RepoRef;
+    source?: PullRequestDataSource;
+    refresh?: boolean;
+  }): Promise<CachedLinkedIssueClusterEvaluation> {
+    return this.computeLinkedIssueClusterEvaluation(params);
   }
 
   private async collectSemanticOnlyDecisionSet(params: {
@@ -2308,18 +2632,23 @@ export class PrIndexStore {
     const nearbyButExcluded: ClusterExcludedCandidate[] = [];
     const decisionTrace: ClusterDecisionTrace[] = [];
     const seedChangedFiles = this.getChangedFilesForPr(params.seed.number);
+    const semanticNumbers = Array.from(params.semanticNumbers.entries());
 
-    for (const [prNumber, matchedBy] of params.semanticNumbers) {
-      if (params.repo && params.source) {
-        await this.ensurePullRequestCached(
+    if (params.repo && params.source) {
+      for (const [prNumber] of semanticNumbers) {
+        await this.ensureClusterCandidateCached(
           params.repo,
           params.source,
           prNumber,
           params.refresh ?? false,
         );
       }
-      const candidateRow = this.getPrRow(prNumber);
-      if (!candidateRow) {
+    }
+    const bundles = this.loadClusterInputs(semanticNumbers.map(([prNumber]) => prNumber));
+
+    for (const [prNumber, matchedBy] of semanticNumbers) {
+      const bundle = bundles.get(prNumber);
+      if (!bundle) {
         continue;
       }
       const semanticScore = computeSemanticScore({
@@ -2329,13 +2658,13 @@ export class PrIndexStore {
           changedFiles: seedChangedFiles,
         },
         candidate: {
-          title: candidateRow.title,
-          body: candidateRow.body,
-          changedFiles: this.getChangedFilesForPr(candidateRow.number),
+          title: bundle.pr.title,
+          body: bundle.pr.body,
+          changedFiles: bundle.changedFiles,
         },
       });
-      const candidate = this.buildClusterCandidate(
-        prNumber,
+      const candidate = this.buildClusterCandidateFromBundle(
+        bundle,
         "possible_same_cluster",
         matchedBy,
         undefined,
@@ -2380,20 +2709,28 @@ export class PrIndexStore {
   }> {
     const nearbyButExcluded: ClusterExcludedCandidate[] = [];
     const decisionTrace: ClusterDecisionTrace[] = [];
+    const nearbyNumbers = Array.from(params.nearbyNumbers.entries()).filter(
+      ([prNumber]) => !params.sameClusterSet.has(prNumber),
+    );
 
-    for (const [prNumber, matchedBy] of params.nearbyNumbers) {
-      if (params.sameClusterSet.has(prNumber)) {
-        continue;
-      }
-      if (params.repo && params.source) {
-        await this.ensurePullRequestCached(
+    if (params.repo && params.source) {
+      for (const [prNumber] of nearbyNumbers) {
+        await this.ensureClusterCandidateCached(
           params.repo,
           params.source,
           prNumber,
           params.refresh ?? false,
         );
       }
-      const candidate = this.buildClusterCandidate(prNumber, "same_cluster_candidate", matchedBy);
+    }
+    const bundles = this.loadClusterInputs(nearbyNumbers.map(([prNumber]) => prNumber));
+
+    for (const [prNumber, matchedBy] of nearbyNumbers) {
+      const candidate = this.buildClusterCandidateFromBundle(
+        bundles.get(prNumber) ?? null,
+        "same_cluster_candidate",
+        matchedBy,
+      );
       if (!candidate) {
         continue;
       }
@@ -2570,7 +2907,7 @@ export class PrIndexStore {
     await this.ensureDerivedIssueLinksBackfilled();
     const limit = params.limit ?? DEFAULT_SEARCH_LIMIT;
     if (params.repo && params.source) {
-      await this.ensurePullRequestCached(
+      await this.ensureClusterCandidateCached(
         params.repo,
         params.source,
         params.prNumber,
@@ -2637,31 +2974,26 @@ export class PrIndexStore {
       seed,
       clusterIssueNumbers: seedLinkedIssues,
       liveIssueSearchLimit: limit * 3,
+      limit,
+      repoKey:
+        params.repoKey ??
+        (params.repo ? this.repoKey(params.repo) : (this.getMeta(META_REPO) ?? "")),
       repo: params.repo,
       source: params.source,
       refresh: params.refresh ?? false,
     });
-    const rawCandidates = linkedIssueCandidateSet.rawCandidates;
-    const decisionTrace = [...linkedIssueCandidateSet.decisionTrace];
-    const relevantPaths = buildRelevantPathSets(params.prNumber, rawCandidates);
-    const rankedCandidates = rawCandidates
-      .map((candidate) =>
-        annotateRelevantCoverage(
-          candidate,
-          relevantPaths.relevantProdFiles,
-          relevantPaths.relevantTestFiles,
-          seedLinkedIssues,
-        ),
-      )
-      .sort((left, right) => rankClusterCandidates(seedLinkedIssues, left, right));
-
-    const rankedDecisionSet = rankClusterDecisionSet({
-      rankedCandidates,
-      limit,
-    });
-    const bestBase = rankedDecisionSet.bestBase;
-    const sameClusterCandidates = rankedDecisionSet.sameClusterCandidates;
-    decisionTrace.push(...rankedDecisionSet.decisionTrace);
+    const decisionTrace = [
+      buildClusterDecisionTrace({
+        phase: "seed",
+        prNumber: seed.number,
+        matchedBy: null,
+        outcome: "linked_issue_seed",
+        summary: `Seed PR links issues ${seedLinkedIssues.map((issue) => `#${issue}`).join(", ")}.`,
+      }),
+      ...linkedIssueCandidateSet.decisionTrace,
+    ];
+    const bestBase = linkedIssueCandidateSet.bestBase;
+    const sameClusterCandidates = linkedIssueCandidateSet.sameClusterCandidates;
 
     const nearbyNumbers = new Map<number, ClusterMatchSource>(localNearbyNumbers);
     if (params.repo && params.source && nearbyNumbers.size < limit) {
@@ -2676,11 +3008,13 @@ export class PrIndexStore {
       }
     }
 
-    const sameClusterSet = new Set(rankedCandidates.map((candidate) => candidate.prNumber));
+    const sameClusterSet = new Set(
+      linkedIssueCandidateSet.rankedCandidates.map((candidate) => candidate.prNumber),
+    );
     const nearbyDecisionSet = await this.collectNearbyExcludedCandidates({
       nearbyNumbers,
       sameClusterSet,
-      relevantPaths,
+      relevantPaths: linkedIssueCandidateSet.relevantPaths,
       clusterIssueNumbers: seedLinkedIssues,
       repo: params.repo,
       source: params.source,
