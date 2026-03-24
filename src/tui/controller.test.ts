@@ -597,6 +597,8 @@ describe("TuiController", () => {
     model = controller.getRenderModel();
     expect(model.resultsPane.rows).toHaveLength(0);
     expect(model.footer.message).toContain("Hid excluded cluster candidates.");
+    expect(model.detailPane.visible).toBe(false);
+    expect(model.detailPane.title).toBe("Start Here");
 
     await controller.expandSelectedCluster();
     model = controller.getRenderModel();
@@ -985,6 +987,31 @@ describe("TuiController", () => {
     expect(model.mode).toBe("watchlist");
     expect(model.resultsPane.rows).toHaveLength(1);
     expect(model.resultsPane.rows[0]?.kind).toBe("pr");
+  });
+
+  it("keeps dismissed banners hidden after busy refreshes finish", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.toggleWatchSelected();
+    expect(controller.getRenderModel().footer.banner?.message).toContain("watch");
+
+    controller.dismissBanner();
+    expect(controller.getRenderModel().footer.banner).toBeNull();
+
+    const refreshPromise = controller.refreshSelected();
+    await flushMicrotasks();
+    expect(controller.getRenderModel().footer.banner?.message).toContain("[REFRESHING]");
+
+    service.releaseRefreshPr();
+    await refreshPromise;
+
+    expect(controller.getRenderModel().footer.banner).toBeNull();
   });
 
   it("ignores PRs in Inbox without hiding them from other desks", async () => {

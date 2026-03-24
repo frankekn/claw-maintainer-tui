@@ -1108,6 +1108,10 @@ export class TuiController {
       await this.refreshDetailForSelection(true);
       return;
     }
+    if (this.rows.length === 0) {
+      this.resetDetailState();
+      this.focus = "results";
+    }
     this.emit();
   }
 
@@ -1693,6 +1697,8 @@ export class TuiController {
       this.emit();
       return;
     }
+    const previousBanner = this.banner;
+    const previousBannerHidden = this.bannerHidden;
     this.busyMessage = label;
     this.errorMessage = null;
     this.bannerHidden = false;
@@ -1711,6 +1717,9 @@ export class TuiController {
       this.bannerHidden = false;
     } finally {
       this.busyMessage = null;
+      if (!this.errorMessage && this.banner === previousBanner) {
+        this.bannerHidden = previousBannerHidden;
+      }
       this.emit();
     }
   }
