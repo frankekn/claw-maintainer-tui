@@ -129,6 +129,9 @@ export function resolveKeyAction(
     return { kind: "command", command: { type: "expand_cluster" } };
   }
   if (key.name === "v") {
+    if (key.shift) {
+      return { kind: "command", command: { type: "mark_visible_seen" } };
+    }
     return { kind: "command", command: { type: "mark_seen" } };
   }
   if (key.name === "w") {
@@ -138,6 +141,9 @@ export function resolveKeyAction(
     return { kind: "command", command: { type: "toggle_ignore" } };
   }
   if (key.name === "u") {
+    if (key.shift) {
+      return { kind: "command", command: { type: "undo_attention_state" } };
+    }
     return { kind: "command", command: { type: "clear_attention_state" } };
   }
   if (key.name === "s" && key.shift) {

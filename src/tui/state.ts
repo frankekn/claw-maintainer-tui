@@ -29,6 +29,7 @@ export function createInitialSessionState(resultLimit: number): TuiSessionState 
     banner: null,
     bannerHidden: false,
     helpVisible: false,
+    lastAttentionMutation: null,
     history: [],
   };
 }
@@ -84,6 +85,7 @@ export function createViewSnapshot(
       banner: session.banner,
       bannerHidden: session.bannerHidden,
       helpVisible: session.helpVisible,
+      lastAttentionMutation: session.lastAttentionMutation,
     },
     detail: {
       visible: detail.visible,

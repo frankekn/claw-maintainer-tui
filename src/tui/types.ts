@@ -109,9 +109,18 @@ export type TuiActionId =
   | "open-url"
   | "back"
   | "mark-seen"
+  | "mark-page-seen"
   | "toggle-watch"
   | "toggle-ignore"
-  | "clear-state";
+  | "clear-state"
+  | "undo";
+
+export type TuiAttentionMutation = {
+  prNumbers: number[];
+  previousStates: Array<AttentionState | null>;
+  nextState: AttentionState | null;
+  message: string;
+};
 
 export type TuiAction = {
   id: TuiActionId;
@@ -226,6 +235,7 @@ export type TuiSessionState = {
   banner: TuiBanner | null;
   bannerHidden: boolean;
   helpVisible: boolean;
+  lastAttentionMutation: TuiAttentionMutation | null;
   history: TuiViewSnapshot[];
 };
 
@@ -267,9 +277,11 @@ export type TuiCommand =
   | { type: "submit_query" }
   | { type: "go_back" }
   | { type: "mark_seen" }
+  | { type: "mark_visible_seen" }
   | { type: "toggle_watch" }
   | { type: "toggle_ignore" }
   | { type: "clear_attention_state" }
+  | { type: "undo_attention_state" }
   | { type: "sync_prs" }
   | { type: "sync_issues" }
   | { type: "refresh_selected" }

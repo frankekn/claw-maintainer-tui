@@ -49,6 +49,7 @@ import type {
   TuiSessionState,
   TuiSyncJobSnapshot,
   TuiSyncMode,
+  TuiAttentionMutation,
 } from "./types.js";
 
 type ControllerOptions = {
@@ -216,6 +217,14 @@ export class TuiController {
 
   private set helpVisible(value: boolean) {
     this.sessionState.helpVisible = value;
+  }
+
+  private get lastAttentionMutation(): TuiAttentionMutation | null {
+    return this.sessionState.lastAttentionMutation;
+  }
+
+  private set lastAttentionMutation(value: TuiAttentionMutation | null) {
+    this.sessionState.lastAttentionMutation = value;
   }
 
   private get context(): TuiContext {
@@ -428,6 +437,9 @@ export class TuiController {
       case "mark_seen":
         await this.markSeenSelected();
         return;
+      case "mark_visible_seen":
+        await this.markVisiblePageSeen();
+        return;
       case "toggle_watch":
         await this.toggleWatchSelected();
         return;
@@ -436,6 +448,9 @@ export class TuiController {
         return;
       case "clear_attention_state":
         await this.clearSelectedAttentionState();
+        return;
+      case "undo_attention_state":
+        await this.undoAttentionState();
         return;
       case "sync_prs":
         await this.syncPrs();
@@ -736,6 +751,36 @@ export class TuiController {
     await this.updateAttentionState("seen", "Marked PR as seen.");
   }
 
+  async markVisiblePageSeen(): Promise<void> {
+    const targets = this.visiblePriorityPrNumbers();
+    if (targets.length === 0) {
+      return;
+    }
+    const previousStates = await Promise.all(
+      targets.map((prNumber) =>
+        this.currentAttentionState(prNumber, this.priorityStateFromRows(prNumber)),
+      ),
+    );
+    await Promise.all(
+      targets.map((prNumber) => this.effects.setPrAttentionState(prNumber, "seen")),
+    );
+    this.lastAttentionMutation = {
+      prNumbers: targets,
+      previousStates: previousStates.map((state) => (state === "new" ? null : state)),
+      nextState: "seen",
+      message: `Marked ${targets.length} PR${targets.length === 1 ? "" : "s"} on this page as seen.`,
+    };
+    this.message = this.lastAttentionMutation.message;
+    this.banner = {
+      tone: "success",
+      message: this.lastAttentionMutation.message,
+      actions: ["U undo", "Esc dismiss"],
+      dismissible: true,
+    };
+    this.bannerHidden = false;
+    await this.refreshActiveListPreservingUi();
+  }
+
   async toggleWatchSelected(): Promise<void> {
     const row = this.rows[this.selectedIndex];
     if (!isPriorityDetailRow(row)) {
@@ -768,6 +813,28 @@ export class TuiController {
 
   async clearSelectedAttentionState(): Promise<void> {
     await this.updateAttentionState(null, "Cleared local triage state.");
+  }
+
+  async undoAttentionState(): Promise<void> {
+    if (!this.lastAttentionMutation) {
+      return;
+    }
+    const mutation = this.lastAttentionMutation;
+    await Promise.all(
+      mutation.prNumbers.map((prNumber, index) =>
+        this.effects.setPrAttentionState(prNumber, mutation.previousStates[index] ?? null),
+      ),
+    );
+    this.lastAttentionMutation = null;
+    this.message = `Undid triage change for ${mutation.prNumbers.length} PR${mutation.prNumbers.length === 1 ? "" : "s"}.`;
+    this.banner = {
+      tone: "info",
+      message: this.message,
+      actions: ["Esc dismiss"],
+      dismissible: true,
+    };
+    this.bannerHidden = false;
+    await this.refreshActiveListPreservingUi();
   }
 
   async syncPrs(): Promise<void> {
@@ -845,22 +912,44 @@ export class TuiController {
     if (!row) {
       return;
     }
+    let mutation: TuiAttentionMutation | null = null;
     if (row.kind === "pr") {
+      const previous = await this.currentAttentionState(
+        row.pr.prNumber,
+        row.priority?.attentionState,
+      );
       await this.effects.setPrAttentionState(row.pr.prNumber, state);
+      mutation = {
+        prNumbers: [row.pr.prNumber],
+        previousStates: [previous === "new" ? null : previous],
+        nextState: state,
+        message,
+      };
     } else if (row.kind === "priority-cluster") {
+      const prNumbers = row.cluster.openMembers.map((member) => member.pr.prNumber);
+      const previousStates = row.cluster.openMembers.map((member) =>
+        member.attentionState === "new" ? null : member.attentionState,
+      );
       await Promise.all(
         row.cluster.openMembers.map((member) =>
           this.effects.setPrAttentionState(member.pr.prNumber, state),
         ),
       );
+      mutation = {
+        prNumbers,
+        previousStates,
+        nextState: state,
+        message,
+      };
     } else {
       return;
     }
+    this.lastAttentionMutation = mutation;
     this.message = message;
     this.banner = {
       tone: "success",
       message,
-      actions: ["Esc dismiss"],
+      actions: ["U undo", "Esc dismiss"],
       dismissible: true,
     };
     this.bannerHidden = false;
@@ -895,6 +984,39 @@ export class TuiController {
     return bundle?.candidate.attentionState ?? "new";
   }
 
+  private priorityStateFromRows(prNumber: number): PriorityAttentionState | null {
+    for (const row of this.rows) {
+      if (row.kind === "pr" && row.pr.prNumber === prNumber) {
+        return row.priority?.attentionState ?? null;
+      }
+      if (row.kind === "priority-cluster") {
+        const member = row.cluster.openMembers.find(
+          (candidate) => candidate.pr.prNumber === prNumber,
+        );
+        if (member) {
+          return member.attentionState;
+        }
+      }
+    }
+    return null;
+  }
+
+  private visiblePriorityPrNumbers(): number[] {
+    return Array.from(
+      new Set(
+        this.rows.flatMap((row) => {
+          if (row.kind === "pr") {
+            return [row.pr.prNumber];
+          }
+          if (row.kind === "priority-cluster") {
+            return row.cluster.openMembers.map((member) => member.pr.prNumber);
+          }
+          return [];
+        }),
+      ),
+    );
+  }
+
   private buildActions(): TuiAction[] {
     const row = this.rows[this.selectedIndex];
     const hasRow = Boolean(row);
@@ -912,6 +1034,8 @@ export class TuiController {
           ? this.clusterAttentionState(row) !== "new"
           : false;
     const canOpenUrl = Boolean(this.getActiveUrl());
+    const canUndoAttention = this.lastAttentionMutation !== null;
+    const canPageSeen = this.visiblePriorityPrNumbers().length > 0;
 
     switch (this.mode) {
       case "inbox":
@@ -929,6 +1053,8 @@ export class TuiController {
           this.action("toggle-watch", "Watch", "w", canTriage),
           this.action("toggle-ignore", "Ignore", "i", canTriage),
           this.action("clear-state", "Clear", "u", hasLocalState),
+          this.action("mark-page-seen", "Seen Page", "V", canPageSeen),
+          this.action("undo", "Undo", "U", canUndoAttention),
           this.action("load-more", "More", "m", this.canLoadMore()),
           this.action("open-url", "Open URL", "o", canOpenUrl),
         ];
@@ -952,6 +1078,8 @@ export class TuiController {
           this.action("cluster", "Cluster", "c", canCluster),
           this.action("mark-seen", "Seen", "v", canTriage),
           this.action("toggle-watch", "Watch", "w", canTriage),
+          this.action("mark-page-seen", "Seen Page", "V", canPageSeen),
+          this.action("undo", "Undo", "U", canUndoAttention),
           this.action("refresh", "Refresh", "r", canRefresh),
           this.action("load-more", "More", "m", this.canLoadMore()),
           this.action("open-url", "Open URL", "o", canOpenUrl),

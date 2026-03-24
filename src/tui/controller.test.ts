@@ -659,6 +659,30 @@ describe("TuiController", () => {
     expect(controller.getRenderModel().resultsPane.rows[0]?.kind).toBe("pr");
   });
 
+  it("marks the visible page as seen and can undo the batch change", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.markVisiblePageSeen();
+
+    expect(service.attentionState.get(41793)).toBe("seen");
+    expect(service.attentionState.get(41812)).toBe("seen");
+    expect(controller.getRenderModel().footer.actions.some((action) => action.id === "undo")).toBe(
+      true,
+    );
+
+    await controller.undoAttentionState();
+
+    expect(service.attentionState.has(41793)).toBe(false);
+    expect(service.attentionState.has(41812)).toBe(false);
+    expect(controller.getRenderModel().footer.banner?.message).toContain("Undid triage change");
+  });
+
   it("loads more Inbox rows in batches of 20", async () => {
     const service = new FakeTuiDataService();
     const controller = new TuiController(service, {

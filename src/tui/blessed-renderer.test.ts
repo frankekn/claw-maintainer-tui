@@ -150,6 +150,29 @@ describe("BlessedTuiRenderer", () => {
     expect(controller.dispatch).toHaveBeenNthCalledWith(4, { type: "clear_attention_state" });
   });
 
+  it("routes shifted triage shortcuts to page-seen and undo actions", async () => {
+    const controller = createControllerStub();
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness;
+    renderers.push(harness);
+
+    await harness.handleKeypress("V", {
+      name: "v",
+      shift: true,
+    } as blessed.Widgets.Events.IKeyEventArg);
+    await harness.handleKeypress("U", {
+      name: "u",
+      shift: true,
+    } as blessed.Widgets.Events.IKeyEventArg);
+
+    expect(controller.dispatch).toHaveBeenNthCalledWith(1, {
+      type: "mark_visible_seen",
+    });
+    expect(controller.dispatch).toHaveBeenNthCalledWith(2, {
+      type: "undo_attention_state",
+    });
+  });
+
   it("routes left and right arrows to mode changes from non-query focus", async () => {
     const controller = createControllerStub();
     const renderer = new BlessedTuiRenderer(controller as never);

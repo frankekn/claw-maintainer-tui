@@ -71,6 +71,25 @@ function formatReasonLines(reasons: PriorityCandidate["reasons"]): string[] {
   return reasons.map((reason) => `- ${reason.label} ${text(`(+${reason.points})`, "muted")}`);
 }
 
+function formatCoverageSummary(candidate: ClusterCandidate): string {
+  return `prod ${candidate.relevantProdFiles.length}/${candidate.prodFiles.length}  test ${candidate.relevantTestFiles.length}/${candidate.testFiles.length}  noise ${candidate.noiseFilesCount}`;
+}
+
+function formatClusterCandidateLine(
+  candidate: ClusterCandidate,
+  marker: string,
+  label: string,
+): string {
+  const reasonSummary =
+    candidate.reasonCodes.length > 0
+      ? candidate.reasonCodes.slice(0, 2).join(", ")
+      : (candidate.reason ?? "cached");
+  return `${marker} #${candidate.prNumber} ${candidate.title}  ${text(label, "muted")}  ${text(
+    formatCoverageSummary(candidate),
+    "dim",
+  )}  ${text(reasonSummary, "muted")}`;
+}
+
 function appendSection(
   lines: string[],
   anchors: Partial<Record<TuiDetailSection, number>>,
@@ -140,6 +159,9 @@ export function formatPriorityPrDetail(
   const clusterCandidates =
     (bundle.cluster?.sameClusterCandidates.length ?? 0) +
     (bundle.cluster?.nearbyButExcluded.length ?? 0);
+  const bestBase = bundle.cluster?.bestBase ?? null;
+  const sameClusterCandidates = bundle.cluster?.sameClusterCandidates ?? [];
+  const nearbyButExcluded = bundle.cluster?.nearbyButExcluded ?? [];
   appendSection(lines, anchors, "cluster", "Cluster", [
     bundle.cluster
       ? `${text("basis", "muted")} ${bundle.cluster.clusterBasis}`
@@ -148,11 +170,27 @@ export function formatPriorityPrDetail(
       ? `${text("issues", "muted")} ${bundle.cluster.clusterIssueNumbers.map((issue) => `#${issue}`).join(", ")}`
       : `${text("issues", "muted")} (none)`,
     `${text("rows", "muted")} ${clusterCandidates}`,
-    ...(bundle.cluster?.sameClusterCandidates.length
-      ? bundle.cluster.sameClusterCandidates.map(
-          (candidate) => `- #${candidate.prNumber} ${candidate.title}`,
-        )
-      : ["(none)"]),
+    ...(bestBase ? [formatClusterCandidateLine(bestBase, "★", "best base")] : []),
+    ...(sameClusterCandidates.length > 0
+      ? sameClusterCandidates
+          .filter((candidate) => candidate.prNumber !== bestBase?.prNumber)
+          .map((candidate) =>
+            formatClusterCandidateLine(
+              candidate,
+              candidate.status === "superseded_candidate" ? "└" : "├",
+              candidate.status.replaceAll("_", " "),
+            ),
+          )
+      : bestBase
+        ? []
+        : ["(none)"]),
+    ...(nearbyButExcluded.length > 0
+      ? [
+          `${text("excluded", "muted")} +${nearbyButExcluded.length} candidate${
+            nearbyButExcluded.length === 1 ? "" : "s"
+          } hidden  ${text("[E planned]", "dim")}`,
+        ]
+      : []),
   ]);
   appendSection(lines, anchors, "maintainer-state", "Maintainer State", [
     `${text("attention", "muted")} ${bundle.candidate.attentionState}`,
