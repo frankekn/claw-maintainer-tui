@@ -37,6 +37,8 @@ const renderModel: TuiRenderModel = {
   mode: "inbox",
   focus: "results",
   layoutMode: "single-pane",
+  resultsWidth: "100%",
+  detailWidth: "0%",
   resultsPane: {
     title: "Inbox",
     summary: null,
@@ -184,6 +186,29 @@ describe("BlessedTuiRenderer", () => {
 
     expect(controller.dispatch).toHaveBeenNthCalledWith(1, { type: "activate_mode", delta: -1 });
     expect(controller.dispatch).toHaveBeenNthCalledWith(2, { type: "activate_mode", delta: 1 });
+  });
+
+  it("routes z and bracket keys to detail layout controls", async () => {
+    const controller = createControllerStub();
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness;
+    renderers.push(harness);
+
+    await harness.handleKeypress("z", { name: "z" } as blessed.Widgets.Events.IKeyEventArg);
+    await harness.handleKeypress("[", { name: "[" } as blessed.Widgets.Events.IKeyEventArg);
+    await harness.handleKeypress("]", { name: "]" } as blessed.Widgets.Events.IKeyEventArg);
+
+    expect(controller.dispatch).toHaveBeenNthCalledWith(1, {
+      type: "toggle_detail_layout",
+    });
+    expect(controller.dispatch).toHaveBeenNthCalledWith(2, {
+      type: "resize_detail",
+      delta: -1,
+    });
+    expect(controller.dispatch).toHaveBeenNthCalledWith(3, {
+      type: "resize_detail",
+      delta: 1,
+    });
   });
 
   it("deduplicates enter and return keypresses fired back-to-back", async () => {

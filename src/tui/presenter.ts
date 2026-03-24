@@ -1,5 +1,5 @@
 import { buildDetailPaneModel, formatResultsPaneModel } from "./format.js";
-import { TUI_MODE_ORDER } from "./types.js";
+import { DETAIL_WIDTH_PRESETS, TUI_MODE_ORDER } from "./types.js";
 import type {
   TuiAction,
   TuiBanner,
@@ -35,6 +35,8 @@ function buildGlobalKeys(): TuiAction[] {
     { id: "detail", label: "Mode", shortcut: "\u2190/\u2192", enabled: true },
     { id: "detail", label: "Jump", shortcut: "1-6", enabled: true },
     { id: "detail", label: "Focus", shortcut: "Tab", enabled: true },
+    { id: "detail", label: "Zoom", shortcut: "z", enabled: true },
+    { id: "detail", label: "Resize", shortcut: "[ ]", enabled: true },
     { id: "detail", label: "Help", shortcut: "?", enabled: true },
     { id: "detail", label: "Quit", shortcut: "q", enabled: true },
   ];
@@ -145,6 +147,8 @@ export function buildRenderModel(
       : modeInfo.queryExamples.length > 0
         ? `example: ${modeInfo.queryExamples[0]}`
         : modeInfo.browsePrompt;
+  const widthPreset = DETAIL_WIDTH_PRESETS[session.detailWidthIndex] ?? DETAIL_WIDTH_PRESETS[0];
+  const layoutMode = detail.visible ? session.detailLayoutMode : "single-pane";
 
   return {
     header: {
@@ -180,7 +184,19 @@ export function buildRenderModel(
     helpOverlay: buildHelpOverlay(session, options.actions, globalKeys),
     mode: session.mode,
     focus: session.focus,
-    layoutMode: detail.visible ? "split-pane" : "single-pane",
+    layoutMode,
+    resultsWidth:
+      layoutMode === "split-pane"
+        ? widthPreset.results
+        : layoutMode === "detail-fullscreen"
+          ? "0%"
+          : "100%",
+    detailWidth:
+      layoutMode === "split-pane"
+        ? widthPreset.detail
+        : layoutMode === "detail-fullscreen"
+          ? "100%"
+          : "0%",
     resultsPane,
     detailPane,
     activeUrl: session.activeUrl,

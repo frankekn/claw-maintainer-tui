@@ -24,7 +24,7 @@ import {
   createLandingDetailState,
   createViewSnapshot,
 } from "./state.js";
-import { TUI_MODE_ORDER } from "./types.js";
+import { DETAIL_WIDTH_PRESETS, TUI_MODE_ORDER } from "./types.js";
 import type {
   AttentionState,
   IssueSearchResult,
@@ -219,6 +219,22 @@ export class TuiController {
     this.sessionState.helpVisible = value;
   }
 
+  private get detailLayoutMode(): Exclude<TuiRenderModel["layoutMode"], "single-pane"> {
+    return this.sessionState.detailLayoutMode;
+  }
+
+  private set detailLayoutMode(value: Exclude<TuiRenderModel["layoutMode"], "single-pane">) {
+    this.sessionState.detailLayoutMode = value;
+  }
+
+  private get detailWidthIndex(): number {
+    return this.sessionState.detailWidthIndex;
+  }
+
+  private set detailWidthIndex(value: number) {
+    this.sessionState.detailWidthIndex = value;
+  }
+
   private get lastAttentionMutation(): TuiAttentionMutation | null {
     return this.sessionState.lastAttentionMutation;
   }
@@ -394,6 +410,12 @@ export class TuiController {
       case "toggle_detail":
         await this.openSelected();
         return;
+      case "toggle_detail_layout":
+        this.toggleDetailLayout();
+        return;
+      case "resize_detail":
+        this.resizeDetail(command.delta);
+        return;
       case "expand_cluster":
         await this.expandSelectedCluster();
         return;
@@ -489,7 +511,8 @@ export class TuiController {
   }
 
   focusResults(): void {
-    this.focus = "results";
+    this.focus =
+      this.showDetail && this.detailLayoutMode === "detail-fullscreen" ? "detail" : "results";
     this.emit();
   }
 
@@ -514,6 +537,8 @@ export class TuiController {
     this.banner = null;
     this.bannerHidden = false;
     this.helpVisible = false;
+    this.detailLayoutMode = "split-pane";
+    this.detailWidthIndex = 0;
     this.isLandingView = false;
     this.resultTitle = this.modeLabel(mode);
     this.message = this.isListMode(mode)
@@ -562,7 +587,8 @@ export class TuiController {
     if (this.isQueryMode(this.mode)) {
       this.syncQueryState(this.mode, this.query);
     }
-    this.focus = "results";
+    this.focus =
+      this.showDetail && this.detailLayoutMode === "detail-fullscreen" ? "detail" : "results";
     this.emit();
   }
 
@@ -863,6 +889,8 @@ export class TuiController {
     this.context = snapshot.session.context;
     this.isLandingView = snapshot.session.isLandingView;
     this.browseLimit = snapshot.session.browseLimit;
+    this.detailLayoutMode = snapshot.session.detailLayoutMode;
+    this.detailWidthIndex = snapshot.session.detailWidthIndex;
     this.setDetailPayload(snapshot.detail);
     this.errorMessage = null;
     this.focus = "results";
@@ -872,6 +900,34 @@ export class TuiController {
 
   getActiveUrl(): string | null {
     return this.activeUrl ?? this.rowUrl(this.rows[this.selectedIndex]);
+  }
+
+  toggleDetailLayout(): void {
+    if (!this.showDetail) {
+      return;
+    }
+    this.detailLayoutMode =
+      this.detailLayoutMode === "detail-fullscreen" ? "split-pane" : "detail-fullscreen";
+    if (this.detailLayoutMode === "detail-fullscreen") {
+      this.focus = "detail";
+    }
+    this.emit();
+  }
+
+  resizeDetail(delta: -1 | 1): void {
+    if (!this.showDetail || this.detailLayoutMode !== "split-pane") {
+      return;
+    }
+    const nextIndex = Math.max(
+      0,
+      Math.min(DETAIL_WIDTH_PRESETS.length - 1, this.detailWidthIndex + delta),
+    );
+    if (nextIndex === this.detailWidthIndex) {
+      return;
+    }
+    this.detailWidthIndex = nextIndex;
+    this.message = `Detail width ${DETAIL_WIDTH_PRESETS[nextIndex]?.label ?? ""}.`;
+    this.emit();
   }
 
   async refreshSelected(): Promise<void> {

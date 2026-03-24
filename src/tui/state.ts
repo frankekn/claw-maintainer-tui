@@ -29,6 +29,8 @@ export function createInitialSessionState(resultLimit: number): TuiSessionState 
     banner: null,
     bannerHidden: false,
     helpVisible: false,
+    detailLayoutMode: "split-pane",
+    detailWidthIndex: 0,
     lastAttentionMutation: null,
     history: [],
   };
@@ -49,7 +51,8 @@ export function createLandingDetailState(
 }
 
 export function availableFocuses(session: TuiSessionState, detail: TuiDetailState): TuiFocus[] {
-  const focuses: TuiFocus[] = ["results"];
+  const focuses: TuiFocus[] =
+    detail.visible && session.detailLayoutMode === "detail-fullscreen" ? [] : ["results"];
   if (detail.visible) {
     focuses.push("detail");
   }
@@ -85,6 +88,8 @@ export function createViewSnapshot(
       banner: session.banner,
       bannerHidden: session.bannerHidden,
       helpVisible: session.helpVisible,
+      detailLayoutMode: session.detailLayoutMode,
+      detailWidthIndex: session.detailWidthIndex,
       lastAttentionMutation: session.lastAttentionMutation,
     },
     detail: {

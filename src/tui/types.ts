@@ -96,6 +96,12 @@ export const TUI_MODE_ORDER: TuiModeMeta[] = [
   },
 ];
 
+export const DETAIL_WIDTH_PRESETS = [
+  { results: "64%", detail: "36%", label: "36%" },
+  { results: "58%", detail: "42%", label: "42%" },
+  { results: "52%", detail: "48%", label: "48%" },
+] as const;
+
 export type TuiActionId =
   | "query"
   | "detail"
@@ -235,6 +241,8 @@ export type TuiSessionState = {
   banner: TuiBanner | null;
   bannerHidden: boolean;
   helpVisible: boolean;
+  detailLayoutMode: Exclude<TuiLayoutMode, "single-pane">;
+  detailWidthIndex: number;
   lastAttentionMutation: TuiAttentionMutation | null;
   history: TuiViewSnapshot[];
 };
@@ -264,6 +272,8 @@ export type TuiCommand =
   | { type: "activate_mode_index"; index: number }
   | { type: "move_selection"; delta: number }
   | { type: "toggle_detail" }
+  | { type: "toggle_detail_layout" }
+  | { type: "resize_detail"; delta: -1 | 1 }
   | { type: "expand_cluster" }
   | { type: "jump_detail_section"; section: Extract<TuiDetailSection, "linked-issues" | "cluster"> }
   | { type: "toggle_help" }
@@ -314,7 +324,7 @@ export type TuiFooterModel = {
   autoUpdateHint: string | null;
 };
 
-export type TuiLayoutMode = "single-pane" | "split-pane";
+export type TuiLayoutMode = "single-pane" | "split-pane" | "detail-fullscreen";
 
 export type TuiResultsPaneModel = {
   title: string;
@@ -347,6 +357,8 @@ export type TuiRenderModel = {
   mode: TuiMode;
   focus: TuiFocus;
   layoutMode: TuiLayoutMode;
+  resultsWidth: string;
+  detailWidth: string;
   resultsPane: TuiResultsPaneModel;
   detailPane: TuiDetailPaneModel;
   activeUrl: string | null;

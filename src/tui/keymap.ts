@@ -110,6 +110,15 @@ export function resolveKeyAction(
   if (key.name === "enter" || key.name === "return") {
     return { kind: "command", command: { type: "toggle_detail" } };
   }
+  if (key.name === "z") {
+    return { kind: "command", command: { type: "toggle_detail_layout" } };
+  }
+  if (ch === "[" || key.name === "[") {
+    return { kind: "command", command: { type: "resize_detail", delta: -1 } };
+  }
+  if (ch === "]" || key.name === "]") {
+    return { kind: "command", command: { type: "resize_detail", delta: 1 } };
+  }
   if (
     isSlashKey(ch, key) &&
     (model.mode === "cross-search" || model.mode === "pr-search" || model.mode === "issue-search")

@@ -564,6 +564,37 @@ describe("TuiController", () => {
     expect(model.detailPane.lines.join("\n")).toContain("CLUSTER");
   });
 
+  it("toggles detail fullscreen and resizes split detail panes", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.openSelected();
+
+    let model = controller.getRenderModel();
+    expect(model.layoutMode).toBe("split-pane");
+    expect(model.detailWidth).toBe("36%");
+
+    await controller.dispatch({ type: "resize_detail", delta: 1 });
+    model = controller.getRenderModel();
+    expect(model.layoutMode).toBe("split-pane");
+    expect(model.detailWidth).toBe("42%");
+
+    await controller.dispatch({ type: "toggle_detail_layout" });
+    model = controller.getRenderModel();
+    expect(model.layoutMode).toBe("detail-fullscreen");
+    expect(model.detailWidth).toBe("100%");
+
+    await controller.dispatch({ type: "toggle_detail_layout" });
+    model = controller.getRenderModel();
+    expect(model.layoutMode).toBe("split-pane");
+    expect(model.detailWidth).toBe("42%");
+  });
+
   it("does not reopen detail if a background list replay finishes after closing it", async () => {
     const service = new FakeTuiDataService();
     const controller = new TuiController(service, {

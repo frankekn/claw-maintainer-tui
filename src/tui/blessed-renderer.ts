@@ -170,7 +170,7 @@ export class BlessedTuiRenderer {
         program?: { clearScreen?: () => void };
       }
     ).program?.clearScreen?.();
-    const layoutChanged = this.transitionLayout(model.layoutMode);
+    const layoutChanged = this.transitionLayout(model);
     this.headerBox.setContent(formatHeader(model.header));
     this.tabsBox.setLabel(panelLabel("MODES"));
     this.tabsBox.setContent(formatModeTabs(model.mode, model.focus));
@@ -300,16 +300,35 @@ export class BlessedTuiRenderer {
     });
   }
 
-  private transitionLayout(nextLayoutMode: TuiLayoutMode): boolean {
+  private transitionLayout(model: TuiRenderModel): boolean {
+    const nextLayoutMode = model.layoutMode;
     if (this.layoutMode === nextLayoutMode) {
+      if (nextLayoutMode === "split-pane") {
+        this.resultsBox.show();
+        this.resultsBox.width = model.resultsWidth;
+        this.detailBox.left = model.resultsWidth;
+        this.detailBox.width = model.detailWidth;
+      } else if (nextLayoutMode === "detail-fullscreen") {
+        this.resultsBox.hide();
+        this.detailBox.left = 0;
+        this.detailBox.width = "100%";
+        this.detailBox.show();
+      }
       return false;
     }
     if (nextLayoutMode === "split-pane") {
-      this.resultsBox.width = TUI_THEME.layout.resultsWidthWithDetail;
-      this.detailBox.left = TUI_THEME.layout.resultsWidthWithDetail;
-      this.detailBox.width = TUI_THEME.layout.detailWidth;
+      this.resultsBox.show();
+      this.resultsBox.width = model.resultsWidth;
+      this.detailBox.left = model.resultsWidth;
+      this.detailBox.width = model.detailWidth;
+      this.detailBox.show();
+    } else if (nextLayoutMode === "detail-fullscreen") {
+      this.resultsBox.hide();
+      this.detailBox.left = 0;
+      this.detailBox.width = "100%";
       this.detailBox.show();
     } else {
+      this.resultsBox.show();
       this.resultsBox.width = "100%";
       this.detailBox.setContent("");
       this.detailBox.hide();
