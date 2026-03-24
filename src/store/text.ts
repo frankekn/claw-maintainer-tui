@@ -13,6 +13,34 @@ const XREF_STOP_WORDS = new Set([
   "using",
 ]);
 
+const PATH_TERM_STOP_WORDS = new Set([
+  "src",
+  "app",
+  "lib",
+  "dist",
+  "build",
+  "docs",
+  "doc",
+  "test",
+  "tests",
+  "spec",
+  "specs",
+  "fixtures",
+  "fixture",
+  "scripts",
+  "script",
+  "internal",
+  "shared",
+  "common",
+  "utils",
+  "index",
+]);
+
+export type ChangedFileTerm = {
+  kind: "stem" | "dir" | "dir_pair";
+  value: string;
+};
+
 export function normalizeSearchText(value: string): string {
   return value.replace(/\r\n/g, "\n").trim();
 }
@@ -49,6 +77,40 @@ export function uniqueStrings(values: string[]): string[] {
 export function getFileStem(filePath: string): string {
   const baseName = path.basename(filePath).toLowerCase();
   return baseName.replace(/\.(test|spec)(?=\.[^.]+$)/, "").replace(/\.[^.]+$/, "");
+}
+
+function normalizePathSegment(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function isUsefulPathSegment(value: string): boolean {
+  return value.length >= 3 && /^[\p{L}\p{N}_-]+$/u.test(value) && !PATH_TERM_STOP_WORDS.has(value);
+}
+
+export function extractChangedFileTerms(filePath: string): ChangedFileTerm[] {
+  const normalizedPath = filePath.replace(/\\/g, "/");
+  const out = new Map<string, ChangedFileTerm>();
+  const stem = normalizePathSegment(getFileStem(normalizedPath));
+  if (isUsefulPathSegment(stem)) {
+    out.set(`stem:${stem}`, { kind: "stem", value: stem });
+  }
+
+  const dirSegments = path
+    .dirname(normalizedPath)
+    .split(/[\\/]/g)
+    .map(normalizePathSegment)
+    .filter(isUsefulPathSegment);
+  for (const segment of dirSegments) {
+    out.set(`dir:${segment}`, { kind: "dir", value: segment });
+  }
+  for (let index = 1; index < dirSegments.length; index += 1) {
+    const pair = `${dirSegments[index - 1]!}/${dirSegments[index]!}`;
+    out.set(`dir_pair:${pair}`, { kind: "dir_pair", value: pair });
+  }
+
+  return Array.from(out.values()).sort(
+    (left, right) => left.kind.localeCompare(right.kind) || left.value.localeCompare(right.value),
+  );
 }
 
 export function isCompanionTest(prodPath: string, testPath: string): boolean {

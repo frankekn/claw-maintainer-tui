@@ -140,7 +140,7 @@ describe("cluster workflow helpers", () => {
         },
       }),
     );
-    expect(included.included?.reason).toBe("semantic-only candidate");
+    expect(included.included?.reason).toContain("semantic-only candidate");
     expect(included.excluded).toBeNull();
 
     const excluded = evaluateSemanticOnlyCandidate(
@@ -180,7 +180,7 @@ describe("cluster workflow helpers", () => {
         linkedIssues: [41789],
         relevantProdFiles: ["src/a.ts"],
         relevantTestFiles: [],
-        noiseFilesCount: 4,
+        noiseFilesCount: 6,
       }),
       clusterIssueNumbers: [41789],
     });

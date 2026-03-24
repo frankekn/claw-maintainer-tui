@@ -518,8 +518,14 @@ export interface PullRequestDataSource {
   listAllPullRequests(repo: RepoRef): AsyncGenerator<PullRequestRecord>;
   listChangedPullRequestNumbersSince(repo: RepoRef, since: string): Promise<number[]>;
   listChangedPullRequestsSince?(repo: RepoRef, since: string): Promise<PullRequestRecord[]>;
+  getPullRequestSummary?(repo: RepoRef, prNumber: number): Promise<PullRequestRecord>;
   hydratePullRequest(repo: RepoRef, prNumber: number): Promise<HydratedPullRequest>;
   fetchPullRequestFacts?(repo: RepoRef, prNumber: number): Promise<PullRequestFactRecord>;
+  getRateLimitStatus?(): Promise<{
+    limit: number;
+    remaining: number;
+    resetAt: string;
+  } | null>;
   searchPullRequestNumbers?(
     repo: RepoRef,
     query: string,

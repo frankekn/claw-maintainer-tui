@@ -28,6 +28,16 @@ class FakePullRequestDataSource implements PullRequestDataSource {
   changedPrNumbers: number[] = [];
   changedPrs: PullRequestRecord[] = [];
   hydrateCalls: number[] = [];
+  summaryCalls: number[] = [];
+  factCalls: number[] = [];
+  searchCalls: Array<{ query: string; state: "open" | "closed"; limit: number }> = [];
+  rateLimitCalls = 0;
+  rateLimitError: Error | null = null;
+  rateLimitStatus: { limit: number; remaining: number; resetAt: string } | null = {
+    limit: 5000,
+    remaining: 5000,
+    resetAt: "2026-03-11T00:00:00.000Z",
+  };
 
   constructor(items: HydratedPullRequest[]) {
     for (const item of items) {
@@ -71,7 +81,17 @@ class FakePullRequestDataSource implements PullRequestDataSource {
     return payload;
   }
 
+  async getPullRequestSummary(_repo: RepoRef, prNumber: number): Promise<PullRequestRecord> {
+    this.summaryCalls.push(prNumber);
+    const payload = this.hydrated.get(prNumber);
+    if (!payload) {
+      throw new Error(`missing PR ${prNumber}`);
+    }
+    return payload.pr;
+  }
+
   async fetchPullRequestFacts(_repo: RepoRef, prNumber: number): Promise<PullRequestFactRecord> {
+    this.factCalls.push(prNumber);
     const payload = this.facts.get(prNumber);
     if (!payload) {
       throw new Error(`missing facts for PR ${prNumber}`);
@@ -79,11 +99,24 @@ class FakePullRequestDataSource implements PullRequestDataSource {
     return payload;
   }
 
+  async getRateLimitStatus(): Promise<{
+    limit: number;
+    remaining: number;
+    resetAt: string;
+  } | null> {
+    this.rateLimitCalls += 1;
+    if (this.rateLimitError) {
+      throw this.rateLimitError;
+    }
+    return this.rateLimitStatus;
+  }
+
   async searchPullRequestNumbers(
     _repo: RepoRef,
     query: string,
     options: { state: "open" | "closed"; limit: number },
   ): Promise<number[]> {
+    this.searchCalls.push({ query, state: options.state, limit: options.limit });
     return [...(this.searchResults.get(`${options.state}:${query}`) ?? [])].slice(0, options.limit);
   }
 }
@@ -640,6 +673,105 @@ describe("PrIndexStore", () => {
     expect(createProvider).not.toHaveBeenCalled();
   });
 
+  it("prewarms facts for family representatives, watched PRs, and ungrouped touched PRs", async () => {
+    const store = await createStore();
+    const groupedA = makePullRequest(50070, {
+      title: "fix: collapse family representative A",
+      body: "Closes #42070\nRepresentative A.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const groupedB = makePullRequest(50071, {
+      title: "fix: collapse family representative B",
+      body: "Closes #42070\nRepresentative B.",
+      updatedAt: "2026-03-10T01:00:00.000Z",
+    });
+    const watched = makePullRequest(50072, {
+      title: "fix: watched open PR",
+      body: "Watched but not touched in the incremental sync.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const ungrouped = makePullRequest(50073, {
+      title: "fix: ungrouped touched PR",
+      body: "Touched open PR with no linked issue family.",
+      updatedAt: "2026-03-10T02:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([groupedA, groupedB, watched, ungrouped]);
+    source.rateLimitStatus = {
+      limit: 5000,
+      remaining: 50,
+      resetAt: "2026-03-11T00:00:00.000Z",
+    };
+
+    await store.sync({ repo, source, full: true });
+    await store.setPrAttentionState(repo, 50072, "watch");
+
+    source.setFacts(makePullRequestFacts(50070));
+    source.setFacts(makePullRequestFacts(50071));
+    source.setFacts(makePullRequestFacts(50072));
+    source.setFacts(makePullRequestFacts(50073));
+    source.factCalls = [];
+    source.rateLimitStatus = {
+      limit: 5000,
+      remaining: 5000,
+      resetAt: "2026-03-11T00:00:00.000Z",
+    };
+    source.changedPrs = [
+      { ...groupedA.pr, updatedAt: "2026-03-11T00:00:00.000Z" },
+      { ...groupedB.pr, updatedAt: "2026-03-11T01:00:00.000Z" },
+      { ...ungrouped.pr, updatedAt: "2026-03-11T02:00:00.000Z" },
+    ];
+
+    const summary = await store.sync({ repo, source });
+
+    expect(summary.processedPrs).toBe(3);
+    expect(source.factCalls.sort((left, right) => left - right)).toEqual([50071, 50072, 50073]);
+    expect(source.factCalls).not.toContain(50070);
+  });
+
+  it("skips fact prewarm entirely when the rate limit budget is low", async () => {
+    const store = await createStore();
+    const pr = makePullRequest(50074, {
+      title: "fix: skip prewarm under low quota",
+      body: "Closes #42074\nSkip prewarm under low quota.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([pr]);
+    source.setFacts(makePullRequestFacts(50074));
+    source.rateLimitStatus = {
+      limit: 5000,
+      remaining: 50,
+      resetAt: "2026-03-11T00:00:00.000Z",
+    };
+
+    await store.sync({ repo, source, full: true });
+
+    expect(source.rateLimitCalls).toBeGreaterThan(0);
+    expect(source.factCalls).toEqual([]);
+  });
+
+  it("keeps sync successful when the prewarm rate limit probe fails", async () => {
+    const store = await createStore();
+    const pr = makePullRequest(50075, {
+      title: "fix: ignore prewarm rate limit probe errors",
+      body: "Closes #42075\nIgnore prewarm rate limit probe errors.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([pr]);
+    source.setFacts(
+      makePullRequestFacts(50075, {
+        linkedIssues: [{ issueNumber: 42075, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/prewarm/rate-limit.ts", kind: "prod" }],
+      }),
+    );
+    source.rateLimitError = new Error("transient gh failure");
+
+    const summary = await store.sync({ repo, source, full: true });
+
+    expect(summary.processedPrs).toBe(1);
+    expect(source.rateLimitCalls).toBeGreaterThan(0);
+    expect(source.factCalls).toEqual([50075]);
+  });
+
   it("stores issues, supports issue search, and cross references issues to pull requests", async () => {
     const store = await createStore();
     const pr = makePullRequest(61001, {
@@ -1077,7 +1209,7 @@ describe("PrIndexStore", () => {
           prNumber: 34020,
           matchedBy: "local_semantic",
           status: "possible_same_cluster",
-          reason: "semantic-only candidate",
+          reason: expect.stringContaining("semantic-only candidate"),
           featureVector: expect.objectContaining({
             matchedBy: "local_semantic",
             semanticScore: expect.any(Number),
@@ -1273,7 +1405,67 @@ describe("PrIndexStore", () => {
     );
   });
 
-  it("hydrates the seed before cluster analysis when repo and source are provided", async () => {
+  it("recovers semantic-only candidates from local path overlap and embedding rerank", async () => {
+    const createProvider = vi
+      .spyOn(embeddingModule, "createLocalEmbeddingProvider")
+      .mockResolvedValue({
+        id: "local",
+        model: "mock-cluster",
+        embedQuery: async () => [1, 0],
+        embedBatch: async (texts: string[]) => texts.map(() => [1, 0]),
+      });
+    try {
+      const store = await createStore();
+      const seed = makePullRequest(39675, {
+        title: "fix: tame retry budget drift",
+        body: "Reduce retry budget drift in long-lived runs.",
+        updatedAt: "2026-03-08T00:00:00.000Z",
+      });
+      const pathNeighbor = makePullRequest(39676, {
+        title: "refactor: rebalance quota accounting",
+        body: "Adjust quota accounting in a nearby runtime path.",
+        updatedAt: "2026-03-09T00:00:00.000Z",
+      });
+
+      await store.sync({
+        repo,
+        source: new FakePullRequestDataSource([seed, pathNeighbor]),
+        full: true,
+      });
+      await store.recordPullRequestFacts(
+        makePullRequestFacts(39675, {
+          changedFiles: [{ path: "src/retries/budget-controller.ts", kind: "prod" }],
+        }),
+      );
+      await store.recordPullRequestFacts(
+        makePullRequestFacts(39676, {
+          changedFiles: [{ path: "src/retries/quota-manager.ts", kind: "prod" }],
+        }),
+      );
+
+      const analysis = await store.clusterPullRequest({
+        prNumber: 39675,
+        limit: 10,
+        ftsOnly: true,
+      });
+
+      expect(createProvider).toHaveBeenCalled();
+      expect(analysis?.clusterBasis).toBe("semantic_only");
+      expect(analysis?.sameClusterCandidates).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            prNumber: 39676,
+            matchedBy: "local_semantic",
+            status: "possible_same_cluster",
+          }),
+        ]),
+      );
+    } finally {
+      createProvider.mockRestore();
+    }
+  });
+
+  it("refreshes cluster candidates through summary and fact fetches without hydrating detail", async () => {
     const store = await createStore();
     const refreshedSeed = makePullRequest(39672, {
       title: "feat: warn before compaction on large token usage",
@@ -1307,7 +1499,9 @@ describe("PrIndexStore", () => {
       refresh: true,
     });
 
-    expect(source.hydrateCalls).toContain(39672);
+    expect(source.hydrateCalls).toEqual([]);
+    expect(source.summaryCalls).toEqual(expect.arrayContaining([39672, 39673]));
+    expect(source.factCalls).toEqual(expect.arrayContaining([39672, 39673]));
     expect(analysis?.seedPr.title).toBe("feat: warn before compaction on large token usage");
     expect(analysis?.sameClusterCandidates).toEqual(
       expect.arrayContaining([
@@ -1317,6 +1511,268 @@ describe("PrIndexStore", () => {
         }),
       ]),
     );
+  });
+
+  it("reruns live issue discovery for the same seed and limit when remote search is available", async () => {
+    const store = await createStore();
+    const first = makePullRequest(39680, {
+      title: "fix: stabilize retry budget accounting",
+      body: "Closes #39600\nStabilize retry budget accounting.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const second = makePullRequest(39681, {
+      title: "fix: stabilize retry budget accounting in sibling path",
+      body: "Closes #39600\nSibling retry budget accounting fix.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([first, second]);
+    source.setSearchResults("39600", "open", [39680, 39681]);
+
+    await store.sync({ repo, source: new FakePullRequestDataSource([first, second]), full: true });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39680, {
+        headSha: "head-39680-a",
+        linkedIssues: [{ issueNumber: 39600, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/budget.ts", kind: "prod" }],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39681, {
+        headSha: "head-39681-a",
+        linkedIssues: [{ issueNumber: 39600, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/budget.ts", kind: "prod" }],
+      }),
+    );
+
+    const firstAnalysis = await store.clusterPullRequest({
+      prNumber: 39680,
+      limit: 10,
+      ftsOnly: true,
+      repo,
+      source,
+    });
+    const issueSearchCallCount = source.searchCalls.filter((call) => call.query === "39600").length;
+
+    const secondAnalysis = await store.clusterPullRequest({
+      prNumber: 39680,
+      limit: 10,
+      ftsOnly: true,
+      repo,
+      source,
+    });
+
+    expect(issueSearchCallCount).toBeGreaterThan(0);
+    expect(source.searchCalls.filter((call) => call.query === "39600").length).toBeGreaterThan(
+      issueSearchCallCount,
+    );
+    expect(firstAnalysis?.sameClusterCandidates.map((candidate) => candidate.prNumber)).toEqual(
+      secondAnalysis?.sameClusterCandidates.map((candidate) => candidate.prNumber),
+    );
+  });
+
+  it("does not reuse the linked-issue cluster cache across different limits", async () => {
+    const store = await createStore();
+    const first = makePullRequest(39684, {
+      title: "fix: stabilize cache limit handling",
+      body: "Closes #39602\nStabilize cache limit handling.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const second = makePullRequest(39685, {
+      title: "fix: stabilize cache limit handling follow-up",
+      body: "Closes #39602\nFollow-up cache limit handling fix.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([first, second]);
+    source.setSearchResults("39602", "open", [39684, 39685]);
+
+    await store.sync({ repo, source: new FakePullRequestDataSource([first, second]), full: true });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39684, {
+        headSha: "head-39684-a",
+        linkedIssues: [{ issueNumber: 39602, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/cache-limit.ts", kind: "prod" }],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39685, {
+        headSha: "head-39685-a",
+        linkedIssues: [{ issueNumber: 39602, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/cache-limit.ts", kind: "prod" }],
+      }),
+    );
+
+    await store.clusterPullRequest({ prNumber: 39684, limit: 5, ftsOnly: true, repo, source });
+    const issueSearchCallCount = source.searchCalls.filter((call) => call.query === "39602").length;
+
+    await store.clusterPullRequest({ prNumber: 39684, limit: 10, ftsOnly: true, repo, source });
+
+    expect(source.searchCalls.filter((call) => call.query === "39602").length).toBeGreaterThan(
+      issueSearchCallCount,
+    );
+  });
+
+  it("does not reuse the linked-issue cluster cache across different seeds in the same family", async () => {
+    const store = await createStore();
+    const first = makePullRequest(39686, {
+      title: "fix: stabilize sibling cluster seed coverage",
+      body: "Closes #39603\nFirst sibling cluster seed coverage fix.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const second = makePullRequest(39687, {
+      title: "fix: stabilize sibling cluster seed coverage follow-up",
+      body: "Closes #39603\nSecond sibling cluster seed coverage fix.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([first, second]);
+    source.setSearchResults("39603", "open", [39686, 39687]);
+
+    await store.sync({ repo, source: new FakePullRequestDataSource([first, second]), full: true });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39686, {
+        headSha: "head-39686-a",
+        linkedIssues: [{ issueNumber: 39603, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/seed-a.ts", kind: "prod" }],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39687, {
+        headSha: "head-39687-a",
+        linkedIssues: [{ issueNumber: 39603, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/seed-b.ts", kind: "prod" }],
+      }),
+    );
+
+    await store.clusterPullRequest({ prNumber: 39686, limit: 10, ftsOnly: true, repo, source });
+    const issueSearchCallCount = source.searchCalls.filter((call) => call.query === "39603").length;
+
+    await store.clusterPullRequest({ prNumber: 39687, limit: 10, ftsOnly: true, repo, source });
+
+    expect(source.searchCalls.filter((call) => call.query === "39603").length).toBeGreaterThan(
+      issueSearchCallCount,
+    );
+  });
+
+  it("still runs live issue discovery before reusing a cached linked-issue cluster", async () => {
+    const store = await createStore();
+    const first = makePullRequest(39688, {
+      title: "fix: stabilize linked-issue remote discovery seed",
+      body: "Closes #39604\nStabilize linked-issue remote discovery seed.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const second = makePullRequest(39689, {
+      title: "fix: stabilize linked-issue remote discovery sibling",
+      body: "Closes #39604\nSibling linked-issue remote discovery fix.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const lateRemote = makePullRequest(39690, {
+      title: "fix: stabilize linked-issue remote discovery late arrival",
+      body: "Closes #39604\nLate linked-issue remote discovery fix.",
+      updatedAt: "2026-03-11T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([first, second]);
+    source.setSearchResults("39604", "open", [39688, 39689]);
+
+    await store.sync({ repo, source: new FakePullRequestDataSource([first, second]), full: true });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39688, {
+        headSha: "head-39688-a",
+        linkedIssues: [{ issueNumber: 39604, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/remote-discovery-a.ts", kind: "prod" }],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39689, {
+        headSha: "head-39689-a",
+        linkedIssues: [{ issueNumber: 39604, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/remote-discovery-a.ts", kind: "prod" }],
+      }),
+    );
+
+    const initialAnalysis = await store.clusterPullRequest({
+      prNumber: 39688,
+      limit: 10,
+      ftsOnly: true,
+      repo,
+      source,
+    });
+    expect(
+      initialAnalysis?.sameClusterCandidates.map((candidate) => candidate.prNumber),
+    ).not.toContain(39690);
+    const initialSearchCallCount = source.searchCalls.filter(
+      (call) => call.query === "39604",
+    ).length;
+
+    source.setPullRequest(lateRemote);
+    source.setFacts(
+      makePullRequestFacts(39690, {
+        headSha: "head-39690-a",
+        linkedIssues: [{ issueNumber: 39604, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/remote-discovery-a.ts", kind: "prod" }],
+      }),
+    );
+    source.setSearchResults("39604", "open", [39688, 39689, 39690]);
+
+    const refreshedAnalysis = await store.clusterPullRequest({
+      prNumber: 39688,
+      limit: 10,
+      ftsOnly: true,
+      repo,
+      source,
+    });
+
+    expect(source.searchCalls.filter((call) => call.query === "39604").length).toBeGreaterThan(
+      initialSearchCallCount,
+    );
+    expect(
+      refreshedAnalysis?.sameClusterCandidates.map((candidate) => candidate.prNumber),
+    ).toContain(39690);
+  });
+
+  it("invalidates the linked-issue cluster cache when facts change", async () => {
+    const store = await createStore();
+    const first = makePullRequest(39682, {
+      title: "fix: stabilize cluster invalidation first variant",
+      body: "Closes #39601\nFirst variant.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const second = makePullRequest(39683, {
+      title: "fix: stabilize cluster invalidation second variant",
+      body: "Closes #39601\nSecond variant.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([first, second]);
+    source.setSearchResults("39601", "open", [39682, 39683]);
+
+    await store.sync({ repo, source: new FakePullRequestDataSource([first, second]), full: true });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39682, {
+        headSha: "head-39682-a",
+        linkedIssues: [{ issueNumber: 39601, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/invalidator.ts", kind: "prod" }],
+      }),
+    );
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39683, {
+        headSha: "head-39683-a",
+        linkedIssues: [{ issueNumber: 39601, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/invalidator.ts", kind: "prod" }],
+      }),
+    );
+
+    await store.clusterPullRequest({ prNumber: 39682, limit: 10, ftsOnly: true, repo, source });
+    const firstSearchCallCount = source.searchCalls.length;
+
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39683, {
+        headSha: "head-39683-b",
+        linkedIssues: [{ issueNumber: 39601, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/retries/invalidator.ts", kind: "prod" }],
+      }),
+    );
+
+    await store.clusterPullRequest({ prNumber: 39682, limit: 10, ftsOnly: true, repo, source });
+
+    expect(source.searchCalls.length).toBeGreaterThan(firstSearchCallCount);
   });
 
   it("prioritizes issue-linked hub PRs above recency-only PRs", async () => {

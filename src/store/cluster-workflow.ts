@@ -22,7 +22,17 @@ import {
 } from "./cluster-logic.js";
 import { uniqueStrings } from "./text.js";
 
-const SEMANTIC_ONLY_MIN_SCORE = 0.35;
+const SEMANTIC_ONLY_MIN_SCORE = 0.38;
+
+function describeSemanticConfidence(score: number): string {
+  if (score >= 0.6) {
+    return "high";
+  }
+  if (score >= SEMANTIC_ONLY_MIN_SCORE) {
+    return "medium";
+  }
+  return "low";
+}
 
 export function describeReasonCodes(codes: ClusterReasonCode[]): string {
   const phrases = codes.flatMap((code) => {
@@ -86,11 +96,13 @@ export function evaluateSemanticOnlyCandidate(candidate: ClusterCandidate): {
     };
   }
 
-  if ((candidate.semanticScore ?? 0) >= SEMANTIC_ONLY_MIN_SCORE) {
+  const score = candidate.semanticScore ?? 0;
+
+  if (score >= SEMANTIC_ONLY_MIN_SCORE) {
     const included = withClusterFeatures(
       {
         ...candidate,
-        reason: "semantic-only candidate",
+        reason: `semantic-only candidate (${describeSemanticConfidence(score)} confidence, score ${score.toFixed(2)})`,
       },
       [],
     );
@@ -114,7 +126,7 @@ export function evaluateSemanticOnlyCandidate(candidate: ClusterCandidate): {
   const excluded = buildExcludedCandidate(
     candidate,
     "semantic_weak_match",
-    "semantic_weak_match: semantic overlap too weak",
+    `semantic_weak_match: ${describeSemanticConfidence(score)} confidence score ${score.toFixed(2)}`,
   );
   return {
     included: null,
@@ -137,21 +149,24 @@ export function classifyNearbyExcludedCandidate(params: {
       `different_linked_issue: ${otherLinkedIssues.map((issue) => `#${issue}`).join(", ")}`,
     );
   }
+  const relevantCount =
+    params.candidate.relevantProdFiles.length + params.candidate.relevantTestFiles.length;
+  const noiseRatio = params.candidate.noiseFilesCount / Math.max(1, relevantCount);
   if (
-    params.candidate.noiseFilesCount >
-      params.candidate.relevantProdFiles.length + params.candidate.relevantTestFiles.length + 2 &&
-    params.candidate.relevantProdFiles.length + params.candidate.relevantTestFiles.length <= 1
+    (relevantCount === 0 && params.candidate.noiseFilesCount >= 4) ||
+    (relevantCount <= 2 && params.candidate.noiseFilesCount >= 6 && noiseRatio >= 3)
   ) {
     return buildExcludedCandidate(
       params.candidate,
       "noise_dominated",
-      "noise_dominated: unrelated churn outweighs issue-relevant paths",
+      `noise_dominated: unrelated churn outweighs issue-relevant paths (noise ratio ${noiseRatio.toFixed(1)})`,
     );
   }
+  const score = params.candidate.semanticScore ?? 0;
   return buildExcludedCandidate(
     params.candidate,
     "semantic_weak_match",
-    "semantic_weak_match: semantic neighbor without exact issue link",
+    `semantic_weak_match: ${describeSemanticConfidence(score)} confidence neighbor without exact issue link (score ${score.toFixed(2)})`,
   );
 }
 

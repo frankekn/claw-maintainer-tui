@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  ghCommandJsonWithRetry,
   ghApiJsonWithRetry,
   isRetryableGhApiError,
   normalizePullRequestFactRecord,
@@ -45,6 +46,28 @@ describe("clawlens github retry", () => {
 
     expect(runner).toHaveBeenCalledTimes(1);
     expect(sleepFn).not.toHaveBeenCalled();
+  });
+
+  it("retries transient gh command failures before succeeding", async () => {
+    const runner = vi
+      .fn<(_: string[]) => Promise<string>>()
+      .mockRejectedValueOnce(new Error("HTTP 429 Too Many Requests"))
+      .mockResolvedValue('[{"number":42}]');
+    const sleepFn = vi.fn<(_: number) => Promise<void>>().mockResolvedValue();
+
+    const result = await ghCommandJsonWithRetry<Array<{ number: number }>>(
+      ["search", "prs", "query", "--json", "number"],
+      {
+        runner,
+        attempts: 3,
+        backoffMs: 10,
+        sleepFn,
+      },
+    );
+
+    expect(result).toEqual([{ number: 42 }]);
+    expect(runner).toHaveBeenCalledTimes(2);
+    expect(sleepFn).toHaveBeenCalledWith(10);
   });
 
   it("recognizes retryable transport and rate-limit errors", () => {
