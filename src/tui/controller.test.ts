@@ -561,6 +561,39 @@ describe("TuiController", () => {
     expect(model.resultsPane.rows[0]?.kind).toBe("pr");
   });
 
+  it("opens the cluster workspace when only excluded candidates are available", async () => {
+    const service = new FakeTuiDataService();
+    service.verifyClusterPr = vi.fn(async (prNumber) => ({
+      analysis: {
+        ...makeCluster(prNumber),
+        bestBase: null,
+        sameClusterCandidates: [],
+        nearbyButExcluded: [makeExcludedClusterCandidate(43001)],
+      },
+      summary: {
+        verifiedPrCount: 1,
+        verifiedIssueCount: 1,
+        missingCount: 0,
+        state: "done" as const,
+      },
+    }));
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.expandSelectedCluster();
+
+    const model = controller.getRenderModel();
+    expect(model.resultsPane.title).toContain("Cluster");
+    expect(model.resultsPane.rows).toHaveLength(1);
+    expect(model.resultsPane.rows[0]?.kind).toBe("cluster-excluded");
+    expect(model.resultsPane.lines.join("\n")).toContain("EXCLUDED");
+    expect(model.detailPane.title).toBe("Cluster · #43001");
+  });
+
   it("refreshes detail when hiding the selected excluded cluster row", async () => {
     const service = new FakeTuiDataService();
     service.verifyClusterPr = vi.fn(async (prNumber) => ({

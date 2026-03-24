@@ -1043,7 +1043,12 @@ export class TuiController {
         this.message = `No cluster workspace found for PR #${prNumber}.`;
         return;
       }
-      const rows = this.buildClusterWorkspaceRows(analysis, summary, showExcluded);
+      let effectiveShowExcluded = showExcluded;
+      let rows = this.buildClusterWorkspaceRows(analysis, summary, effectiveShowExcluded);
+      if (rows.length === 0 && !effectiveShowExcluded && analysis.nearbyButExcluded.length > 0) {
+        effectiveShowExcluded = true;
+        rows = this.buildClusterWorkspaceRows(analysis, summary, effectiveShowExcluded);
+      }
       if (rows.length === 0) {
         this.message = `No alternate cluster candidates found for PR #${prNumber}.`;
         return;
@@ -1055,7 +1060,7 @@ export class TuiController {
         seedPrNumber: prNumber,
         analysis,
         verification: summary,
-        showExcluded,
+        showExcluded: effectiveShowExcluded,
       };
       this.rows = rows;
       if (options.restoreSelectionIdentity) {
@@ -1064,7 +1069,7 @@ export class TuiController {
         this.selectedIndex = 0;
       }
       this.resultTitle = `Cluster · #${prNumber}`;
-      this.message = clusterWorkspaceMessage(analysis, summary, showExcluded);
+      this.message = clusterWorkspaceMessage(analysis, summary, effectiveShowExcluded);
       this.activeUrl = this.rowUrl(this.rows[this.selectedIndex]);
       this.isLandingView = false;
       this.showDetail = true;
