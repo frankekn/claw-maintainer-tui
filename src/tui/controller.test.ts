@@ -1054,6 +1054,21 @@ describe("TuiController", () => {
     expect(controller.getRenderModel().query).toBe("state:open ");
   });
 
+  it("does not duplicate browse guidance in the footer query line", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+
+    const model = controller.getRenderModel();
+    expect(model.footer.queryPlaceholder).toContain("Browse-only mode");
+    expect(model.footer.queryHelpText).toBe("");
+  });
+
   it("keeps inbox pagination enabled when collapsed clusters compress visible rows", async () => {
     const service = new FakeTuiDataService();
     service.listPriorityInbox = vi.fn(async ({ limit }) =>

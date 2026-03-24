@@ -148,7 +148,7 @@ export function buildRenderModel(
       ? `filters: ${modeInfo.queryFilters.join("  ")}  keys: [Enter] search  [\u2191\u2193] history  [Esc] cancel`
       : modeInfo.queryExamples.length > 0
         ? `example: ${modeInfo.queryExamples[0]}`
-        : modeInfo.browsePrompt;
+        : "";
   const widthPreset = DETAIL_WIDTH_PRESETS[session.detailWidthIndex] ?? DETAIL_WIDTH_PRESETS[0];
   const layoutMode = detail.visible ? session.detailLayoutMode : "single-pane";
 

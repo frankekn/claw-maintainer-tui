@@ -188,6 +188,19 @@ describe("BlessedTuiRenderer", () => {
     expect(controller.dispatch).toHaveBeenNthCalledWith(2, { type: "activate_mode", delta: 1 });
   });
 
+  it("routes F1 to help even when query input is focused", async () => {
+    const controller = createControllerStub();
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness;
+    renderers.push(harness);
+    renderModel.focus = "query";
+
+    await harness.handleKeypress("", { name: "f1" } as blessed.Widgets.Events.IKeyEventArg);
+
+    expect(controller.dispatch).toHaveBeenCalledWith({ type: "toggle_help" });
+    renderModel.focus = "results";
+  });
+
   it("routes z and bracket keys to detail layout controls", async () => {
     const controller = createControllerStub();
     const renderer = new BlessedTuiRenderer(controller as never);

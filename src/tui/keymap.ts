@@ -49,6 +49,10 @@ export function resolveKeyAction(
     return { kind: "noop" };
   }
 
+  if (key.name === "f1") {
+    return { kind: "command", command: { type: "toggle_help" } };
+  }
+
   if (model.focus === "query") {
     if (key.name === "escape") {
       return { kind: "command", command: { type: "stop_query" } };
@@ -74,7 +78,7 @@ export function resolveKeyAction(
     return { kind: "noop" };
   }
 
-  if (key.name === "f1" || key.name === "question mark" || ch === "?") {
+  if (key.name === "question mark" || ch === "?") {
     return { kind: "command", command: { type: "toggle_help" } };
   }
   if (key.name === "escape" && model.footer.banner?.dismissible) {
