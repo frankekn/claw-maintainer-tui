@@ -1510,7 +1510,13 @@ export class PrIndexStore {
       return;
     }
 
-    const rateLimit = await params.source.getRateLimitStatus?.();
+    let rateLimit: Awaited<ReturnType<NonNullable<PullRequestDataSource["getRateLimitStatus"]>>> =
+      null;
+    try {
+      rateLimit = (await params.source.getRateLimitStatus?.()) ?? null;
+    } catch {
+      rateLimit = null;
+    }
     if (rateLimit && rateLimit.remaining < 100) {
       return;
     }
@@ -2785,16 +2791,21 @@ export class PrIndexStore {
     }
 
     let bundles = this.loadClusterInputs(Array.from(exactMatches.keys()));
-    const initialCacheKey = this.buildLinkedIssueClusterCacheKey(
-      params.repoKey,
-      params.seed.number,
-      params.clusterIssueNumbers,
-      bundles,
-      params.limit,
-    );
-    const cached = !params.refresh ? this.linkedIssueClusterCache.get(initialCacheKey) : undefined;
-    if (cached) {
-      return cached;
+    const needsLiveIssueDiscovery = Boolean(params.repo && params.source?.searchPullRequestNumbers);
+    if (!needsLiveIssueDiscovery) {
+      const initialCacheKey = this.buildLinkedIssueClusterCacheKey(
+        params.repoKey,
+        params.seed.number,
+        params.clusterIssueNumbers,
+        bundles,
+        params.limit,
+      );
+      const cached = !params.refresh
+        ? this.linkedIssueClusterCache.get(initialCacheKey)
+        : undefined;
+      if (cached) {
+        return cached;
+      }
     }
 
     if (params.repo && params.source) {
@@ -2823,6 +2834,17 @@ export class PrIndexStore {
     }
 
     bundles = this.loadClusterInputs(Array.from(exactMatches.keys()));
+    const cacheKey = this.buildLinkedIssueClusterCacheKey(
+      params.repoKey,
+      params.seed.number,
+      params.clusterIssueNumbers,
+      bundles,
+      params.limit,
+    );
+    const cached = !params.refresh ? this.linkedIssueClusterCache.get(cacheKey) : undefined;
+    if (cached) {
+      return cached;
+    }
     const rawCandidates = Array.from(exactMatches.entries())
       .map(([prNumber, matchedBy]) =>
         this.buildClusterCandidateFromBundle(
@@ -2894,16 +2916,7 @@ export class PrIndexStore {
       bestBase: rankedDecisionSet.bestBase,
       sameClusterCandidates: rankedDecisionSet.sameClusterCandidates,
     };
-    this.linkedIssueClusterCache.set(
-      this.buildLinkedIssueClusterCacheKey(
-        params.repoKey,
-        params.seed.number,
-        params.clusterIssueNumbers,
-        bundles,
-        params.limit,
-      ),
-      cacheEntry,
-    );
+    this.linkedIssueClusterCache.set(cacheKey, cacheEntry);
     return cacheEntry;
   }
 
