@@ -283,6 +283,8 @@ describe("tui formatting", () => {
     expect(detail.lines.join("\n")).toContain("SPARSE EXTRAS");
     expect(detail.lines.join("\n")).toContain("best base");
     expect(detail.lines.join("\n")).toContain("excluded");
+    expect(detail.lines.join("\n")).toContain("[e to show]");
+    expect(detail.lines.join("\n")).not.toContain("[E planned]");
     expect(detail.anchorLine).not.toBeNull();
 
     const collapsed = formatPriorityPrDetail(makeBundle(), "sparse-extras", {

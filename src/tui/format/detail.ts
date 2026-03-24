@@ -225,7 +225,7 @@ export function formatPriorityPrDetail(
         ? [
             `${text("excluded", "muted")} +${nearbyButExcluded.length} candidate${
               nearbyButExcluded.length === 1 ? "" : "s"
-            } hidden  ${text("[E planned]", "dim")}`,
+            } hidden  ${text("[e to show]", "dim")}`,
           ]
         : []),
     ],
