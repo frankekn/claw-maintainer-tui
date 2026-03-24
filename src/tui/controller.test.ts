@@ -182,6 +182,28 @@ function makeCluster(prNumber: number): ClusterPullRequestAnalysis {
   };
 }
 
+function makeExcludedClusterCandidate(prNumber: number) {
+  return {
+    prNumber,
+    title: `Excluded PR ${prNumber}`,
+    url: `https://github.com/openclaw/openclaw/pull/${prNumber}`,
+    state: "open" as const,
+    updatedAt: "2026-03-09T00:00:00.000Z",
+    headSha: `head-${prNumber}`,
+    matchedBy: "linked_issue" as const,
+    linkedIssues: [41789],
+    prodFiles: ["b.ts"],
+    testFiles: ["b.test.ts"],
+    otherFiles: [],
+    relevantProdFiles: [],
+    relevantTestFiles: [],
+    noiseFilesCount: 1,
+    excludedReasonCode: "noise_dominated" as const,
+    reason: "mostly unrelated churn",
+    featureVector: defaultFeatureVector,
+  };
+}
+
 const status: StatusSnapshot = {
   repo: "openclaw/openclaw",
   lastSyncAt: "2026-03-11T07:28:13.832Z",
@@ -475,7 +497,7 @@ describe("TuiController", () => {
     expect(service.priorityInboxCalls).toEqual([{ limit: 20, scanLimit: 300 }]);
   });
 
-  it("renders collapsed cluster rows and expands them into member PRs", async () => {
+  it("renders collapsed cluster rows and opens a dedicated cluster workspace", async () => {
     const service = new FakeTuiDataService();
     service.inboxItems = [
       { kind: "cluster", cluster: makePriorityCluster([41793, 42212]) },
@@ -495,8 +517,48 @@ describe("TuiController", () => {
     await controller.expandSelectedCluster();
     model = controller.getRenderModel();
     expect(model.resultsPane.title).toContain("Cluster");
-    expect(model.resultsPane.rows.every((row) => row.kind === "pr")).toBe(true);
-    expect(model.resultsPane.rows).toHaveLength(2);
+    expect(model.resultsPane.rows[0]?.kind).toBe("cluster-candidate");
+    expect(model.resultsPane.lines[0]).toContain("Verify");
+    expect(model.detailPane.visible).toBe(true);
+    expect(model.detailPane.title).toBe("Cluster · #42212");
+    expect(model.detailPane.lines.join("\n")).toContain("CANDIDATE");
+  });
+
+  it("toggles excluded candidates inside the cluster workspace", async () => {
+    const service = new FakeTuiDataService();
+    service.verifyClusterPr = vi.fn(async (prNumber) => ({
+      analysis: {
+        ...makeCluster(prNumber),
+        nearbyButExcluded: [makeExcludedClusterCandidate(43001)],
+      },
+      summary: {
+        verifiedPrCount: 2,
+        verifiedIssueCount: 1,
+        missingCount: 0,
+        state: "done" as const,
+      },
+    }));
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.expandSelectedCluster();
+
+    let model = controller.getRenderModel();
+    expect(model.resultsPane.rows.some((row) => row.kind === "cluster-excluded")).toBe(false);
+
+    await controller.expandSelectedCluster();
+    model = controller.getRenderModel();
+    expect(model.resultsPane.rows.some((row) => row.kind === "cluster-excluded")).toBe(true);
+    expect(model.footer.message).toContain("Showing 1 excluded cluster candidate");
+
+    controller.goBack();
+    model = controller.getRenderModel();
+    expect(model.resultsPane.title).toBe("Inbox");
+    expect(model.resultsPane.rows[0]?.kind).toBe("pr");
   });
 
   it("uses x on a collapsed cluster row to open linked-issue detail", async () => {

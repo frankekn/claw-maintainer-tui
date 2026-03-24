@@ -31,6 +31,7 @@ export function createInitialSessionState(resultLimit: number): TuiSessionState 
     helpVisible: false,
     detailLayoutMode: "split-pane",
     detailWidthIndex: 0,
+    clusterWorkspace: null,
     lastAttentionMutation: null,
     history: [],
   };
@@ -91,6 +92,7 @@ export function createViewSnapshot(
       helpVisible: session.helpVisible,
       detailLayoutMode: session.detailLayoutMode,
       detailWidthIndex: session.detailWidthIndex,
+      clusterWorkspace: session.clusterWorkspace,
       lastAttentionMutation: session.lastAttentionMutation,
     },
     detail: {

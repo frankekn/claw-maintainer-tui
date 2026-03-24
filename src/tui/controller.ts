@@ -37,6 +37,8 @@ import type {
   TuiAction,
   TuiActionId,
   TuiBanner,
+  TuiClusterWorkspaceDetail,
+  TuiClusterWorkspaceState,
   TuiCommand,
   TuiContext,
   TuiDetailFoldState,
@@ -234,6 +236,14 @@ export class TuiController {
 
   private set detailWidthIndex(value: number) {
     this.sessionState.detailWidthIndex = value;
+  }
+
+  private get clusterWorkspace(): TuiClusterWorkspaceState | null {
+    return this.sessionState.clusterWorkspace;
+  }
+
+  private set clusterWorkspace(value: TuiClusterWorkspaceState | null) {
+    this.sessionState.clusterWorkspace = value;
   }
 
   private get lastAttentionMutation(): TuiAttentionMutation | null {
@@ -564,6 +574,7 @@ export class TuiController {
     this.helpVisible = false;
     this.detailLayoutMode = "split-pane";
     this.detailWidthIndex = 0;
+    this.clusterWorkspace = null;
     this.isLandingView = false;
     this.resultTitle = this.modeLabel(mode);
     this.message = this.isListMode(mode)
@@ -783,19 +794,19 @@ export class TuiController {
 
   async expandSelectedCluster(): Promise<void> {
     const row = this.rows[this.selectedIndex];
-    if (!row || row.kind !== "priority-cluster") {
+    if (!row) {
       return;
     }
-    this.pushHistory();
-    this.rows = row.cluster.openMembers.map((member) => this.toPrRow(member.pr, member));
-    this.selectedIndex = 0;
-    this.resultTitle = `Cluster · ${row.cluster.statusLabel}`;
-    this.message = `Expanded ${row.cluster.openMembers.length} open PR(s) from ${row.cluster.statusLabel}.`;
-    this.activeUrl = this.rowUrl(this.rows[0]);
-    this.isLandingView = false;
-    this.resetDetailState(this.mode);
-    this.focus = "results";
-    this.emit();
+    if (row.kind === "cluster-candidate" || row.kind === "cluster-excluded") {
+      this.toggleClusterExcludedRows();
+      return;
+    }
+    if (!isPriorityDetailRow(row)) {
+      return;
+    }
+    await this.openClusterWorkspace(
+      row.kind === "priority-cluster" ? row.cluster.representative.pr.prNumber : row.pr.prNumber,
+    );
   }
 
   async markSeenSelected(): Promise<void> {
@@ -916,6 +927,7 @@ export class TuiController {
     this.browseLimit = snapshot.session.browseLimit;
     this.detailLayoutMode = snapshot.session.detailLayoutMode;
     this.detailWidthIndex = snapshot.session.detailWidthIndex;
+    this.clusterWorkspace = snapshot.session.clusterWorkspace;
     this.detailState = snapshot.detail;
     this.errorMessage = null;
     this.focus = "results";
@@ -974,6 +986,105 @@ export class TuiController {
     this.emit();
   }
 
+  private async openClusterWorkspace(prNumber: number, pushHistory = true): Promise<void> {
+    await this.runBusy(`Opening cluster workspace for PR #${prNumber}`, async () => {
+      const { analysis, summary } = await this.effects.verifyClusterPr(prNumber, this.resultLimit);
+      if (!analysis) {
+        this.message = `No cluster workspace found for PR #${prNumber}.`;
+        return;
+      }
+      const rows = this.buildClusterWorkspaceRows(analysis, summary, false);
+      if (rows.length === 0) {
+        this.message = `No alternate cluster candidates found for PR #${prNumber}.`;
+        return;
+      }
+      if (pushHistory) {
+        this.pushHistory();
+      }
+      this.clusterWorkspace = {
+        seedPrNumber: prNumber,
+        analysis,
+        verification: summary,
+        showExcluded: false,
+      };
+      this.rows = rows;
+      this.selectedIndex = 0;
+      this.resultTitle = `Cluster · #${prNumber}`;
+      this.message = clusterWorkspaceMessage(analysis, summary, false);
+      this.activeUrl = this.rowUrl(this.rows[0]);
+      this.isLandingView = false;
+      this.showDetail = true;
+      this.focus = "results";
+      await this.refreshDetailForSelection(true);
+    });
+  }
+
+  private toggleClusterExcludedRows(): void {
+    if (!this.clusterWorkspace) {
+      return;
+    }
+    const selectionIdentity = this.selectedRowIdentity();
+    const showExcluded = !this.clusterWorkspace.showExcluded;
+    this.clusterWorkspace = {
+      ...this.clusterWorkspace,
+      showExcluded,
+    };
+    this.rows = this.buildClusterWorkspaceRows(
+      this.clusterWorkspace.analysis,
+      this.clusterWorkspace.verification,
+      showExcluded,
+    );
+    this.restoreSelection(selectionIdentity);
+    this.message = showExcluded
+      ? `Showing ${this.clusterWorkspace.analysis.nearbyButExcluded.length} excluded cluster candidate${this.clusterWorkspace.analysis.nearbyButExcluded.length === 1 ? "" : "s"}.`
+      : "Hid excluded cluster candidates.";
+    this.activeUrl = this.rowUrl(this.rows[this.selectedIndex]);
+    this.emit();
+  }
+
+  private buildClusterWorkspaceRows(
+    analysis: Awaited<ReturnType<TuiEffects["verifyClusterPr"]>>["analysis"],
+    summary: Awaited<ReturnType<TuiEffects["verifyClusterPr"]>>["summary"],
+    showExcluded: boolean,
+  ): Array<Extract<TuiResultRow, { kind: "cluster-candidate" | "cluster-excluded" }>> {
+    if (!analysis) {
+      return [];
+    }
+    const detail = buildClusterWorkspaceDetail(analysis, summary);
+    const rows: Array<Extract<TuiResultRow, { kind: "cluster-candidate" | "cluster-excluded" }>> =
+      [];
+    if (analysis.bestBase) {
+      rows.push({
+        kind: "cluster-candidate",
+        candidate: analysis.bestBase,
+        verification: summary.state,
+        detail,
+      });
+    }
+    for (const candidate of analysis.sameClusterCandidates) {
+      if (candidate.prNumber === analysis.bestBase?.prNumber) {
+        continue;
+      }
+      rows.push({
+        kind: "cluster-candidate",
+        candidate,
+        verification: summary.state,
+        detail,
+      });
+    }
+    if (showExcluded) {
+      for (const candidate of analysis.nearbyButExcluded) {
+        rows.push({
+          kind: "cluster-excluded",
+          candidate,
+          verification: summary.state,
+          detail,
+        });
+      }
+    }
+    return rows;
+  }
+
   async refreshSelected(): Promise<void> {
     const row = this.rows[this.selectedIndex];
     if (!row) {
@@ -985,6 +1096,13 @@ export class TuiController {
     }
     if (row.kind === "pr") {
       await this.refreshDetailForPr(row.pr.prNumber, true);
+      return;
+    }
+    if (row.kind === "cluster-candidate" || row.kind === "cluster-excluded") {
+      await this.openClusterWorkspace(
+        this.clusterWorkspace?.seedPrNumber ?? row.candidate.prNumber,
+        false,
+      );
       return;
     }
     if (row.kind === "issue") {
@@ -1123,10 +1241,16 @@ export class TuiController {
     const hasHistory = this.history.length > 0;
     const canLinked = row?.kind === "pr";
     const canCluster = isPriorityDetailRow(row);
-    const canExpand = row?.kind === "priority-cluster";
+    const canOpenClusterWorkspace = isPriorityDetailRow(row);
+    const canToggleExcluded =
+      this.clusterWorkspace !== null && this.clusterWorkspace.analysis.nearbyButExcluded.length > 0;
     const canTriage = isPriorityDetailRow(row);
     const canRefresh =
-      row?.kind === "pr" || row?.kind === "issue" || row?.kind === "priority-cluster";
+      row?.kind === "pr" ||
+      row?.kind === "issue" ||
+      row?.kind === "priority-cluster" ||
+      row?.kind === "cluster-candidate" ||
+      row?.kind === "cluster-excluded";
     const hasLocalState =
       row?.kind === "pr"
         ? (row.priority?.attentionState ?? "new") !== "new"
@@ -1136,51 +1260,86 @@ export class TuiController {
     const canOpenUrl = Boolean(this.getActiveUrl());
     const canUndoAttention = this.lastAttentionMutation !== null;
     const canPageSeen = this.visiblePriorityPrNumbers().length > 0;
+    const isClusterWorkspaceRow =
+      row?.kind === "cluster-candidate" || row?.kind === "cluster-excluded";
 
     switch (this.mode) {
       case "inbox":
       case "watchlist":
+        if (isClusterWorkspaceRow) {
+          return [
+            this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
+            this.action("expand-cluster", "Excluded", "e", canToggleExcluded),
+            this.action("refresh", "Refresh", "r", canRefresh),
+            this.action("back", "Back", "b", hasHistory),
+            this.action("open-url", "Open URL", "o", canOpenUrl),
+          ];
+        }
         return [
           this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
           this.action(
-            row?.kind === "priority-cluster" ? "expand-cluster" : "jump-linked-issues",
-            row?.kind === "priority-cluster" ? "Expand" : "Linked",
-            row?.kind === "priority-cluster" ? "e" : "x",
-            row?.kind === "priority-cluster" ? canExpand : canLinked,
+            "jump-linked-issues",
+            "Linked",
+            "x",
+            canLinked || row?.kind === "priority-cluster",
           ),
           this.action("cluster", "Cluster", "c", canCluster),
+          this.action("expand-cluster", "Workspace", "e", canOpenClusterWorkspace),
           this.action("mark-seen", "Seen", "v", canTriage),
           this.action("toggle-watch", "Watch", "w", canTriage),
           this.action("toggle-ignore", "Ignore", "i", canTriage),
           this.action("clear-state", "Clear", "u", hasLocalState),
           this.action("mark-page-seen", "Seen Page", "V", canPageSeen),
           this.action("undo", "Undo", "U", canUndoAttention),
+          this.action("back", "Back", "b", hasHistory),
           this.action("load-more", "More", "m", this.canLoadMore()),
           this.action("open-url", "Open URL", "o", canOpenUrl),
         ];
       case "cross-search":
+        if (isClusterWorkspaceRow) {
+          return [
+            this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
+            this.action("expand-cluster", "Excluded", "e", canToggleExcluded),
+            this.action("refresh", "Refresh", "r", canRefresh),
+            this.action("back", "Back", "b", hasHistory),
+            this.action("open-url", "Open URL", "o", canOpenUrl),
+          ];
+        }
         return [
           this.action("query", "Search", "/"),
           this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
           this.action("jump-linked-issues", "Linked", "x", canLinked),
           this.action("cluster", "Cluster", "c", canCluster),
+          this.action("expand-cluster", "Workspace", "e", canOpenClusterWorkspace),
           this.action("sync-prs", "Sync PRs", "s"),
           this.action("sync-issues", "Sync Issues", "S"),
           this.action("refresh", "Refresh", "r", canRefresh),
+          this.action("back", "Back", "b", hasHistory),
           this.action("load-more", "More", "m", this.canLoadMore()),
           this.action("open-url", "Open URL", "o", canOpenUrl),
         ];
       case "pr-search":
+        if (isClusterWorkspaceRow) {
+          return [
+            this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
+            this.action("expand-cluster", "Excluded", "e", canToggleExcluded),
+            this.action("refresh", "Refresh", "r", canRefresh),
+            this.action("back", "Back", "b", hasHistory),
+            this.action("open-url", "Open URL", "o", canOpenUrl),
+          ];
+        }
         return [
           this.action("query", "Search", "/"),
           this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
           this.action("jump-linked-issues", "Linked", "x", canLinked),
           this.action("cluster", "Cluster", "c", canCluster),
+          this.action("expand-cluster", "Workspace", "e", canOpenClusterWorkspace),
           this.action("mark-seen", "Seen", "v", canTriage),
           this.action("toggle-watch", "Watch", "w", canTriage),
           this.action("mark-page-seen", "Seen Page", "V", canPageSeen),
           this.action("undo", "Undo", "U", canUndoAttention),
           this.action("refresh", "Refresh", "r", canRefresh),
+          this.action("back", "Back", "b", hasHistory),
           this.action("load-more", "More", "m", this.canLoadMore()),
           this.action("open-url", "Open URL", "o", canOpenUrl),
         ];
@@ -1259,6 +1418,7 @@ export class TuiController {
     this.message = result.message;
     this.activeUrl = result.activeUrl;
     this.isLandingView = result.isLandingView;
+    this.clusterWorkspace = null;
     this.resetDetailState(result.mode);
   }
 
@@ -1363,6 +1523,26 @@ export class TuiController {
         });
         this.context = { kind: "issue", issueNumber: issue.issueNumber };
         this.activeUrl = issue.url;
+        this.emit();
+        return;
+      }
+
+      if (row.kind === "cluster-candidate" || row.kind === "cluster-excluded") {
+        this.setDetailPayload({
+          visible: true,
+          payload: {
+            kind: "cluster",
+            analysis: row.detail,
+            candidate: row.candidate,
+          },
+          identity: `${row.kind}:${row.candidate.prNumber}`,
+          status: `Cluster ${row.verification.replaceAll("_", " ")}`,
+          focusSection: null,
+          anchorKey: null,
+          foldedSections: {},
+        });
+        this.context = { kind: "pr", prNumber: row.candidate.prNumber };
+        this.activeUrl = row.candidate.url;
         this.emit();
         return;
       }
@@ -1781,6 +1961,9 @@ export class TuiController {
     if (this.disposed) {
       return;
     }
+    if (this.clusterWorkspace) {
+      return;
+    }
     if (!this.isListMode(this.mode)) {
       return;
     }
@@ -1870,4 +2053,41 @@ function detailSectionLabel(section: TuiDetailSection): string {
     default:
       return "Section";
   }
+}
+
+function buildClusterWorkspaceDetail(
+  analysis: NonNullable<TuiClusterWorkspaceState["analysis"]>,
+  summary: TuiClusterWorkspaceState["verification"],
+): TuiClusterWorkspaceDetail {
+  return {
+    seedLabel: `#${analysis.seedPr.prNumber} ${analysis.seedPr.title}`,
+    clusterBasis: analysis.clusterBasis,
+    clusterIssues: analysis.clusterIssueNumbers,
+    verificationSummary: clusterVerificationSummary(summary),
+    mergeSummary: analysis.mergeReadiness
+      ? `${analysis.mergeReadiness.state} via ${analysis.mergeReadiness.source}`
+      : null,
+  };
+}
+
+function clusterVerificationSummary(
+  summary: TuiClusterWorkspaceState["verification"],
+): string | null {
+  return `${summary.state.replaceAll("_", " ")} · PR ${summary.verifiedPrCount} · Issue ${summary.verifiedIssueCount} · Missing ${summary.missingCount}`;
+}
+
+function clusterWorkspaceMessage(
+  analysis: NonNullable<TuiClusterWorkspaceState["analysis"]>,
+  summary: TuiClusterWorkspaceState["verification"],
+  showExcluded: boolean,
+): string {
+  const includedCount =
+    (analysis.bestBase ? 1 : 0) +
+    analysis.sameClusterCandidates.filter(
+      (candidate) => candidate.prNumber !== analysis.bestBase?.prNumber,
+    ).length;
+  const excludedLabel = showExcluded
+    ? `showing ${analysis.nearbyButExcluded.length} excluded`
+    : `${analysis.nearbyButExcluded.length} excluded hidden`;
+  return `Cluster workspace: ${includedCount} included · ${excludedLabel} · ${clusterVerificationSummary(summary)}`;
 }

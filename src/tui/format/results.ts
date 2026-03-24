@@ -200,6 +200,16 @@ function formatTableHeader(mode: TuiMode): string {
   );
 }
 
+function formatClusterWorkspaceHeader(): string {
+  return text(
+    `${padRight("Kind", 8)} ${padRight("ID", 9)} ${padRight("State", 11)} ${padRight(
+      "Status",
+      9,
+    )} ${padRight("Verify", 11)} ${padRight("Updated", 10)} Title`,
+    "dim",
+  );
+}
+
 function wrapCard(title: string, body: string[]): string[] {
   const contentWidth = Math.max(
     title.length + 2,
@@ -261,6 +271,9 @@ export function buildResultsPaneModel(input: {
 }): TuiResultsPaneModel {
   const { mode, rows, selectedIndex, focus, title, summary, message, isLandingView, status } =
     input;
+  const isClusterWorkspace =
+    rows.length > 0 &&
+    rows.every((row) => row.kind === "cluster-candidate" || row.kind === "cluster-excluded");
   if (isLandingView && rows.length === 0) {
     return {
       title,
@@ -314,7 +327,7 @@ export function buildResultsPaneModel(input: {
     };
   }
 
-  const lines = [formatTableHeader(mode)];
+  const lines = [isClusterWorkspace ? formatClusterWorkspaceHeader() : formatTableHeader(mode)];
   lines.push(
     ...rows.map((row, index) => {
       const line = formatResultRow(row, mode);

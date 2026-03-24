@@ -186,6 +186,21 @@ export type TuiClusterVerificationSummary = {
   state: TuiVerificationState;
 };
 
+export type TuiClusterWorkspaceDetail = {
+  seedLabel: string;
+  clusterBasis: string;
+  clusterIssues: number[];
+  verificationSummary: string | null;
+  mergeSummary: string | null;
+};
+
+export type TuiClusterWorkspaceState = {
+  seedPrNumber: number;
+  analysis: ClusterPullRequestAnalysis;
+  verification: TuiClusterVerificationSummary;
+  showExcluded: boolean;
+};
+
 export type TuiResultRow =
   | { kind: "pr"; pr: SearchResult; freshness: TuiFreshness; priority: PriorityCandidate | null }
   | {
@@ -198,11 +213,13 @@ export type TuiResultRow =
       kind: "cluster-candidate";
       candidate: ClusterCandidate;
       verification: TuiVerificationState;
+      detail: TuiClusterWorkspaceDetail;
     }
   | {
       kind: "cluster-excluded";
       candidate: ClusterExcludedCandidate;
       verification: TuiVerificationState;
+      detail: TuiClusterWorkspaceDetail;
     }
   | { kind: "status"; label: string; value: string };
 
@@ -214,6 +231,11 @@ export type TuiContext =
 export type TuiDetailPayload =
   | { kind: "landing"; mode: TuiMode; status: StatusSnapshot | null }
   | { kind: "pr"; bundle: PrContextBundle }
+  | {
+      kind: "cluster";
+      analysis: TuiClusterWorkspaceDetail;
+      candidate: ClusterCandidate | ClusterExcludedCandidate;
+    }
   | { kind: "issue"; issue: IssueSearchResult }
   | { kind: "status"; status: StatusSnapshot | null };
 
@@ -246,6 +268,7 @@ export type TuiSessionState = {
   helpVisible: boolean;
   detailLayoutMode: Exclude<TuiLayoutMode, "single-pane">;
   detailWidthIndex: number;
+  clusterWorkspace: TuiClusterWorkspaceState | null;
   lastAttentionMutation: TuiAttentionMutation | null;
   history: TuiViewSnapshot[];
 };

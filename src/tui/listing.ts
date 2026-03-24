@@ -28,6 +28,18 @@ export function buildListSummary(params: {
   if (mode === "status") {
     return { yieldLabel: `${count} metrics`, confidenceLabel: null, coverageLabel: null };
   }
+  if (
+    rows.length > 0 &&
+    rows.every((row) => row.kind === "cluster-candidate" || row.kind === "cluster-excluded")
+  ) {
+    const includedCount = rows.filter((row) => row.kind === "cluster-candidate").length;
+    const excludedCount = rows.filter((row) => row.kind === "cluster-excluded").length;
+    return {
+      yieldLabel: `${count} cluster row${count === 1 ? "" : "s"}`,
+      confidenceLabel: `included ${includedCount} · excluded ${excludedCount}`,
+      coverageLabel: "cluster workspace",
+    };
+  }
   if (mode === "inbox" || mode === "watchlist") {
     const representedCount = rows.reduce((sum, row) => {
       if (row.kind === "pr") {

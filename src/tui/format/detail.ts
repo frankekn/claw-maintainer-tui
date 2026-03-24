@@ -494,6 +494,16 @@ export function buildDetailPaneModel(input: {
         anchorLine: null,
         anchorKey,
       };
+    case "cluster":
+      return {
+        visible,
+        title: `Cluster · #${payload.candidate.prNumber}`,
+        status,
+        lines: formatClusterDetail(payload.analysis, payload.candidate),
+        identity,
+        anchorLine: null,
+        anchorKey,
+      };
     case "status":
       return {
         visible,
