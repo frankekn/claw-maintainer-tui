@@ -658,11 +658,26 @@ export class TuiController {
     if (state.history.length === 0) {
       return;
     }
-    const currentIndex = state.historyIndex ?? state.history.length;
-    const nextIndex = Math.max(0, Math.min(state.history.length, currentIndex + delta));
+    if (state.historyIndex === null && delta === 1) {
+      return;
+    }
+    const nextIndex =
+      delta === -1
+        ? (state.historyIndex ?? -1) + 1
+        : state.historyIndex === null
+          ? null
+          : state.historyIndex - 1;
+    if (nextIndex === null || nextIndex < 0) {
+      state.historyIndex = null;
+      this.query = state.value;
+      this.emit();
+      return;
+    }
+    if (nextIndex >= state.history.length) {
+      return;
+    }
     state.historyIndex = nextIndex;
-    this.query =
-      nextIndex === state.history.length ? state.value : (state.history[nextIndex] ?? "");
+    this.query = state.history[nextIndex] ?? "";
     this.emit();
   }
 
@@ -1014,7 +1029,7 @@ export class TuiController {
       this.activeUrl = this.rowUrl(this.rows[0]);
       this.isLandingView = false;
       this.showDetail = true;
-      this.focus = "results";
+      this.focus = this.detailLayoutMode === "detail-fullscreen" ? "detail" : "results";
       await this.refreshDetailForSelection(true);
     });
   }

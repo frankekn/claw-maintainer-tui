@@ -561,6 +561,32 @@ describe("TuiController", () => {
     expect(model.resultsPane.rows[0]?.kind).toBe("pr");
   });
 
+  it("keeps detail focus when opening cluster workspace from fullscreen detail", async () => {
+    const service = new FakeTuiDataService();
+    service.inboxItems = [{ kind: "cluster", cluster: makePriorityCluster([41793, 42212]) }];
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.openSelected();
+    await controller.dispatch({ type: "toggle_detail_layout" });
+
+    let model = controller.getRenderModel();
+    expect(model.layoutMode).toBe("detail-fullscreen");
+    expect(model.focus).toBe("detail");
+
+    await controller.expandSelectedCluster();
+
+    model = controller.getRenderModel();
+    expect(model.layoutMode).toBe("detail-fullscreen");
+    expect(model.focus).toBe("detail");
+    expect(model.resultsPane.rows[0]?.kind).toBe("cluster-candidate");
+    expect(model.detailPane.title).toBe("Cluster · #42212");
+  });
+
   it("uses x on a collapsed cluster row to open linked-issue detail", async () => {
     const service = new FakeTuiDataService();
     service.inboxItems = [{ kind: "cluster", cluster: makePriorityCluster([41793, 42212]) }];
@@ -891,6 +917,35 @@ describe("TuiController", () => {
       .getRenderModel()
       .footer.actions.find((action) => action.id === "load-more");
     expect(loadMore?.enabled).toBe(true);
+  });
+
+  it("recalls the newest query first in history navigation", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    controller.activateMode("cross-search");
+    await flushMicrotasks();
+    await controller.submitQuery("author:frank");
+    await controller.submitQuery("state:open");
+
+    controller.startQueryEntry();
+    controller.appendQueryCharacter(" ");
+
+    controller.moveQueryHistory(-1);
+    expect(controller.getRenderModel().query).toBe("state:open");
+
+    controller.moveQueryHistory(-1);
+    expect(controller.getRenderModel().query).toBe("author:frank");
+
+    controller.moveQueryHistory(1);
+    expect(controller.getRenderModel().query).toBe("state:open");
+
+    controller.moveQueryHistory(1);
+    expect(controller.getRenderModel().query).toBe("state:open ");
   });
 
   it("keeps inbox pagination enabled when collapsed clusters compress visible rows", async () => {
