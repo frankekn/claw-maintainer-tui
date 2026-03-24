@@ -7,6 +7,10 @@ export type TuiKeyAction =
   | { kind: "detail-page"; delta: number }
   | { kind: "detail-home" }
   | { kind: "detail-end" }
+  | { kind: "help-scroll"; delta: number }
+  | { kind: "help-page"; delta: number }
+  | { kind: "help-home" }
+  | { kind: "help-end" }
   | { kind: "quit" }
   | { kind: "open-url" }
   | { kind: "noop" };
@@ -23,6 +27,24 @@ export function resolveKeyAction(
   if (model.helpOverlay.visible) {
     if (key.name === "escape" || key.name === "f1" || key.name === "question mark" || ch === "?") {
       return { kind: "command", command: { type: "toggle_help" } };
+    }
+    if (key.name === "up" || key.name === "k") {
+      return { kind: "help-scroll", delta: -1 };
+    }
+    if (key.name === "down" || key.name === "j") {
+      return { kind: "help-scroll", delta: 1 };
+    }
+    if (key.name === "pageup") {
+      return { kind: "help-page", delta: -1 };
+    }
+    if (key.name === "pagedown" || key.name === "space") {
+      return { kind: "help-page", delta: 1 };
+    }
+    if (key.name === "home") {
+      return { kind: "help-home" };
+    }
+    if (key.name === "end") {
+      return { kind: "help-end" };
     }
     return { kind: "noop" };
   }

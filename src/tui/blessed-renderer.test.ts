@@ -280,6 +280,38 @@ describe("BlessedTuiRenderer", () => {
     expect(controller.dispose).toHaveBeenCalledTimes(1);
   });
 
+  it("scrolls the help overlay instead of swallowing navigation keys", async () => {
+    const controller = createControllerStub();
+    controller.getRenderModel.mockReturnValue({
+      ...renderModel,
+      helpOverlay: {
+        visible: true,
+        title: "Inbox Help",
+        lines: Array.from({ length: 50 }, (_, index) => `Line ${index + 1}`),
+      },
+    });
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness & {
+      helpBox: blessed.Widgets.BoxElement;
+    };
+    renderers.push(harness);
+    const scrollSpy = vi.spyOn(harness.helpBox, "scroll");
+    const setScrollSpy = vi.spyOn(harness.helpBox, "setScroll");
+    const setScrollPercSpy = vi.spyOn(harness.helpBox, "setScrollPerc");
+
+    harness.render(controller.getRenderModel());
+    await harness.handleKeypress("", { name: "down" } as blessed.Widgets.Events.IKeyEventArg);
+    await harness.handleKeypress("", { name: "pageup" } as blessed.Widgets.Events.IKeyEventArg);
+    await harness.handleKeypress("", { name: "home" } as blessed.Widgets.Events.IKeyEventArg);
+    await harness.handleKeypress("", { name: "end" } as blessed.Widgets.Events.IKeyEventArg);
+
+    expect(scrollSpy).toHaveBeenNthCalledWith(1, 1);
+    expect(scrollSpy).toHaveBeenNthCalledWith(2, -(Number(harness.helpBox.height) || 10));
+    expect(setScrollSpy).toHaveBeenCalledWith(0);
+    expect(setScrollPercSpy).toHaveBeenCalledWith(100);
+    expect(controller.dispatch).not.toHaveBeenCalled();
+  });
+
   it("cleans up the screen when initialize fails", async () => {
     const controller = createControllerStub();
     controller.initialize.mockRejectedValue(new Error("init boom"));

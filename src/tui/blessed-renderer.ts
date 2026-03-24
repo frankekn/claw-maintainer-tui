@@ -404,6 +404,22 @@ export class BlessedTuiRenderer {
           this.detailBox.setScrollPerc(100);
           this.screen.render();
           return;
+        case "help-scroll":
+          this.helpBox.scroll(action.delta);
+          this.screen.render();
+          return;
+        case "help-page":
+          this.helpBox.scroll((Number(this.helpBox.height) || 10) * action.delta);
+          this.screen.render();
+          return;
+        case "help-home":
+          this.helpBox.setScroll(0);
+          this.screen.render();
+          return;
+        case "help-end":
+          this.helpBox.setScrollPerc(100);
+          this.screen.render();
+          return;
         case "quit":
           this.destroyScreen();
           return;

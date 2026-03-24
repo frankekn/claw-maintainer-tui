@@ -650,6 +650,49 @@ describe("TuiController", () => {
     expect(model.resultsPane.rows[0]?.kind).toBe("priority-cluster");
   });
 
+  it("ignores stale cluster workspace loads after switching modes", async () => {
+    const service = new FakeTuiDataService();
+    service.inboxItems = [{ kind: "cluster", cluster: makePriorityCluster([41793, 42212]) }];
+    let releaseVerify: (() => void) | null = null;
+    service.verifyClusterPr = vi.fn(
+      async (prNumber): ReturnType<FakeTuiDataService["verifyClusterPr"]> =>
+        await new Promise(
+          (
+            resolve: (value: Awaited<ReturnType<FakeTuiDataService["verifyClusterPr"]>>) => void,
+          ) => {
+            releaseVerify = () =>
+              resolve({
+                analysis: makeCluster(prNumber),
+                summary: {
+                  verifiedPrCount: 2,
+                  verifiedIssueCount: 1,
+                  missingCount: 0,
+                  state: "done" as const,
+                },
+              });
+          },
+        ),
+    );
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    const expandPromise = controller.expandSelectedCluster();
+
+    controller.activateMode("watchlist");
+    releaseVerify!();
+    await expandPromise;
+    await flushMicrotasks();
+
+    const model = controller.getRenderModel();
+    expect(model.mode).toBe("watchlist");
+    expect(model.resultsPane.title).toBe("Watchlist");
+    expect(model.resultsPane.rows.some((row) => row.kind === "cluster-candidate")).toBe(false);
+  });
+
   it("uses x on a collapsed cluster row to open linked-issue detail", async () => {
     const service = new FakeTuiDataService();
     service.inboxItems = [{ kind: "cluster", cluster: makePriorityCluster([41793, 42212]) }];

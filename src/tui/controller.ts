@@ -83,6 +83,7 @@ export class TuiController {
   private listRequestId = 0;
   private detailAutoRefreshInFlight = false;
   private readonly detailFreshness = new Map<string, TuiFreshness>();
+  private clusterWorkspaceRequestId = 0;
   private rateLimitSnapshot: Awaited<ReturnType<TuiEffects["rateLimit"]>> = null;
   private readonly syncJobs: Record<MetadataEntity, TuiSyncJobSnapshot> = {
     prs: {
@@ -356,6 +357,7 @@ export class TuiController {
 
   private resetDetailState(mode = this.mode): void {
     this.detailRequestId += 1;
+    this.clusterWorkspaceRequestId += 1;
     this.detailState = createLandingDetailState(mode, this.statusSnapshot);
   }
 
@@ -390,6 +392,7 @@ export class TuiController {
     this.disposed = true;
     this.detailRequestId += 1;
     this.listRequestId += 1;
+    this.clusterWorkspaceRequestId += 1;
     this.detailAutoRefreshInFlight = false;
     if (this.idleRefreshTimer) {
       clearInterval(this.idleRefreshTimer);
@@ -931,6 +934,7 @@ export class TuiController {
       this.emit();
       return;
     }
+    this.clusterWorkspaceRequestId += 1;
     this.mode = snapshot.session.mode;
     this.query = snapshot.session.query;
     this.rows = snapshot.session.rows;
@@ -1005,8 +1009,18 @@ export class TuiController {
   }
 
   private async openClusterWorkspace(prNumber: number, pushHistory = true): Promise<void> {
+    const mode = this.mode;
+    const selectionIdentity = this.selectedRowIdentity();
+    const requestId = ++this.clusterWorkspaceRequestId;
     await this.runBusy(`Opening cluster workspace for PR #${prNumber}`, async () => {
       const { analysis, summary } = await this.effects.verifyClusterPr(prNumber, this.resultLimit);
+      if (
+        requestId !== this.clusterWorkspaceRequestId ||
+        this.mode !== mode ||
+        this.selectedRowIdentity() !== selectionIdentity
+      ) {
+        return;
+      }
       if (!analysis) {
         this.message = `No cluster workspace found for PR #${prNumber}.`;
         return;
