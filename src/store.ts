@@ -14,6 +14,7 @@ import { truncateUtf16Safe } from "./lib/text.js";
 import { isoNow } from "./lib/time.js";
 import {
   annotateRelevantCoverage,
+  buildClusterSemanticText,
   buildLiveSemanticQueries,
   buildRelevantPathSets,
   computeSemanticScore,
@@ -58,7 +59,12 @@ import { buildIssueFilterClause, buildPrFilterClause } from "./store/search-sql.
 import { resolveMergeReadiness as resolveMergeReadinessModel } from "./store/merge-readiness.js";
 import { mergeSummaryPullRequestRecord } from "./store/pull-request-sync-contract.js";
 import { syncIssuesWorkflow, syncPullRequestsWorkflow } from "./store/sync-workflow.js";
-import { buildCrossReferenceQuery, normalizeSearchText, uniqueStrings } from "./store/text.js";
+import {
+  buildCrossReferenceQuery,
+  extractChangedFileTerms,
+  normalizeSearchText,
+  uniqueStrings,
+} from "./store/text.js";
 import { pullRequestUpsertParams, UPSERT_PULL_REQUEST_SQL } from "./store/upsert.js";
 import {
   createLocalEmbeddingProvider,
@@ -122,7 +128,12 @@ const META_REPO = "repo";
 const META_EMBEDDING_MODEL = "embedding_model";
 const META_VECTOR_DIMS = "vector_dims";
 const META_DERIVED_ISSUE_LINKS_BACKFILLED_AT = "derived_issue_links_backfilled_at";
+const META_CHANGED_FILE_TERMS_BACKFILLED_AT = "changed_file_terms_backfilled_at";
 const SUCCESSFUL_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
+const CLUSTER_EMBEDDING_PROVIDER = "cluster";
+const CLUSTER_LOCAL_PATH_LIMIT = 16;
+const CLUSTER_EMBEDDING_RERANK_LIMIT = 12;
+const EXACT_CLUSTER_PATH_CAP = 40;
 
 type IssueDocRow = {
   issue_number: number;
@@ -376,6 +387,13 @@ export class PrIndexStore {
         PRIMARY KEY (pr_number, path)
       );
 
+      CREATE TABLE IF NOT EXISTS pr_changed_file_terms (
+        pr_number INTEGER NOT NULL,
+        term_kind TEXT NOT NULL,
+        term_value TEXT NOT NULL,
+        PRIMARY KEY (pr_number, term_kind, term_value)
+      );
+
       CREATE TABLE IF NOT EXISTS pr_review_facts (
         repo TEXT NOT NULL,
         pr_number INTEGER NOT NULL,
@@ -413,6 +431,10 @@ export class PrIndexStore {
     );
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_pr_changed_files_pr_number ON pr_changed_files(pr_number);`,
+    );
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_pr_changed_file_terms_lookup
+         ON pr_changed_file_terms(term_kind, term_value, pr_number);`,
     );
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_pr_review_facts_pr_number ON pr_review_facts(pr_number);`,
@@ -518,6 +540,25 @@ export class PrIndexStore {
     this.linkedIssueClusterCache.clear();
   }
 
+  private rebuildChangedFileTermsForPr(
+    prNumber: number,
+    changedFiles: Array<Pick<PullRequestChangedFile, "path" | "kind">>,
+  ): void {
+    this.db.prepare("DELETE FROM pr_changed_file_terms WHERE pr_number = ?").run(prNumber);
+    const rows = changedFiles
+      .filter((file) => file.kind !== "other")
+      .flatMap((file) => extractChangedFileTerms(file.path));
+    for (const row of rows) {
+      this.db
+        .prepare(
+          `INSERT INTO pr_changed_file_terms (pr_number, term_kind, term_value)
+           VALUES (?, ?, ?)
+           ON CONFLICT(pr_number, term_kind, term_value) DO NOTHING`,
+        )
+        .run(prNumber, row.kind, row.value);
+    }
+  }
+
   private clearIssueLinksForSources(prNumber: number, sources: PullRequestLinkSource[]): void {
     if (sources.length === 0) {
       return;
@@ -570,6 +611,38 @@ export class PrIndexStore {
     }
   }
 
+  async ensureChangedFileTermsBackfilled(): Promise<void> {
+    await this.init();
+    if (this.getMeta(META_CHANGED_FILE_TERMS_BACKFILLED_AT)) {
+      return;
+    }
+    const rows = this.db
+      .prepare("SELECT pr_number, path, kind FROM pr_changed_files")
+      .all() as Array<{
+      pr_number: number;
+      path: string;
+      kind: PullRequestChangedFile["kind"];
+    }>;
+    const byPr = new Map<number, PullRequestChangedFile[]>();
+    for (const row of rows) {
+      const files = byPr.get(row.pr_number) ?? [];
+      files.push({ path: row.path, kind: row.kind });
+      byPr.set(row.pr_number, files);
+    }
+    this.db.exec("BEGIN");
+    try {
+      this.db.exec("DELETE FROM pr_changed_file_terms");
+      for (const [prNumber, files] of byPr) {
+        this.rebuildChangedFileTermsForPr(prNumber, files);
+      }
+      this.setMeta(META_CHANGED_FILE_TERMS_BACKFILLED_AT, isoNow());
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   async recordPullRequestFacts(facts: PullRequestFactRecord): Promise<void> {
     await this.init();
     this.db.exec("BEGIN");
@@ -614,6 +687,7 @@ export class PrIndexStore {
           .prepare(`INSERT INTO pr_changed_files (pr_number, path, kind) VALUES (?, ?, ?)`)
           .run(facts.prNumber, file.path, file.kind);
       }
+      this.rebuildChangedFileTermsForPr(facts.prNumber, facts.changedFiles);
       this.clearLinkedIssueClusterCache();
       this.db.exec("COMMIT");
     } catch (error) {
@@ -903,7 +977,7 @@ export class PrIndexStore {
     return row?.updated_at ?? null;
   }
 
-  private collectCachedEmbeddings(hashes: string[]): Map<string, number[]> {
+  private collectCachedEmbeddings(providerKey: string, hashes: string[]): Map<string, number[]> {
     if (hashes.length === 0) {
       return new Map();
     }
@@ -912,7 +986,7 @@ export class PrIndexStore {
       .prepare(
         `SELECT hash, embedding FROM ${EMBEDDING_CACHE_TABLE} WHERE provider = ? AND model = ? AND hash IN (${placeholders})`,
       )
-      .all("local", this.embeddingModel, ...hashes) as Array<{
+      .all(providerKey, this.embeddingModel, ...hashes) as Array<{
       hash: string;
       embedding: string;
     }>;
@@ -923,8 +997,14 @@ export class PrIndexStore {
     return out;
   }
 
-  private async embedDocuments(docs: SearchDocument[]): Promise<Map<string, number[]>> {
-    const byHash = this.collectCachedEmbeddings(docs.map((doc) => doc.hash));
+  private async embedTextEntries(
+    providerKey: string,
+    entries: Array<{ hash: string; text: string }>,
+  ): Promise<Map<string, number[]>> {
+    const byHash = this.collectCachedEmbeddings(
+      providerKey,
+      entries.map((entry) => entry.hash),
+    );
     if (!this.vectorAvailable) {
       return byHash;
     }
@@ -932,33 +1012,40 @@ export class PrIndexStore {
     if (!provider) {
       return byHash;
     }
-    const missing = docs.filter((doc) => !byHash.has(doc.hash));
+    const missing = entries.filter((entry) => !byHash.has(entry.hash));
     if (missing.length === 0) {
       return byHash;
     }
     try {
-      const vectors = await provider.embedBatch(missing.map((doc) => doc.text));
+      const vectors = await provider.embedBatch(missing.map((entry) => entry.text));
       const timestamp = isoNow();
       for (let index = 0; index < missing.length; index += 1) {
-        const doc = missing[index]!;
+        const entry = missing[index]!;
         const embedding = vectors[index] ?? [];
         if (embedding.length === 0) {
           continue;
         }
-        byHash.set(doc.hash, embedding);
+        byHash.set(entry.hash, embedding);
         this.db
           .prepare(
             `INSERT INTO ${EMBEDDING_CACHE_TABLE} (provider, model, hash, embedding, updated_at)
              VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(provider, model, hash) DO UPDATE SET embedding = excluded.embedding, updated_at = excluded.updated_at`,
           )
-          .run("local", this.embeddingModel, doc.hash, JSON.stringify(embedding), timestamp);
+          .run(providerKey, this.embeddingModel, entry.hash, JSON.stringify(embedding), timestamp);
       }
     } catch (error) {
       this.vectorError = error instanceof Error ? error.message : String(error);
       this.vectorAvailable = false;
     }
     return byHash;
+  }
+
+  private async embedDocuments(docs: SearchDocument[]): Promise<Map<string, number[]>> {
+    return this.embedTextEntries(
+      "local",
+      docs.map((doc) => ({ hash: doc.hash, text: doc.text })),
+    );
   }
 
   private getAllSearchDocuments(): SearchDocument[] {
@@ -2428,6 +2515,195 @@ export class PrIndexStore {
     );
   }
 
+  private collectLocalPathOverlapCandidates(
+    seedPrNumber: number,
+    limit: number,
+  ): Map<number, ClusterMatchSource> {
+    const seedTerms = this.db
+      .prepare(
+        `SELECT term_kind, term_value
+           FROM pr_changed_file_terms
+          WHERE pr_number = ?
+          ORDER BY term_kind ASC, term_value ASC`,
+      )
+      .all(seedPrNumber) as Array<{ term_kind: "stem" | "dir" | "dir_pair"; term_value: string }>;
+    if (seedTerms.length === 0) {
+      return new Map();
+    }
+
+    const condition = seedTerms.map(() => "(term_kind = ? AND term_value = ?)").join(" OR ");
+    const termParams = seedTerms.flatMap((term) => [term.term_kind, term.term_value]);
+    const countRows = this.db
+      .prepare(
+        `SELECT term_kind, term_value, COUNT(DISTINCT pr_number) AS doc_count
+           FROM pr_changed_file_terms
+          WHERE ${condition}
+          GROUP BY term_kind, term_value`,
+      )
+      .all(...termParams) as Array<{
+      term_kind: "stem" | "dir" | "dir_pair";
+      term_value: string;
+      doc_count: number;
+    }>;
+    const kindWeights = {
+      stem: 3,
+      dir_pair: 2,
+      dir: 1,
+    } as const;
+    const seedTermWeights = countRows
+      .filter((row) => row.doc_count <= 40)
+      .map((row) => ({
+        key: `${row.term_kind}:${row.term_value}`,
+        kind: row.term_kind,
+        value: row.term_value,
+        weight: kindWeights[row.term_kind] / Math.max(1, row.doc_count),
+      }))
+      .sort((left, right) => right.weight - left.weight || left.key.localeCompare(right.key))
+      .slice(0, 10);
+    if (seedTermWeights.length === 0) {
+      return new Map();
+    }
+
+    const selectedCondition = seedTermWeights
+      .map(() => "(term_kind = ? AND term_value = ?)")
+      .join(" OR ");
+    const selectedParams = seedTermWeights.flatMap((term) => [term.kind, term.value]);
+    const overlapRows = this.db
+      .prepare(
+        `SELECT pr_number, term_kind, term_value
+           FROM pr_changed_file_terms
+          WHERE pr_number != ?
+            AND (${selectedCondition})`,
+      )
+      .all(seedPrNumber, ...selectedParams) as Array<{
+      pr_number: number;
+      term_kind: "stem" | "dir" | "dir_pair";
+      term_value: string;
+    }>;
+    const scoreByPr = new Map<number, number>();
+    const weightByKey = new Map(seedTermWeights.map((term) => [term.key, term.weight]));
+    for (const row of overlapRows) {
+      const key = `${row.term_kind}:${row.term_value}`;
+      scoreByPr.set(
+        row.pr_number,
+        (scoreByPr.get(row.pr_number) ?? 0) + (weightByKey.get(key) ?? 0),
+      );
+    }
+
+    return new Map(
+      Array.from(scoreByPr.entries())
+        .sort((left, right) => right[1] - left[1] || right[0] - left[0])
+        .slice(0, limit)
+        .map(([prNumber]) => [prNumber, "local_semantic" satisfies ClusterMatchSource]),
+    );
+  }
+
+  private async rerankSemanticCandidates(params: {
+    seed: { title: string; body: string; changedFiles: PullRequestChangedFile[] };
+    candidates: ClusterCandidate[];
+  }): Promise<ClusterCandidate[]> {
+    if (params.candidates.length === 0) {
+      return params.candidates;
+    }
+    const rerankable = [...params.candidates]
+      .sort(
+        (left, right) =>
+          (right.semanticScore ?? 0) - (left.semanticScore ?? 0) ||
+          right.updatedAt.localeCompare(left.updatedAt),
+      )
+      .slice(0, CLUSTER_EMBEDDING_RERANK_LIMIT);
+    const seedText = buildClusterSemanticText(params.seed);
+    const entries = [
+      {
+        key: `seed`,
+        hash: hashText(seedText),
+        text: seedText,
+      },
+      ...rerankable.map((candidate) => {
+        const candidateText = buildClusterSemanticText({
+          title: candidate.title,
+          body: "",
+          changedFiles: [
+            ...candidate.prodFiles.map(
+              (path) => ({ path, kind: "prod" }) satisfies PullRequestChangedFile,
+            ),
+            ...candidate.testFiles.map(
+              (path) => ({ path, kind: "test" }) satisfies PullRequestChangedFile,
+            ),
+            ...candidate.otherFiles.map(
+              (path) => ({ path, kind: "other" }) satisfies PullRequestChangedFile,
+            ),
+          ],
+        });
+        return {
+          key: String(candidate.prNumber),
+          hash: hashText(candidateText),
+          text: candidateText,
+        };
+      }),
+    ];
+    const embeddings = await this.embedTextEntries(
+      CLUSTER_EMBEDDING_PROVIDER,
+      entries.map((entry) => ({ hash: entry.hash, text: entry.text })),
+    );
+    const seedEmbedding = embeddings.get(entries[0]!.hash);
+    if (!seedEmbedding?.length) {
+      return params.candidates;
+    }
+
+    const cosineSimilarity = (left: number[], right: number[]): number => {
+      let sum = 0;
+      const dims = Math.min(left.length, right.length);
+      for (let index = 0; index < dims; index += 1) {
+        sum += (left[index] ?? 0) * (right[index] ?? 0);
+      }
+      return sum;
+    };
+
+    const rerankedByPr = new Map<number, ClusterCandidate>();
+    for (const candidate of rerankable) {
+      const entry = entries.find((value) => value.key === String(candidate.prNumber));
+      if (!entry) {
+        continue;
+      }
+      const candidateEmbedding = embeddings.get(entry.hash);
+      if (!candidateEmbedding?.length) {
+        continue;
+      }
+      const score = computeSemanticScore({
+        seed: params.seed,
+        candidate: {
+          title: candidate.title,
+          body: "",
+          changedFiles: [
+            ...candidate.prodFiles.map(
+              (path) => ({ path, kind: "prod" }) satisfies PullRequestChangedFile,
+            ),
+            ...candidate.testFiles.map(
+              (path) => ({ path, kind: "test" }) satisfies PullRequestChangedFile,
+            ),
+            ...candidate.otherFiles.map(
+              (path) => ({ path, kind: "other" }) satisfies PullRequestChangedFile,
+            ),
+          ],
+        },
+        embeddingScore: cosineSimilarity(seedEmbedding, candidateEmbedding),
+      });
+      rerankedByPr.set(
+        candidate.prNumber,
+        withClusterFeatures(
+          {
+            ...candidate,
+            semanticScore: score.score,
+          },
+          [],
+        ),
+      );
+    }
+
+    return params.candidates.map((candidate) => rerankedByPr.get(candidate.prNumber) ?? candidate);
+  }
+
   private async collectLiveIssueSearchCandidates(
     repo: RepoRef,
     source: PullRequestDataSource,
@@ -2556,8 +2832,25 @@ export class PrIndexStore {
         ),
       )
       .filter((candidate): candidate is ClusterCandidate => Boolean(candidate));
-    const relevantPaths = buildRelevantPathSets(params.seed.number, rawCandidates);
-    const rankedCandidates = rawCandidates
+    const cappedCandidates = [...rawCandidates]
+      .sort((left, right) => {
+        const issueDelta =
+          right.linkedIssues.filter((issue) => params.clusterIssueNumbers.includes(issue)).length -
+          left.linkedIssues.filter((issue) => params.clusterIssueNumbers.includes(issue)).length;
+        if (issueDelta !== 0) {
+          return issueDelta;
+        }
+        const stateRank = (value: ClusterCandidate["state"]): number =>
+          value === "open" ? 2 : value === "merged" ? 1 : 0;
+        const stateDelta = stateRank(right.state) - stateRank(left.state);
+        if (stateDelta !== 0) {
+          return stateDelta;
+        }
+        return right.updatedAt.localeCompare(left.updatedAt) || right.prNumber - left.prNumber;
+      })
+      .slice(0, EXACT_CLUSTER_PATH_CAP);
+    const relevantPaths = buildRelevantPathSets(params.seed.number, cappedCandidates);
+    const rankedCandidates = cappedCandidates
       .map((candidate) =>
         annotateRelevantCoverage(
           candidate,
@@ -2645,11 +2938,10 @@ export class PrIndexStore {
       }
     }
     const bundles = this.loadClusterInputs(semanticNumbers.map(([prNumber]) => prNumber));
-
-    for (const [prNumber, matchedBy] of semanticNumbers) {
+    const semanticCandidates = semanticNumbers.flatMap(([prNumber, matchedBy]) => {
       const bundle = bundles.get(prNumber);
       if (!bundle) {
-        continue;
+        return [];
       }
       const semanticScore = computeSemanticScore({
         seed: {
@@ -2669,11 +2961,20 @@ export class PrIndexStore {
         matchedBy,
         undefined,
         ["semantic_only_candidate"],
-        semanticScore,
+        semanticScore.score,
       );
-      if (!candidate) {
-        continue;
-      }
+      return candidate ? [candidate] : [];
+    });
+    const rerankedCandidates = await this.rerankSemanticCandidates({
+      seed: {
+        title: params.seed.title,
+        body: params.seed.body,
+        changedFiles: seedChangedFiles,
+      },
+      candidates: semanticCandidates,
+    });
+
+    for (const candidate of rerankedCandidates) {
       const evaluation = evaluateSemanticOnlyCandidate(candidate);
       decisionTrace.push(...evaluation.decisionTrace);
       if (evaluation.included) {
@@ -2693,6 +2994,7 @@ export class PrIndexStore {
   }
 
   private async collectNearbyExcludedCandidates(params: {
+    seed: PrRow;
     nearbyNumbers: Map<number, ClusterMatchSource>;
     sameClusterSet: Set<number>;
     relevantPaths: {
@@ -2709,6 +3011,7 @@ export class PrIndexStore {
   }> {
     const nearbyButExcluded: ClusterExcludedCandidate[] = [];
     const decisionTrace: ClusterDecisionTrace[] = [];
+    const seedChangedFiles = this.getChangedFilesForPr(params.seed.number);
     const nearbyNumbers = Array.from(params.nearbyNumbers.entries()).filter(
       ([prNumber]) => !params.sameClusterSet.has(prNumber),
     );
@@ -2724,16 +3027,43 @@ export class PrIndexStore {
       }
     }
     const bundles = this.loadClusterInputs(nearbyNumbers.map(([prNumber]) => prNumber));
-
-    for (const [prNumber, matchedBy] of nearbyNumbers) {
+    const nearbyCandidates = nearbyNumbers.flatMap(([prNumber, matchedBy]) => {
+      const bundle = bundles.get(prNumber) ?? null;
+      if (!bundle) {
+        return [];
+      }
+      const semanticScore = computeSemanticScore({
+        seed: {
+          title: params.seed.title,
+          body: params.seed.body,
+          changedFiles: seedChangedFiles,
+        },
+        candidate: {
+          title: bundle.pr.title,
+          body: bundle.pr.body,
+          changedFiles: bundle.changedFiles,
+        },
+      });
       const candidate = this.buildClusterCandidateFromBundle(
-        bundles.get(prNumber) ?? null,
+        bundle,
         "same_cluster_candidate",
         matchedBy,
+        undefined,
+        [],
+        semanticScore.score,
       );
-      if (!candidate) {
-        continue;
-      }
+      return candidate ? [candidate] : [];
+    });
+    const rerankedCandidates = await this.rerankSemanticCandidates({
+      seed: {
+        title: params.seed.title,
+        body: params.seed.body,
+        changedFiles: seedChangedFiles,
+      },
+      candidates: nearbyCandidates,
+    });
+
+    for (const candidate of rerankedCandidates) {
       const annotated = annotateRelevantCoverage(
         candidate,
         params.relevantPaths.relevantProdFiles,
@@ -2905,6 +3235,7 @@ export class PrIndexStore {
   }): Promise<ClusterPullRequestAnalysis | null> {
     await this.init();
     await this.ensureDerivedIssueLinksBackfilled();
+    await this.ensureChangedFileTermsBackfilled();
     const limit = params.limit ?? DEFAULT_SEARCH_LIMIT;
     if (params.repo && params.source) {
       await this.ensureClusterCandidateCached(
@@ -2927,6 +3258,14 @@ export class PrIndexStore {
     const localNearbyNumbers = new Map<number, ClusterMatchSource>(
       localNearbyResults.map((result) => [result.prNumber, "local_semantic"]),
     );
+    for (const [prNumber, matchedBy] of this.collectLocalPathOverlapCandidates(
+      params.prNumber,
+      CLUSTER_LOCAL_PATH_LIMIT,
+    )) {
+      if (prNumber !== params.prNumber) {
+        localNearbyNumbers.set(prNumber, localNearbyNumbers.get(prNumber) ?? matchedBy);
+      }
+    }
 
     if (seedLinkedIssues.length === 0) {
       const decisionTrace = [
@@ -3012,6 +3351,7 @@ export class PrIndexStore {
       linkedIssueCandidateSet.rankedCandidates.map((candidate) => candidate.prNumber),
     );
     const nearbyDecisionSet = await this.collectNearbyExcludedCandidates({
+      seed,
       nearbyNumbers,
       sameClusterSet,
       relevantPaths: linkedIssueCandidateSet.relevantPaths,

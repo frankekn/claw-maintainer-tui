@@ -1182,7 +1182,7 @@ describe("PrIndexStore", () => {
           prNumber: 34020,
           matchedBy: "local_semantic",
           status: "possible_same_cluster",
-          reason: "semantic-only candidate",
+          reason: expect.stringContaining("semantic-only candidate"),
           featureVector: expect.objectContaining({
             matchedBy: "local_semantic",
             semanticScore: expect.any(Number),
@@ -1376,6 +1376,66 @@ describe("PrIndexStore", () => {
         }),
       ]),
     );
+  });
+
+  it("recovers semantic-only candidates from local path overlap and embedding rerank", async () => {
+    const createProvider = vi
+      .spyOn(embeddingModule, "createLocalEmbeddingProvider")
+      .mockResolvedValue({
+        id: "local",
+        model: "mock-cluster",
+        embedQuery: async () => [1, 0],
+        embedBatch: async (texts: string[]) => texts.map(() => [1, 0]),
+      });
+    try {
+      const store = await createStore();
+      const seed = makePullRequest(39675, {
+        title: "fix: tame retry budget drift",
+        body: "Reduce retry budget drift in long-lived runs.",
+        updatedAt: "2026-03-08T00:00:00.000Z",
+      });
+      const pathNeighbor = makePullRequest(39676, {
+        title: "refactor: rebalance quota accounting",
+        body: "Adjust quota accounting in a nearby runtime path.",
+        updatedAt: "2026-03-09T00:00:00.000Z",
+      });
+
+      await store.sync({
+        repo,
+        source: new FakePullRequestDataSource([seed, pathNeighbor]),
+        full: true,
+      });
+      await store.recordPullRequestFacts(
+        makePullRequestFacts(39675, {
+          changedFiles: [{ path: "src/retries/budget-controller.ts", kind: "prod" }],
+        }),
+      );
+      await store.recordPullRequestFacts(
+        makePullRequestFacts(39676, {
+          changedFiles: [{ path: "src/retries/quota-manager.ts", kind: "prod" }],
+        }),
+      );
+
+      const analysis = await store.clusterPullRequest({
+        prNumber: 39675,
+        limit: 10,
+        ftsOnly: true,
+      });
+
+      expect(createProvider).toHaveBeenCalled();
+      expect(analysis?.clusterBasis).toBe("semantic_only");
+      expect(analysis?.sameClusterCandidates).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            prNumber: 39676,
+            matchedBy: "local_semantic",
+            status: "possible_same_cluster",
+          }),
+        ]),
+      );
+    } finally {
+      createProvider.mockRestore();
+    }
   });
 
   it("refreshes cluster candidates through summary and fact fetches without hydrating detail", async () => {

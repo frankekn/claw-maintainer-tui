@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import type {
   ClusterCandidate,
   ClusterExcludedCandidate,
@@ -9,6 +10,7 @@ import type {
 import { withClusterFeatures } from "./cluster-analysis.js";
 import {
   buildCrossReferenceQuery,
+  extractChangedFileTerms,
   extractSemanticTerms,
   getFileStem,
   isCompanionTest,
@@ -25,6 +27,19 @@ function setContainsAll(left: Set<string>, right: Set<string>): boolean {
   }
   return true;
 }
+
+type PathFileMetadata = {
+  path: string;
+  stem: string;
+  dir: string;
+};
+
+export type SemanticScoreBreakdown = {
+  lexicalScore: number;
+  structuralScore: number;
+  embeddingScore: number;
+  score: number;
+};
 
 export function annotateRelevantCoverage(
   candidate: ClusterCandidate,
@@ -61,43 +76,94 @@ export function buildRelevantPathSets(
   const prodCounts = new Map<string, number>();
   const testCounts = new Map<string, number>();
   const seedCandidate = candidates.find((candidate) => candidate.prNumber === seedPrNumber) ?? null;
+  const prodMetadataByCandidate = new Map<number, PathFileMetadata[]>();
+  const testMetadataByCandidate = new Map<number, PathFileMetadata[]>();
+  const testsByStem = new Map<string, PathFileMetadata[]>();
+  const seedProdSet = new Set(seedCandidate?.prodFiles ?? []);
 
   for (const candidate of candidates) {
+    const prodMetadata = candidate.prodFiles.map((file) => ({
+      path: file,
+      stem: getFileStem(file),
+      dir: path.dirname(file),
+    }));
+    const testMetadata = candidate.testFiles.map((file) => ({
+      path: file,
+      stem: getFileStem(file),
+      dir: path.dirname(file),
+    }));
+    prodMetadataByCandidate.set(candidate.prNumber, prodMetadata);
+    testMetadataByCandidate.set(candidate.prNumber, testMetadata);
     for (const file of candidate.prodFiles) {
       prodCounts.set(file, (prodCounts.get(file) ?? 0) + 1);
     }
     for (const file of candidate.testFiles) {
       testCounts.set(file, (testCounts.get(file) ?? 0) + 1);
     }
+    for (const metadata of testMetadata) {
+      const rows = testsByStem.get(metadata.stem) ?? [];
+      rows.push(metadata);
+      testsByStem.set(metadata.stem, rows);
+    }
   }
 
-  const relevantProdFiles = new Set(
-    candidates.flatMap((candidate) =>
-      candidate.prodFiles.filter(
-        (file) =>
-          (prodCounts.get(file) ?? 0) >= 2 ||
-          seedCandidate?.prodFiles.includes(file) ||
-          candidates.some((otherCandidate) =>
-            otherCandidate.testFiles.some((testFile) => isCompanionTest(file, testFile)),
-          ),
-      ),
-    ),
-  );
-  const relevantTestFiles = new Set(
-    candidates.flatMap((candidate) =>
-      candidate.testFiles.filter((file) => {
-        const candidateRelevantProdCount = candidate.prodFiles.filter((prodFile) =>
-          relevantProdFiles.has(prodFile),
-        ).length;
-        return (
-          (testCounts.get(file) ?? 0) >= 2 ||
-          Array.from(relevantProdFiles).some((prodFile) => isCompanionTest(prodFile, file)) ||
-          (candidateRelevantProdCount > 0 &&
-            candidate.testFiles.length <= Math.max(2, candidateRelevantProdCount * 2))
-        );
-      }),
-    ),
-  );
+  const relevantProdFiles = new Set<string>();
+  for (const candidate of candidates) {
+    for (const metadata of prodMetadataByCandidate.get(candidate.prNumber) ?? []) {
+      const matchingTests = testsByStem.get(metadata.stem) ?? [];
+      const hasCompanionTest = matchingTests.some((testMetadata) =>
+        isCompanionTest(metadata.path, testMetadata.path),
+      );
+      if (
+        (prodCounts.get(metadata.path) ?? 0) >= 2 ||
+        seedProdSet.has(metadata.path) ||
+        hasCompanionTest
+      ) {
+        relevantProdFiles.add(metadata.path);
+      }
+    }
+  }
+
+  const relevantProdByStem = new Map<string, PathFileMetadata[]>();
+  for (const candidate of candidates) {
+    for (const metadata of prodMetadataByCandidate.get(candidate.prNumber) ?? []) {
+      if (!relevantProdFiles.has(metadata.path)) {
+        continue;
+      }
+      const rows = relevantProdByStem.get(metadata.stem) ?? [];
+      rows.push(metadata);
+      relevantProdByStem.set(metadata.stem, rows);
+    }
+  }
+
+  const relevantProdCountByCandidate = new Map<number, number>();
+  for (const candidate of candidates) {
+    relevantProdCountByCandidate.set(
+      candidate.prNumber,
+      (prodMetadataByCandidate.get(candidate.prNumber) ?? []).filter((metadata) =>
+        relevantProdFiles.has(metadata.path),
+      ).length,
+    );
+  }
+
+  const relevantTestFiles = new Set<string>();
+  for (const candidate of candidates) {
+    const candidateRelevantProdCount = relevantProdCountByCandidate.get(candidate.prNumber) ?? 0;
+    for (const metadata of testMetadataByCandidate.get(candidate.prNumber) ?? []) {
+      const relevantProdMatches = relevantProdByStem.get(metadata.stem) ?? [];
+      const hasCompanionProd = relevantProdMatches.some((prodMetadata) =>
+        isCompanionTest(prodMetadata.path, metadata.path),
+      );
+      if (
+        (testCounts.get(metadata.path) ?? 0) >= 2 ||
+        hasCompanionProd ||
+        (candidateRelevantProdCount > 0 &&
+          candidate.testFiles.length <= Math.max(2, candidateRelevantProdCount * 2))
+      ) {
+        relevantTestFiles.add(metadata.path);
+      }
+    }
+  }
 
   return { relevantProdFiles, relevantTestFiles };
 }
@@ -191,38 +257,62 @@ export function rankClusterCandidates(
 export function computeSemanticScore(params: {
   seed: { title: string; body: string; changedFiles: PullRequestChangedFile[] };
   candidate: { title: string; body: string; changedFiles: PullRequestChangedFile[] };
-}): number {
+  embeddingScore?: number;
+}): SemanticScoreBreakdown {
   const { seed, candidate } = params;
   const seedTerms = extractSemanticTerms(normalizeClusterSearchTitle(seed.title), seed.body).slice(
     0,
     6,
   );
-  if (seedTerms.length === 0) {
-    return 0;
-  }
   const candidateTerms = new Set(
     extractSemanticTerms(normalizeClusterSearchTitle(candidate.title), candidate.body),
   );
-  const matchedTerms = seedTerms.filter((term) => candidateTerms.has(term)).length;
-  const seedFiles = new Set(
-    seed.changedFiles.filter((file) => file.kind !== "other").map((file) => getFileStem(file.path)),
+  const matchedTerms =
+    seedTerms.length === 0 ? 0 : seedTerms.filter((term) => candidateTerms.has(term)).length;
+  const lexicalScore =
+    seedTerms.length === 0 ? 0 : matchedTerms / Math.max(2, Math.min(6, seedTerms.length));
+
+  const seedPathTerms = new Map(
+    seed.changedFiles
+      .filter((file) => file.kind !== "other")
+      .flatMap((file) => extractChangedFileTerms(file.path))
+      .map((term) => [`${term.kind}:${term.value}`, term.kind]),
   );
-  const candidateFiles = new Set(
+  const candidatePathTerms = new Set(
     candidate.changedFiles
       .filter((file) => file.kind !== "other")
-      .map((file) => getFileStem(file.path)),
+      .flatMap((file) => extractChangedFileTerms(file.path))
+      .map((term) => `${term.kind}:${term.value}`),
   );
-  let fileOverlap = 0;
-  if (seedFiles.size > 0 && candidateFiles.size > 0) {
-    let overlap = 0;
-    for (const file of seedFiles) {
-      if (candidateFiles.has(file)) {
-        overlap += 1;
-      }
+  const termWeights = {
+    stem: 1.3,
+    dir_pair: 1,
+    dir: 0.7,
+  } as const;
+  let matchedPathWeight = 0;
+  let totalPathWeight = 0;
+  for (const [termKey, kind] of seedPathTerms) {
+    const weight = termWeights[kind];
+    totalPathWeight += weight;
+    if (candidatePathTerms.has(termKey)) {
+      matchedPathWeight += weight;
     }
-    fileOverlap = overlap / Math.max(seedFiles.size, candidateFiles.size);
   }
-  return Math.min(1, matchedTerms / Math.max(2, Math.min(6, seedTerms.length)) + fileOverlap * 0.3);
+  const structuralScore =
+    totalPathWeight === 0 ? 0 : Math.min(1, matchedPathWeight / totalPathWeight);
+  const embeddingScore = Math.max(0, params.embeddingScore ?? 0);
+
+  const score =
+    params.embeddingScore === undefined
+      ? Math.min(1, lexicalScore * 0.55 + structuralScore * 0.45)
+      : Math.min(1, lexicalScore * 0.3 + structuralScore * 0.3 + embeddingScore * 0.4);
+
+  return {
+    lexicalScore,
+    structuralScore,
+    embeddingScore,
+    score,
+  };
 }
 
 export function buildLiveSemanticQueries(seed: { title: string; body: string }): string[] {
@@ -237,6 +327,28 @@ export function buildLiveSemanticQueries(seed: { title: string; body: string }):
     .slice(0, 6)
     .join(" ");
   return uniqueStrings([crossReferenceQuery, titleQuery, firstSentenceQuery]).slice(0, 3);
+}
+
+export function buildClusterSemanticText(params: {
+  title: string;
+  body: string;
+  changedFiles: PullRequestChangedFile[];
+}): string {
+  const bodySnippet = normalizeSearchText(params.body)
+    .split(/[\n.!?]+/g)
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .slice(0, 2)
+    .join(". ");
+  const pathTerms = uniqueStrings(
+    params.changedFiles
+      .filter((file) => file.kind !== "other")
+      .flatMap((file) => extractChangedFileTerms(file.path))
+      .map((term) => term.value),
+  ).slice(0, 10);
+  return [normalizeClusterSearchTitle(params.title), bodySnippet, pathTerms.join(" ")]
+    .filter(Boolean)
+    .join("\n");
 }
 
 export function buildExcludedCandidate(
