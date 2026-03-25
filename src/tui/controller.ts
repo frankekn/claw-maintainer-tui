@@ -589,7 +589,11 @@ export class TuiController {
     this.emit();
 
     if (this.isListMode(mode)) {
-      void this.loadLandingRows(mode);
+      if (this.isQueryMode(mode) && this.query) {
+        void this.submitQuery(this.query);
+      } else {
+        void this.loadLandingRows(mode);
+      }
       this.scheduleAutoSync(mode);
       return;
     }

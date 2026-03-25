@@ -1240,6 +1240,50 @@ describe("TuiController", () => {
     expect(controller.getRenderModel().query).toBe("author:frank");
   });
 
+  it.each([
+    ["cross-search", "Explore · author:frank"],
+    ["pr-search", "PRs · author:frank"],
+    ["issue-search", "Issues · author:frank"],
+  ] as const)("re-runs the saved query when re-activating %s", async (mode, expectedTitle) => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    controller.activateMode(mode);
+    await flushMicrotasks();
+    await controller.submitQuery("author:frank");
+
+    service.searchCalls = [];
+    service.issueSearchCalls = [];
+
+    controller.activateMode("watchlist");
+    await flushMicrotasks();
+    controller.activateMode(mode);
+    await flushMicrotasks();
+
+    const model = controller.getRenderModel();
+    expect(model.mode).toBe(mode);
+    expect(model.query).toBe("author:frank");
+    expect(model.resultsPane.title).toBe(expectedTitle);
+    expect(model.resultsPane.rows.length).toBeGreaterThan(0);
+
+    if (mode === "cross-search") {
+      expect(service.searchCalls.at(-1)?.query).toBe("author:frank");
+      expect(service.issueSearchCalls.at(-1)?.query).toBe("author:frank");
+      return;
+    }
+    if (mode === "pr-search") {
+      expect(service.searchCalls.at(-1)?.query).toBe("author:frank");
+      expect(service.issueSearchCalls).toHaveLength(0);
+      return;
+    }
+    expect(service.searchCalls).toHaveLength(0);
+    expect(service.issueSearchCalls.at(-1)?.query).toBe("author:frank");
+  });
+
   it("does not duplicate browse guidance in the footer query line", async () => {
     const service = new FakeTuiDataService();
     const controller = new TuiController(service, {
