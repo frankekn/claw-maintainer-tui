@@ -721,7 +721,6 @@ export class TuiController {
 
   toggleHelp(): void {
     this.helpVisible = !this.helpVisible;
-    this.bannerHidden = false;
     this.emit();
   }
 
@@ -1117,6 +1116,7 @@ export class TuiController {
     }
     if (this.rows.length === 0) {
       this.resetDetailState();
+      this.context = null;
       this.focus = "results";
     }
     this.emit();
@@ -1169,6 +1169,7 @@ export class TuiController {
     const row = this.rows[this.selectedIndex];
     if (!row && this.clusterWorkspace) {
       await this.openClusterWorkspace(this.clusterWorkspace.seedPrNumber, {
+        pushHistory: false,
         showExcluded: this.clusterWorkspace.showExcluded,
       });
       return;

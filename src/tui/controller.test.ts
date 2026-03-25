@@ -599,6 +599,7 @@ describe("TuiController", () => {
     expect(model.footer.message).toContain("Hid excluded cluster candidates.");
     expect(model.detailPane.visible).toBe(false);
     expect(model.detailPane.title).toBe("Start Here");
+    expect(model.context).toBeNull();
     expect(model.footer.actions.find((action) => action.id === "expand-cluster")).toMatchObject({
       label: "Excluded",
       shortcut: "e",
@@ -629,6 +630,45 @@ describe("TuiController", () => {
     model = controller.getRenderModel();
     expect(model.resultsPane.rows).toHaveLength(1);
     expect(model.resultsPane.rows[0]?.kind).toBe("cluster-excluded");
+  });
+
+  it("does not add duplicate back-stack entries when refreshing an empty cluster workspace", async () => {
+    const service = new FakeTuiDataService();
+    service.verifyClusterPr = vi.fn(async (prNumber) => ({
+      analysis: {
+        ...makeCluster(prNumber),
+        bestBase: null,
+        sameClusterCandidates: [],
+        nearbyButExcluded: [makeExcludedClusterCandidate(43001)],
+      },
+      summary: {
+        verifiedPrCount: 1,
+        verifiedIssueCount: 1,
+        missingCount: 0,
+        state: "done" as const,
+      },
+    }));
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.expandSelectedCluster();
+    await controller.expandSelectedCluster();
+
+    let model = controller.getRenderModel();
+    expect(model.resultsPane.rows).toHaveLength(0);
+    expect(model.resultsPane.title).toContain("Cluster");
+
+    await controller.refreshSelected();
+    controller.goBack();
+
+    model = controller.getRenderModel();
+    expect(model.mode).toBe("inbox");
+    expect(model.resultsPane.title).toBe("Inbox");
+    expect(model.resultsPane.rows[0]?.kind).toBe("pr");
   });
 
   it("refreshes detail when hiding the selected excluded cluster row", async () => {
@@ -1062,6 +1102,28 @@ describe("TuiController", () => {
     service.releaseRefreshPr();
     await refreshPromise;
 
+    expect(controller.getRenderModel().footer.banner).toBeNull();
+  });
+
+  it("keeps dismissed banners hidden when the help overlay is toggled", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.toggleWatchSelected();
+    expect(controller.getRenderModel().footer.banner?.message).toContain("watch");
+
+    controller.dismissBanner();
+    expect(controller.getRenderModel().footer.banner).toBeNull();
+
+    controller.toggleHelp();
+    controller.toggleHelp();
+
+    expect(controller.getRenderModel().helpOverlay.visible).toBe(false);
     expect(controller.getRenderModel().footer.banner).toBeNull();
   });
 
