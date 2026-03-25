@@ -325,6 +325,25 @@ describe("BlessedTuiRenderer", () => {
     expect(controller.dispatch).not.toHaveBeenCalled();
   });
 
+  it("still quits when q is pressed while help overlay is open", async () => {
+    const controller = createControllerStub();
+    controller.getRenderModel.mockReturnValue({
+      ...renderModel,
+      helpOverlay: {
+        visible: true,
+        title: "Inbox Help",
+        lines: ["Help line"],
+      },
+    });
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness;
+    renderers.push(harness);
+
+    await harness.handleKeypress("q", { name: "q" } as blessed.Widgets.Events.IKeyEventArg);
+
+    expect(controller.dispose).toHaveBeenCalledTimes(1);
+  });
+
   it("cleans up the screen when initialize fails", async () => {
     const controller = createControllerStub();
     controller.initialize.mockRejectedValue(new Error("init boom"));

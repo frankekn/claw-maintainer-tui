@@ -25,6 +25,9 @@ export function resolveKeyAction(
   key: blessed.Widgets.Events.IKeyEventArg,
 ): TuiKeyAction {
   if (model.helpOverlay.visible) {
+    if (key.name === "q") {
+      return { kind: "quit" };
+    }
     if (key.name === "escape" || key.name === "f1" || key.name === "question mark" || ch === "?") {
       return { kind: "command", command: { type: "toggle_help" } };
     }

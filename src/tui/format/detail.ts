@@ -187,12 +187,11 @@ export function formatPriorityPrDetail(
     ],
     { foldable: true },
   );
-  const clusterCandidates =
-    (bundle.cluster?.sameClusterCandidates.length ?? 0) +
-    (bundle.cluster?.nearbyButExcluded.length ?? 0);
   const bestBase = bundle.cluster?.bestBase ?? null;
   const sameClusterCandidates = bundle.cluster?.sameClusterCandidates ?? [];
   const nearbyButExcluded = bundle.cluster?.nearbyButExcluded ?? [];
+  const clusterCandidates =
+    (bestBase ? 1 : 0) + sameClusterCandidates.length + nearbyButExcluded.length;
   appendSection(
     lines,
     anchors,
