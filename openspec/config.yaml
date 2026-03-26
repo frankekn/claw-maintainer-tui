@@ -1,0 +1,32 @@
+schema: spec-driven
+
+context: |
+  Repository: clawlens in claw-maintainer-tui.
+  Existing application shape:
+  - TypeScript ESM, Node 22+, Vitest, local-first CLI/TUI.
+  - Pull request and issue sync currently go through data-source interfaces in src/types.ts.
+  - The local SQLite read model already stores PRs, issues, comments, linked issues, changed files, changed-file terms, review facts, and local attention state.
+  - Keep the current CLI/TUI usable while adding the central API. Do not replace the local store in the first implementation.
+  Implementation policy:
+  - Add the coordination service as a Go module under /server in this same repo.
+  - Keep vectors optional and off by default. Start with SQLite + FTS5 + changed-file-term overlap.
+  - Distinguish problem_intent from solution_shape in all analysis outputs.
+  - Bind all PR-derived analysis to repo, pr_number, head_sha, analyzer_id, analyzer_version, and schema_version.
+  - Central attention state must be per-user. Never make watch/ignore/seen global across maintainers.
+
+rules:
+  proposal:
+    - Include explicit goals, non-goals, rollout phases, risks, and rollback strategy.
+    - Include why the change belongs in this repo instead of a separate repo.
+  design:
+    - Document API routes, auth flows, database tables, jobs, agent triggers, failure modes, and migration plan.
+    - Preserve existing store and TUI service boundaries until a specific task changes them.
+    - Prefer additive schema changes and feature flags over flag-day rewrites.
+  specs:
+    - Use Given/When/Then scenarios.
+    - State whether a requirement applies to pull requests, issues, or both.
+    - Spreadsheet output may exist, but SQLite is the authoritative store.
+  tasks:
+    - Group tasks by phase.
+    - Each phase must end with explicit verification steps.
+    - Keep tasks small enough for a focused Codex CLI session.
