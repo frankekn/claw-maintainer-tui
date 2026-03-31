@@ -52,6 +52,9 @@ export function rowUrl(row: TuiResultRow | undefined): string | null {
   if (row.kind === "priority-cluster") {
     return row.cluster.representative.pr.url;
   }
+  if (row.kind === "cluster-candidate" || row.kind === "cluster-excluded") {
+    return row.candidate.url;
+  }
   return null;
 }
 
@@ -64,6 +67,12 @@ export function rowIdentityForAny(row: TuiResultRow): string | null {
   }
   if (row.kind === "priority-cluster") {
     return row.cluster.clusterKey;
+  }
+  if (row.kind === "cluster-candidate") {
+    return `cluster-candidate:${row.candidate.prNumber}`;
+  }
+  if (row.kind === "cluster-excluded") {
+    return `cluster-excluded:${row.candidate.prNumber}`;
   }
   return row.kind;
 }

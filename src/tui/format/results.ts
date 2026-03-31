@@ -10,6 +10,7 @@ import type {
   TuiVerificationState,
 } from "../types.js";
 import { formatRelativeAge } from "./chrome.js";
+import { formatCrossSearchLandingDetail, formatSearchLandingDetail } from "./detail.js";
 
 function cleanText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
@@ -184,7 +185,7 @@ function formatTableHeader(mode: TuiMode): string {
   if (mode === "inbox" || mode === "watchlist") {
     return text(
       `${padRight("Kind", 8)} ${padRight("ID", 9)} ${padRight("Score", 4)} ${padRight(
-        "State",
+        "Triage",
         7,
       )} ${padRight("Age", 4)} ${padRight("Ctx", 7)} ${padRight("Tag", 3)} Title / reasons`,
       "dim",
@@ -199,6 +200,64 @@ function formatTableHeader(mode: TuiMode): string {
   );
 }
 
+function formatClusterWorkspaceHeader(): string {
+  return text(
+    `${padRight("Kind", 8)} ${padRight("ID", 9)} ${padRight("State", 11)} ${padRight(
+      "Status",
+      9,
+    )} ${padRight("Verify", 11)} ${padRight("Updated", 10)} Title`,
+    "dim",
+  );
+}
+
+function wrapCard(title: string, body: string[]): string[] {
+  const contentWidth = Math.max(
+    title.length + 2,
+    ...body.map((line) => line.replace(/\{[^}]+\}/g, "").length),
+    50,
+  );
+  const top = `┌─ ${title} ${"─".repeat(Math.max(0, contentWidth - title.length - 1))}┐`;
+  const lines = body.map((line) => {
+    const visible = line.replace(/\{[^}]+\}/g, "");
+    return `│ ${line}${" ".repeat(Math.max(0, contentWidth - visible.length))} │`;
+  });
+  const bottom = `└${"─".repeat(contentWidth + 2)}┘`;
+  return [top, ...lines, bottom];
+}
+
+function buildLandingCard(mode: TuiMode, status: StatusSnapshot | null): string[] {
+  if (mode === "inbox") {
+    return wrapCard("Getting started", [
+      "No local PR index yet.",
+      "PR metadata will sync automatically if stale.",
+      "",
+      "[s] Sync PRs   [S] Sync issues   [?] Help",
+      "[1-6] Jump mode",
+    ]);
+  }
+  if (mode === "watchlist") {
+    return wrapCard("Watchlist", [
+      "No watched PRs yet.",
+      "Press w on any PR to pin it here.",
+      "",
+      "[1-6] Jump mode   [?] Help",
+    ]);
+  }
+  if (mode === "cross-search") {
+    return wrapCard("Explore", formatCrossSearchLandingDetail(status).slice(0, 6));
+  }
+  if (mode === "pr-search" || mode === "issue-search") {
+    return wrapCard(
+      mode === "pr-search" ? "PR Search" : "Issue Search",
+      formatSearchLandingDetail(mode, status).slice(0, 6),
+    );
+  }
+  return wrapCard("Status", [
+    "Repository sync and cache health.",
+    "[s] Sync PRs   [S] Sync issues",
+  ]);
+}
+
 export function buildResultsPaneModel(input: {
   mode: TuiMode;
   title: string;
@@ -207,8 +266,23 @@ export function buildResultsPaneModel(input: {
   focus: TuiFocus;
   summary: TuiListSummary | null;
   message: string;
+  isLandingView: boolean;
+  status: StatusSnapshot | null;
 }): TuiResultsPaneModel {
-  const { mode, rows, selectedIndex, focus, title, summary, message } = input;
+  const { mode, rows, selectedIndex, focus, title, summary, message, isLandingView, status } =
+    input;
+  const isClusterWorkspace =
+    rows.length > 0 &&
+    rows.every((row) => row.kind === "cluster-candidate" || row.kind === "cluster-excluded");
+  if (isLandingView && rows.length === 0) {
+    return {
+      title,
+      summary,
+      rows,
+      selectedIndex,
+      lines: buildLandingCard(mode, status),
+    };
+  }
   if (rows.length === 0) {
     if (mode === "inbox") {
       return {
@@ -221,10 +295,7 @@ export function buildResultsPaneModel(input: {
               text("Loading priority queue...", "muted"),
               text("Assembling cached PR context from the local index.", "dim"),
             ]
-          : [
-              text("No prioritized PRs.", "muted"),
-              text("Background sync will repopulate the queue when metadata changes.", "dim"),
-            ],
+          : buildLandingCard("inbox", status),
       };
     }
     if (mode === "watchlist") {
@@ -235,7 +306,7 @@ export function buildResultsPaneModel(input: {
         selectedIndex,
         lines: /^Loading\b/.test(message)
           ? [text("Loading watchlist...", "muted"), text("Restoring local triage state.", "dim")]
-          : [text("Watchlist is empty.", "muted"), text("Press w on a PR to pin it here.", "dim")],
+          : buildLandingCard("watchlist", status),
       };
     }
     if (mode === "status") {
@@ -252,11 +323,11 @@ export function buildResultsPaneModel(input: {
       summary,
       rows,
       selectedIndex,
-      lines: [text("No rows.", "muted"), text("Press / to search this desk.", "dim")],
+      lines: buildLandingCard(mode, status),
     };
   }
 
-  const lines = [formatTableHeader(mode)];
+  const lines = [isClusterWorkspace ? formatClusterWorkspaceHeader() : formatTableHeader(mode)];
   lines.push(
     ...rows.map((row, index) => {
       const line = formatResultRow(row, mode);

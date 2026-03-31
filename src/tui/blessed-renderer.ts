@@ -47,9 +47,7 @@ export class BlessedTuiRenderer {
   private detailBox: Box;
   private readonly messageBox: Box;
   private readonly inputBox: Box;
-  private readonly modalBox: Box;
-  private spinnerIndex = 0;
-  private spinnerInterval: NodeJS.Timeout | null = null;
+  private readonly helpBox: Box;
   private lastDetailIdentity: string | null = null;
   private lastDetailAnchorKey: string | null = null;
   private detailVisible = false;
@@ -115,22 +113,23 @@ export class BlessedTuiRenderer {
       style: { bg: TUI_THEME.colors.commandBg, fg: TUI_THEME.colors.commandText },
       padding: { left: 1, right: 1 },
     });
-    this.modalBox = blessed.box({
+    this.helpBox = blessed.box({
       parent: this.screen,
-      width: 40,
-      height: 3,
+      width: "70%",
+      height: "70%",
       top: "center",
       left: "center",
       border: "line",
       hidden: true,
       tags: true,
-      align: "center",
-      valign: "middle",
+      scrollable: true,
+      alwaysScroll: true,
       style: {
         bg: TUI_THEME.colors.modalBg,
-        border: { fg: TUI_THEME.colors.warn },
+        border: { fg: TUI_THEME.colors.focus },
         fg: TUI_THEME.colors.text,
       },
+      padding: { left: 1, right: 1 },
     });
     this.bindKeys();
   }
@@ -171,9 +170,9 @@ export class BlessedTuiRenderer {
         program?: { clearScreen?: () => void };
       }
     ).program?.clearScreen?.();
-    const layoutChanged = this.transitionLayout(model.layoutMode);
+    const layoutChanged = this.transitionLayout(model);
     this.headerBox.setContent(formatHeader(model.header));
-    this.tabsBox.setLabel(panelLabel("MODES", model.focus === "nav"));
+    this.tabsBox.setLabel(panelLabel("MODES"));
     this.tabsBox.setContent(formatModeTabs(model.mode, model.focus));
     this.resultsBox.setLabel(
       panelLabel(
@@ -203,10 +202,25 @@ export class BlessedTuiRenderer {
     const listSummary = model.resultsPane.summary
       ? `${keyLabel("HITS")} ${formatListSummary(model.resultsPane.summary)}`
       : "";
+    const bannerTone =
+      model.footer.banner?.tone === "error"
+        ? "error"
+        : model.footer.banner?.tone === "warn"
+          ? "warn"
+          : model.footer.banner?.tone === "success"
+            ? "ok"
+            : "muted";
+    const bannerLine = model.footer.banner
+      ? `${keyLabel("BANNER")} ${valueTone(model.footer.banner.message, bannerTone)}${
+          model.footer.banner.actions.length > 0
+            ? `  ${text(model.footer.banner.actions.join("  "), "dim")}`
+            : ""
+        }`
+      : `${keyLabel("STATUS")} ${statusTone}${listSummary ? `  ${listSummary}` : ""}`;
     this.messageBox.setContent(
-      `${keyLabel("STATUS")} ${statusTone}${listSummary ? `  ${listSummary}` : ""}\n${keyLabel("ACTIONS")} ${formatActionBar(
-        model.footer.actions,
-      )}  ${keyLabel("KEYS")} ${model.footer.hintText}${model.footer.autoUpdateHint ? `  ${keyLabel("AUTO")} ${text(model.footer.autoUpdateHint, "dim")}` : ""}`,
+      `${bannerLine}\n${keyLabel("ACTIONS")} ${formatActionBar(model.footer.actions)}  ${keyLabel("KEYS")} ${formatActionBar(
+        model.footer.keys,
+      )}${model.footer.autoUpdateHint ? `  ${keyLabel("AUTO")} ${text(model.footer.autoUpdateHint, "dim")}` : ""}`,
     );
     const promptPrefix = `${keyLabel("QUERY")} ${text(model.footer.queryPrompt.toUpperCase(), "dim")} >`;
     const queryValue =
@@ -214,15 +228,19 @@ export class BlessedTuiRenderer {
         ? text(model.footer.queryValue)
         : model.focus === "query"
           ? ""
-          : text("[press / to type]", "dim");
+          : text(model.footer.queryPlaceholder, "dim");
     const cursor = model.focus === "query" ? "█" : "";
-    this.inputBox.setContent(`${promptPrefix} ${queryValue}${cursor}`);
+    this.inputBox.setContent(
+      `${promptPrefix} ${queryValue}${cursor}${model.footer.queryHelpText ? `  ${text(model.footer.queryHelpText, "dim")}` : ""}`,
+    );
     this.updateFocusStyle(model);
     this.syncScroll(model);
-    if (model.busy && model.header.busyMessage) {
-      this.startSpinner(model.header.busyMessage);
+    if (model.helpOverlay.visible) {
+      this.helpBox.setLabel(panelLabel(model.helpOverlay.title, true));
+      this.helpBox.setContent(model.helpOverlay.lines.join("\n"));
+      this.helpBox.show();
     } else {
-      this.stopSpinner();
+      this.helpBox.hide();
     }
     this.screen.render();
     if (layoutChanged) {
@@ -282,16 +300,35 @@ export class BlessedTuiRenderer {
     });
   }
 
-  private transitionLayout(nextLayoutMode: TuiLayoutMode): boolean {
+  private transitionLayout(model: TuiRenderModel): boolean {
+    const nextLayoutMode = model.layoutMode;
     if (this.layoutMode === nextLayoutMode) {
+      if (nextLayoutMode === "split-pane") {
+        this.resultsBox.show();
+        this.resultsBox.width = model.resultsWidth;
+        this.detailBox.left = model.resultsWidth;
+        this.detailBox.width = model.detailWidth;
+      } else if (nextLayoutMode === "detail-fullscreen") {
+        this.resultsBox.hide();
+        this.detailBox.left = 0;
+        this.detailBox.width = "100%";
+        this.detailBox.show();
+      }
       return false;
     }
     if (nextLayoutMode === "split-pane") {
-      this.resultsBox.width = TUI_THEME.layout.resultsWidthWithDetail;
-      this.detailBox.left = TUI_THEME.layout.resultsWidthWithDetail;
-      this.detailBox.width = TUI_THEME.layout.detailWidth;
+      this.resultsBox.show();
+      this.resultsBox.width = model.resultsWidth;
+      this.detailBox.left = model.resultsWidth;
+      this.detailBox.width = model.detailWidth;
+      this.detailBox.show();
+    } else if (nextLayoutMode === "detail-fullscreen") {
+      this.resultsBox.hide();
+      this.detailBox.left = 0;
+      this.detailBox.width = "100%";
       this.detailBox.show();
     } else {
+      this.resultsBox.show();
       this.resultsBox.width = "100%";
       this.detailBox.setContent("");
       this.detailBox.hide();
@@ -301,8 +338,7 @@ export class BlessedTuiRenderer {
   }
 
   private updateFocusStyle(model: TuiRenderModel): void {
-    this.tabsBox.style.border.fg =
-      model.focus === "nav" ? TUI_THEME.colors.focus : TUI_THEME.colors.border;
+    this.tabsBox.style.border.fg = TUI_THEME.colors.border;
     this.resultsBox.style.border.fg =
       model.focus === "results" ? TUI_THEME.colors.focus : TUI_THEME.colors.border;
     this.detailBox.style.border.fg =
@@ -338,28 +374,6 @@ export class BlessedTuiRenderer {
     this.lastDetailAnchorKey = model.detailPane.anchorKey;
   }
 
-  private startSpinner(message: string): void {
-    this.modalBox.show();
-    if (!this.spinnerInterval) {
-      this.spinnerInterval = setInterval(() => {
-        const frames = ["|", "/", "-", "\\"];
-        this.spinnerIndex = (this.spinnerIndex + 1) % frames.length;
-        this.modalBox.setContent(
-          `${keyLabel(frames[this.spinnerIndex])} ${valueTone(message, "warn")}`,
-        );
-        this.screen.render();
-      }, 120);
-    }
-  }
-
-  private stopSpinner(): void {
-    this.modalBox.hide();
-    if (this.spinnerInterval) {
-      clearInterval(this.spinnerInterval);
-      this.spinnerInterval = null;
-    }
-  }
-
   private async handleKeypress(
     ch: string,
     key: blessed.Widgets.Events.IKeyEventArg,
@@ -388,6 +402,22 @@ export class BlessedTuiRenderer {
           return;
         case "detail-end":
           this.detailBox.setScrollPerc(100);
+          this.screen.render();
+          return;
+        case "help-scroll":
+          this.helpBox.scroll(action.delta);
+          this.screen.render();
+          return;
+        case "help-page":
+          this.helpBox.scroll((Number(this.helpBox.height) || 10) * action.delta);
+          this.screen.render();
+          return;
+        case "help-home":
+          this.helpBox.setScroll(0);
+          this.screen.render();
+          return;
+        case "help-end":
+          this.helpBox.setScrollPerc(100);
           this.screen.render();
           return;
         case "quit":
@@ -437,7 +467,6 @@ export class BlessedTuiRenderer {
       return;
     }
     this.destroyed = true;
-    this.stopSpinner();
     this.unsubscribe?.();
     this.unsubscribe = null;
     this.controller.dispose();

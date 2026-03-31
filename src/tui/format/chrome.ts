@@ -6,7 +6,7 @@ import type {
   TuiSyncJobSnapshot,
 } from "../types.js";
 import { TUI_MODE_ORDER } from "../types.js";
-import { badge, keyLabel, tabChip, text, valueTone } from "../theme.js";
+import { actionChip, badge, keyLabel, tabChip, text, valueTone } from "../theme.js";
 
 function formatTimestamp(value: string | null): string {
   if (!value) {
@@ -123,10 +123,8 @@ export function formatHeader(model: TuiHeaderModel, now = new Date()): string {
 
 export function formatActionBar(actions: TuiAction[]): string {
   return actions
-    .map(
-      (action) =>
-        `{${action.enabled ? "#2d3748" : "#48566a"}-bg}{${action.enabled ? "#edf2f7" : "#90a0b6"}-fg} ${action.slot} ${action.label} {/}`,
-    )
+    .filter((action) => action.enabled)
+    .map((action) => `${actionChip(action.shortcut, action.enabled)} ${action.label}`)
     .join(` ${text("·", "dim")} `);
 }
 
@@ -146,7 +144,7 @@ export function formatListSummary(summary: TuiListSummary | null): string {
 
 export function formatModeTabs(activeMode: string, focus: TuiFocus): string {
   return TUI_MODE_ORDER.map((mode) =>
-    tabChip(mode.label, mode.id === activeMode, focus === "nav" && mode.id === activeMode),
+    tabChip(mode.label, mode.id === activeMode, focus === "results" && mode.id === activeMode),
   ).join(` ${text(" ", "dim")}`);
 }
 

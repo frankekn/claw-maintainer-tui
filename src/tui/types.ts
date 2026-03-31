@@ -23,22 +23,86 @@ export type TuiMode =
   | "issue-search"
   | "status";
 
-export type TuiFocus = "nav" | "results" | "detail" | "query";
+export type SearchMode = "cross-search" | "pr-search" | "issue-search";
+export type PriorityMode = "inbox" | "watchlist";
+export type ListMode = SearchMode | PriorityMode;
+export type MetadataEntity = "prs" | "issues";
+
+export type TuiFocus = "results" | "detail" | "query";
 export type TuiDetailSection =
   | "summary"
   | "linked-issues"
   | "related-prs"
   | "cluster"
-  | "maintainer-state";
+  | "maintainer-state"
+  | "sparse-extras";
+export type TuiDetailFoldState = Partial<Record<TuiDetailSection, boolean>>;
 
-export const TUI_MODE_ORDER: Array<{ id: TuiMode; label: string; queryPrompt: string }> = [
-  { id: "inbox", label: "Inbox", queryPrompt: "Inbox is browse-only" },
-  { id: "watchlist", label: "Watchlist", queryPrompt: "Watchlist is browse-only" },
-  { id: "cross-search", label: "Explore", queryPrompt: "Search Explore" },
-  { id: "pr-search", label: "PRs", queryPrompt: "Search PRs" },
-  { id: "issue-search", label: "Issues", queryPrompt: "Search Issues" },
-  { id: "status", label: "Status", queryPrompt: "Status view" },
+export type TuiModeMeta = {
+  id: TuiMode;
+  label: string;
+  browsePrompt: string;
+  queryPrompt: string;
+  queryFilters: string[];
+  queryExamples: string[];
+};
+
+export const TUI_MODE_ORDER: TuiModeMeta[] = [
+  {
+    id: "inbox",
+    label: "Inbox",
+    browsePrompt: "Browse-only mode · use \u2190/\u2192 or 1-6 to switch desks · ? for help",
+    queryPrompt: "Inbox is browse-only",
+    queryFilters: [],
+    queryExamples: [],
+  },
+  {
+    id: "watchlist",
+    label: "Watchlist",
+    browsePrompt: "Browse-only mode · use \u2190/\u2192 or 1-6 to switch desks · ? for help",
+    queryPrompt: "Watchlist is browse-only",
+    queryFilters: [],
+    queryExamples: [],
+  },
+  {
+    id: "cross-search",
+    label: "Explore",
+    browsePrompt: "Search cached PRs and issues",
+    queryPrompt: "Explore query",
+    queryFilters: ["#123", "label:", "state:", "author:", "branch:"],
+    queryExamples: ['state:open label:"size: XS"', "author:frank marker spoofing"],
+  },
+  {
+    id: "pr-search",
+    label: "PRs",
+    browsePrompt: "Search cached PRs",
+    queryPrompt: "PR query",
+    queryFilters: ["#123", "label:", "state:", "author:", "branch:"],
+    queryExamples: ['state:open label:"size: XS"', "branch:feature/fix-cache"],
+  },
+  {
+    id: "issue-search",
+    label: "Issues",
+    browsePrompt: "Search cached issues",
+    queryPrompt: "Issue query",
+    queryFilters: ["#123", "label:", "state:", "author:"],
+    queryExamples: ["state:open label:bug", "author:frank updated"],
+  },
+  {
+    id: "status",
+    label: "Status",
+    browsePrompt: "Status view · use s/S to sync · ? for help",
+    queryPrompt: "Status view",
+    queryFilters: [],
+    queryExamples: [],
+  },
 ];
+
+export const DETAIL_WIDTH_PRESETS = [
+  { results: "64%", detail: "36%", label: "36%" },
+  { results: "58%", detail: "42%", label: "42%" },
+  { results: "52%", detail: "48%", label: "48%" },
+] as const;
 
 export type TuiActionId =
   | "query"
@@ -53,16 +117,39 @@ export type TuiActionId =
   | "open-url"
   | "back"
   | "mark-seen"
+  | "mark-page-seen"
   | "toggle-watch"
   | "toggle-ignore"
-  | "clear-state";
+  | "clear-state"
+  | "undo";
+
+export type TuiAttentionMutation = {
+  prNumbers: number[];
+  previousStates: Array<AttentionState | null>;
+  nextState: AttentionState | null;
+  message: string;
+};
 
 export type TuiAction = {
   id: TuiActionId;
-  slot: number;
   label: string;
   shortcut: string;
   enabled: boolean;
+};
+
+export type TuiBannerTone = "info" | "success" | "warn" | "error";
+
+export type TuiBanner = {
+  tone: TuiBannerTone;
+  message: string;
+  actions: string[];
+  dismissible: boolean;
+};
+
+export type TuiQueryState = {
+  value: string;
+  history: string[];
+  historyIndex: number | null;
 };
 
 export type TuiListSummary = {
@@ -99,6 +186,21 @@ export type TuiClusterVerificationSummary = {
   state: TuiVerificationState;
 };
 
+export type TuiClusterWorkspaceDetail = {
+  seedLabel: string;
+  clusterBasis: string;
+  clusterIssues: number[];
+  verificationSummary: string | null;
+  mergeSummary: string | null;
+};
+
+export type TuiClusterWorkspaceState = {
+  seedPrNumber: number;
+  analysis: ClusterPullRequestAnalysis;
+  verification: TuiClusterVerificationSummary;
+  showExcluded: boolean;
+};
+
 export type TuiResultRow =
   | { kind: "pr"; pr: SearchResult; freshness: TuiFreshness; priority: PriorityCandidate | null }
   | {
@@ -111,11 +213,13 @@ export type TuiResultRow =
       kind: "cluster-candidate";
       candidate: ClusterCandidate;
       verification: TuiVerificationState;
+      detail: TuiClusterWorkspaceDetail;
     }
   | {
       kind: "cluster-excluded";
       candidate: ClusterExcludedCandidate;
       verification: TuiVerificationState;
+      detail: TuiClusterWorkspaceDetail;
     }
   | { kind: "status"; label: string; value: string };
 
@@ -127,6 +231,11 @@ export type TuiContext =
 export type TuiDetailPayload =
   | { kind: "landing"; mode: TuiMode; status: StatusSnapshot | null }
   | { kind: "pr"; bundle: PrContextBundle }
+  | {
+      kind: "cluster";
+      analysis: TuiClusterWorkspaceDetail;
+      candidate: ClusterCandidate | ClusterExcludedCandidate;
+    }
   | { kind: "issue"; issue: IssueSearchResult }
   | { kind: "status"; status: StatusSnapshot | null };
 
@@ -137,6 +246,7 @@ export type TuiDetailState = {
   identity: string | null;
   focusSection: TuiDetailSection | null;
   anchorKey: string | null;
+  foldedSections: TuiDetailFoldState;
 };
 
 export type TuiSessionState = {
@@ -146,19 +256,22 @@ export type TuiSessionState = {
   selectedIndex: number;
   activeUrl: string | null;
   query: string;
+  queryState: Record<SearchMode, TuiQueryState>;
   context: TuiContext;
   resultTitle: string;
   message: string;
   errorMessage: string | null;
   browseLimit: number;
   isLandingView: boolean;
+  banner: TuiBanner | null;
+  bannerHidden: boolean;
+  helpVisible: boolean;
+  detailLayoutMode: Exclude<TuiLayoutMode, "single-pane">;
+  detailWidthIndex: number;
+  clusterWorkspace: TuiClusterWorkspaceState | null;
+  lastAttentionMutation: TuiAttentionMutation | null;
   history: TuiViewSnapshot[];
 };
-
-export type SearchMode = "cross-search" | "pr-search" | "issue-search";
-export type PriorityMode = "inbox" | "watchlist";
-export type ListMode = SearchMode | PriorityMode;
-export type MetadataEntity = "prs" | "issues";
 
 export type ListLoadResult = {
   mode: ListMode;
@@ -182,21 +295,30 @@ export type TuiCommand =
   | { type: "focus_next" }
   | { type: "focus_results" }
   | { type: "activate_mode"; delta: number }
+  | { type: "activate_mode_index"; index: number }
   | { type: "move_selection"; delta: number }
   | { type: "toggle_detail" }
+  | { type: "toggle_detail_layout" }
+  | { type: "resize_detail"; delta: -1 | 1 }
+  | { type: "toggle_detail_section_fold" }
   | { type: "expand_cluster" }
   | { type: "jump_detail_section"; section: Extract<TuiDetailSection, "linked-issues" | "cluster"> }
+  | { type: "toggle_help" }
+  | { type: "dismiss_banner" }
   | { type: "start_query" }
   | { type: "stop_query" }
   | { type: "append_query"; value: string }
   | { type: "backspace_query" }
+  | { type: "query_history_prev" }
+  | { type: "query_history_next" }
   | { type: "submit_query" }
-  | { type: "trigger_action"; slot: number }
   | { type: "go_back" }
   | { type: "mark_seen" }
+  | { type: "mark_visible_seen" }
   | { type: "toggle_watch" }
   | { type: "toggle_ignore" }
   | { type: "clear_attention_state" }
+  | { type: "undo_attention_state" }
   | { type: "sync_prs" }
   | { type: "sync_issues" }
   | { type: "refresh_selected" }
@@ -219,13 +341,17 @@ export type TuiHeaderModel = {
 export type TuiFooterModel = {
   hintText: string;
   message: string;
+  banner: TuiBanner | null;
   queryPrompt: string;
   queryValue: string;
+  queryPlaceholder: string;
+  queryHelpText: string;
   actions: TuiAction[];
+  keys: TuiAction[];
   autoUpdateHint: string | null;
 };
 
-export type TuiLayoutMode = "single-pane" | "split-pane";
+export type TuiLayoutMode = "single-pane" | "split-pane" | "detail-fullscreen";
 
 export type TuiResultsPaneModel = {
   title: string;
@@ -245,18 +371,26 @@ export type TuiDetailPaneModel = {
   anchorKey: string | null;
 };
 
+export type TuiHelpOverlayModel = {
+  visible: boolean;
+  title: string;
+  lines: string[];
+};
+
 export type TuiRenderModel = {
   header: TuiHeaderModel;
   footer: TuiFooterModel;
+  helpOverlay: TuiHelpOverlayModel;
   mode: TuiMode;
   focus: TuiFocus;
   layoutMode: TuiLayoutMode;
+  resultsWidth: string;
+  detailWidth: string;
   resultsPane: TuiResultsPaneModel;
   detailPane: TuiDetailPaneModel;
   activeUrl: string | null;
   query: string;
   context: TuiContext;
-  queryPlaceholder: string;
   busy: boolean;
 };
 

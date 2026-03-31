@@ -153,9 +153,63 @@ function makeBundle(): PrContextBundle {
       },
       clusterBasis: "linked_issue",
       clusterIssueNumbers: [41789],
-      bestBase: null,
+      bestBase: {
+        prNumber: 42212,
+        title: "fix: prune image-containing tool results",
+        url: "https://github.com/openclaw/openclaw/pull/42212",
+        state: "open",
+        updatedAt: "2026-03-12T00:00:00.000Z",
+        headSha: "head-42212",
+        matchedBy: "linked_issue",
+        linkedIssues: [41789],
+        prodFiles: ["a.ts"],
+        testFiles: ["a.test.ts"],
+        otherFiles: [],
+        relevantProdFiles: ["a.ts"],
+        relevantTestFiles: ["a.test.ts"],
+        noiseFilesCount: 0,
+        status: "best_base",
+        reasonCodes: ["broader_relevant_prod_coverage"],
+        reason: "broader relevant production coverage",
+        featureVector: {
+          matchedBy: "linked_issue",
+          linkedIssueOverlap: 1,
+          linkedIssueCount: 1,
+          totalProdFileCount: 1,
+          totalTestFileCount: 1,
+          totalOtherFileCount: 0,
+          relevantProdFileCount: 1,
+          relevantTestFileCount: 1,
+          noiseFilesCount: 0,
+          semanticScore: 0.91,
+        },
+      },
       sameClusterCandidates: [],
-      nearbyButExcluded: [],
+      nearbyButExcluded: [
+        {
+          prNumber: 43001,
+          title: "older attempt",
+          url: "https://github.com/openclaw/openclaw/pull/43001",
+          state: "open",
+          updatedAt: "2026-03-12T00:00:00.000Z",
+          matchedBy: "local_semantic",
+          linkedIssues: [41789],
+          excludedReasonCode: "semantic_weak_match",
+          reason: "lower signal candidate",
+          featureVector: {
+            matchedBy: "local_semantic",
+            linkedIssueOverlap: 0,
+            linkedIssueCount: 1,
+            totalProdFileCount: 1,
+            totalTestFileCount: 0,
+            totalOtherFileCount: 0,
+            relevantProdFileCount: 1,
+            relevantTestFileCount: 0,
+            noiseFilesCount: 0,
+            semanticScore: 0.41,
+          },
+        },
+      ],
       mergeReadiness: null,
       decisionTrace: [],
     },
@@ -226,7 +280,22 @@ describe("tui formatting", () => {
     expect(detail.lines.join("\n")).toContain("WHY PRIORITIZED");
     expect(detail.lines.join("\n")).toContain("LINKED ISSUES");
     expect(detail.lines.join("\n")).toContain("MAINTAINER STATE");
+    expect(detail.lines.join("\n")).toContain("SPARSE EXTRAS");
+    expect(detail.lines.join("\n")).toContain("best base");
+    expect(detail.lines.join("\n")).toContain("rows{/} 2");
+    expect(detail.lines.join("\n")).toContain("excluded");
+    expect(detail.lines.join("\n")).toContain("[e to show]");
+    expect(detail.lines.join("\n")).not.toContain("[E planned]");
     expect(detail.anchorLine).not.toBeNull();
+
+    const collapsed = formatPriorityPrDetail(makeBundle(), "sparse-extras", {
+      "sparse-extras": true,
+      "linked-issues": true,
+    });
+    expect(collapsed.lines.join("\n")).toContain("SPARSE EXTRAS");
+    expect(collapsed.lines.join("\n")).toContain("[collapsed]");
+    expect(collapsed.lines.join("\n")).not.toContain("recent_comments");
+    expect(collapsed.lines.join("\n")).not.toContain("Issue 41789");
   });
 
   it("formats Inbox landing copy and mode tabs", () => {
@@ -237,7 +306,7 @@ describe("tui formatting", () => {
     expect(detail.join("\n")).toContain("Press e to expand");
     expect(detail.join("\n")).toContain("v / w / i / u");
 
-    const tabs = formatModeTabs("inbox", "nav");
+    const tabs = formatModeTabs("inbox", "results");
     expect(tabs).toContain("Inbox");
     expect(tabs).toContain("Watchlist");
     expect(tabs).toContain("Explore");

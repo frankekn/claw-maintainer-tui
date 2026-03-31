@@ -8,7 +8,13 @@ import type {
   StatusSnapshot,
 } from "../../types.js";
 import { section as sectionLabel, text, valueTone } from "../theme.js";
-import type { TuiDetailPaneModel, TuiDetailPayload, TuiDetailSection, TuiMode } from "../types.js";
+import type {
+  TuiDetailFoldState,
+  TuiDetailPaneModel,
+  TuiDetailPayload,
+  TuiDetailSection,
+  TuiMode,
+} from "../types.js";
 import { formatFreshnessLabel, formatRelativeAge, formatStatusTimestampLabel } from "./chrome.js";
 
 function cleanText(value: string): string {
@@ -71,18 +77,45 @@ function formatReasonLines(reasons: PriorityCandidate["reasons"]): string[] {
   return reasons.map((reason) => `- ${reason.label} ${text(`(+${reason.points})`, "muted")}`);
 }
 
+function formatCoverageSummary(candidate: ClusterCandidate): string {
+  return `prod ${candidate.relevantProdFiles.length}/${candidate.prodFiles.length}  test ${candidate.relevantTestFiles.length}/${candidate.testFiles.length}  noise ${candidate.noiseFilesCount}`;
+}
+
+function formatClusterCandidateLine(
+  candidate: ClusterCandidate,
+  marker: string,
+  label: string,
+): string {
+  const reasonSummary =
+    candidate.reasonCodes.length > 0
+      ? candidate.reasonCodes.slice(0, 2).join(", ")
+      : (candidate.reason ?? "cached");
+  return `${marker} #${candidate.prNumber} ${candidate.title}  ${text(label, "muted")}  ${text(
+    formatCoverageSummary(candidate),
+    "dim",
+  )}  ${text(reasonSummary, "muted")}`;
+}
+
 function appendSection(
   lines: string[],
   anchors: Partial<Record<TuiDetailSection, number>>,
+  foldedSections: TuiDetailFoldState,
   section: TuiDetailSection,
   title: string,
   body: string[],
+  options: { foldable?: boolean } = {},
 ): void {
   if (lines.length > 0) {
     lines.push("");
   }
   anchors[section] = lines.length;
-  lines.push(sectionLabel(title));
+  const collapsed = options.foldable && foldedSections[section] === true;
+  lines.push(
+    collapsed ? `${sectionLabel(title)} ${text("[collapsed]", "muted")}` : sectionLabel(title),
+  );
+  if (collapsed) {
+    return;
+  }
   lines.push(...body);
 }
 
@@ -114,10 +147,11 @@ export function formatPrDetail(
 export function formatPriorityPrDetail(
   bundle: PrContextBundle,
   focusSection: TuiDetailSection | null = null,
+  foldedSections: TuiDetailFoldState = {},
 ): { lines: string[]; anchorLine: number | null } {
   const lines = formatPrioritySummary(bundle.candidate);
   const anchors: Partial<Record<TuiDetailSection, number>> = {};
-  appendSection(lines, anchors, "summary", "Summary", [
+  appendSection(lines, anchors, foldedSections, "summary", "Summary", [
     truncate(bundle.candidate.pr.matchedExcerpt, 520),
   ]);
   if (lines.length > 0) {
@@ -125,59 +159,114 @@ export function formatPriorityPrDetail(
   }
   lines.push(sectionLabel("Why Prioritized"));
   lines.push(...formatReasonLines(bundle.candidate.reasons));
-  appendSection(lines, anchors, "linked-issues", "Linked Issues", [
-    `${text("count", "muted")} ${bundle.linkedIssues.length}`,
-    ...(bundle.linkedIssues.length > 0
-      ? bundle.linkedIssues.map((issue) => `- #${issue.issueNumber} ${issue.title}`)
-      : ["(none)"]),
-  ]);
-  appendSection(lines, anchors, "related-prs", "Related PRs", [
-    `${text("count", "muted")} ${bundle.relatedPullRequests.length}`,
-    ...(bundle.relatedPullRequests.length > 0
-      ? bundle.relatedPullRequests.map((pr) => `- #${pr.prNumber} ${pr.title}`)
-      : ["(none)"]),
-  ]);
+  appendSection(
+    lines,
+    anchors,
+    foldedSections,
+    "linked-issues",
+    "Linked Issues",
+    [
+      `${text("count", "muted")} ${bundle.linkedIssues.length}`,
+      ...(bundle.linkedIssues.length > 0
+        ? bundle.linkedIssues.map((issue) => `- #${issue.issueNumber} ${issue.title}`)
+        : ["(none)"]),
+    ],
+    { foldable: true },
+  );
+  appendSection(
+    lines,
+    anchors,
+    foldedSections,
+    "related-prs",
+    "Related PRs",
+    [
+      `${text("count", "muted")} ${bundle.relatedPullRequests.length}`,
+      ...(bundle.relatedPullRequests.length > 0
+        ? bundle.relatedPullRequests.map((pr) => `- #${pr.prNumber} ${pr.title}`)
+        : ["(none)"]),
+    ],
+    { foldable: true },
+  );
+  const bestBase = bundle.cluster?.bestBase ?? null;
+  const sameClusterCandidates = bundle.cluster?.sameClusterCandidates ?? [];
+  const nearbyButExcluded = bundle.cluster?.nearbyButExcluded ?? [];
   const clusterCandidates =
-    (bundle.cluster?.sameClusterCandidates.length ?? 0) +
-    (bundle.cluster?.nearbyButExcluded.length ?? 0);
-  appendSection(lines, anchors, "cluster", "Cluster", [
-    bundle.cluster
-      ? `${text("basis", "muted")} ${bundle.cluster.clusterBasis}`
-      : `${text("basis", "muted")} (none)`,
-    bundle.cluster && bundle.cluster.clusterIssueNumbers.length > 0
-      ? `${text("issues", "muted")} ${bundle.cluster.clusterIssueNumbers.map((issue) => `#${issue}`).join(", ")}`
-      : `${text("issues", "muted")} (none)`,
-    `${text("rows", "muted")} ${clusterCandidates}`,
-    ...(bundle.cluster?.sameClusterCandidates.length
-      ? bundle.cluster.sameClusterCandidates.map(
-          (candidate) => `- #${candidate.prNumber} ${candidate.title}`,
-        )
-      : ["(none)"]),
-  ]);
-  appendSection(lines, anchors, "maintainer-state", "Maintainer State", [
-    `${text("attention", "muted")} ${bundle.candidate.attentionState}`,
-    `${text("watchlist", "muted")} ${bundle.candidate.attentionState === "watch" ? "yes" : "no"}`,
-    `${text("ignore", "muted")} ${bundle.candidate.attentionState === "ignore" ? "yes" : "no"}`,
-  ]);
+    (bestBase ? 1 : 0) + sameClusterCandidates.length + nearbyButExcluded.length;
+  appendSection(
+    lines,
+    anchors,
+    foldedSections,
+    "cluster",
+    "Cluster",
+    [
+      bundle.cluster
+        ? `${text("basis", "muted")} ${bundle.cluster.clusterBasis}`
+        : `${text("basis", "muted")} (none)`,
+      bundle.cluster && bundle.cluster.clusterIssueNumbers.length > 0
+        ? `${text("issues", "muted")} ${bundle.cluster.clusterIssueNumbers.map((issue) => `#${issue}`).join(", ")}`
+        : `${text("issues", "muted")} (none)`,
+      `${text("rows", "muted")} ${clusterCandidates}`,
+      ...(bestBase ? [formatClusterCandidateLine(bestBase, "★", "best base")] : []),
+      ...(sameClusterCandidates.length > 0
+        ? sameClusterCandidates
+            .filter((candidate) => candidate.prNumber !== bestBase?.prNumber)
+            .map((candidate) =>
+              formatClusterCandidateLine(
+                candidate,
+                candidate.status === "superseded_candidate" ? "└" : "├",
+                candidate.status.replaceAll("_", " "),
+              ),
+            )
+        : bestBase
+          ? []
+          : ["(none)"]),
+      ...(nearbyButExcluded.length > 0
+        ? [
+            `${text("excluded", "muted")} +${nearbyButExcluded.length} candidate${
+              nearbyButExcluded.length === 1 ? "" : "s"
+            } hidden  ${text("[e to show]", "dim")}`,
+          ]
+        : []),
+    ],
+    { foldable: true },
+  );
+  appendSection(
+    lines,
+    anchors,
+    foldedSections,
+    "maintainer-state",
+    "Maintainer State",
+    [
+      `${text("attention", "muted")} ${bundle.candidate.attentionState}`,
+      `${text("watchlist", "muted")} ${bundle.candidate.attentionState === "watch" ? "yes" : "no"}`,
+      `${text("ignore", "muted")} ${bundle.candidate.attentionState === "ignore" ? "yes" : "no"}`,
+    ],
+    { foldable: true },
+  );
   if (bundle.comments.length > 0 || bundle.latestReviewFact || bundle.mergeReadiness) {
-    lines.push("", sectionLabel("Sparse Extras"));
+    const sparseExtras: string[] = [];
     if (bundle.comments.length > 0) {
-      lines.push(`${text("recent_comments", "muted")} ${bundle.comments.length}`);
+      sparseExtras.push(`${text("recent_comments", "muted")} ${bundle.comments.length}`);
       for (const comment of bundle.comments) {
-        lines.push(`- [${comment.kind}] ${comment.author}: ${truncate(comment.excerpt, 120)}`);
+        sparseExtras.push(
+          `- [${comment.kind}] ${comment.author}: ${truncate(comment.excerpt, 120)}`,
+        );
       }
     }
     if (bundle.latestReviewFact) {
-      lines.push(
+      sparseExtras.push(
         `${text("latest_review_fact", "muted")} ${bundle.latestReviewFact.decision} · ${bundle.latestReviewFact.summary}`,
       );
     }
     if (bundle.mergeReadiness) {
-      lines.push(
+      sparseExtras.push(
         `${text("merge_readiness", "muted")} ${bundle.mergeReadiness.state} via ${bundle.mergeReadiness.source}`,
       );
-      lines.push(`  ${truncate(bundle.mergeReadiness.summary, 160)}`);
+      sparseExtras.push(`  ${truncate(bundle.mergeReadiness.summary, 160)}`);
     }
+    appendSection(lines, anchors, foldedSections, "sparse-extras", "Sparse Extras", sparseExtras, {
+      foldable: true,
+    });
   }
   return { lines, anchorLine: focusSection ? (anchors[focusSection] ?? 0) : null };
 }
@@ -378,11 +467,12 @@ export function buildDetailPaneModel(input: {
   identity: string | null;
   anchorKey: string | null;
   focusSection: TuiDetailSection | null;
+  foldedSections: TuiDetailFoldState;
 }): TuiDetailPaneModel {
-  const { payload, visible, status, identity, anchorKey, focusSection } = input;
+  const { payload, visible, status, identity, anchorKey, focusSection, foldedSections } = input;
   switch (payload.kind) {
     case "pr": {
-      const formatted = formatPriorityPrDetail(payload.bundle, focusSection);
+      const formatted = formatPriorityPrDetail(payload.bundle, focusSection, foldedSections);
       return {
         visible,
         title: `PR #${payload.bundle.candidate.pr.prNumber}`,
@@ -399,6 +489,16 @@ export function buildDetailPaneModel(input: {
         title: `Issue #${payload.issue.issueNumber}`,
         status,
         lines: formatIssueDetail(payload.issue),
+        identity,
+        anchorLine: null,
+        anchorKey,
+      };
+    case "cluster":
+      return {
+        visible,
+        title: `Cluster · #${payload.candidate.prNumber}`,
+        status,
+        lines: formatClusterDetail(payload.analysis, payload.candidate),
         identity,
         anchorLine: null,
         anchorKey,

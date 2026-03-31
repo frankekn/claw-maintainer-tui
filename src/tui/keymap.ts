@@ -7,21 +7,67 @@ export type TuiKeyAction =
   | { kind: "detail-page"; delta: number }
   | { kind: "detail-home" }
   | { kind: "detail-end" }
+  | { kind: "help-scroll"; delta: number }
+  | { kind: "help-page"; delta: number }
+  | { kind: "help-home" }
+  | { kind: "help-end" }
   | { kind: "quit" }
   | { kind: "open-url" }
   | { kind: "noop" };
+
+function isSlashKey(ch: string, key: blessed.Widgets.Events.IKeyEventArg): boolean {
+  return ch === "/" || key.full === "/" || key.name === "slash";
+}
 
 export function resolveKeyAction(
   model: TuiRenderModel,
   ch: string,
   key: blessed.Widgets.Events.IKeyEventArg,
 ): TuiKeyAction {
+  if (model.helpOverlay.visible) {
+    if (key.name === "q") {
+      return { kind: "quit" };
+    }
+    if (key.name === "escape" || key.name === "f1" || key.name === "question mark" || ch === "?") {
+      return { kind: "command", command: { type: "toggle_help" } };
+    }
+    if (key.name === "up" || key.name === "k") {
+      return { kind: "help-scroll", delta: -1 };
+    }
+    if (key.name === "down" || key.name === "j") {
+      return { kind: "help-scroll", delta: 1 };
+    }
+    if (key.name === "pageup") {
+      return { kind: "help-page", delta: -1 };
+    }
+    if (key.name === "pagedown" || key.name === "space") {
+      return { kind: "help-page", delta: 1 };
+    }
+    if (key.name === "home") {
+      return { kind: "help-home" };
+    }
+    if (key.name === "end") {
+      return { kind: "help-end" };
+    }
+    return { kind: "noop" };
+  }
+
+  if (key.name === "f1") {
+    return { kind: "command", command: { type: "toggle_help" } };
+  }
+
   if (model.focus === "query") {
     if (key.name === "escape") {
       return { kind: "command", command: { type: "stop_query" } };
     }
     if (key.name === "tab") {
       return { kind: "command", command: { type: "focus_next" } };
+    }
+    if (key.name === "up") {
+      return { kind: "command", command: { type: "query_history_prev" } };
+    }
+    if (key.name === "down") {
+      return { kind: "command", command: { type: "query_history_next" } };
     }
     if (key.name === "enter" || key.name === "return") {
       return { kind: "command", command: { type: "submit_query" } };
@@ -35,12 +81,22 @@ export function resolveKeyAction(
     return { kind: "noop" };
   }
 
+  if (key.name === "question mark" || ch === "?") {
+    return { kind: "command", command: { type: "toggle_help" } };
+  }
+  if (key.name === "escape" && model.footer.banner?.dismissible) {
+    return { kind: "command", command: { type: "dismiss_banner" } };
+  }
+
   if (model.focus === "detail") {
     if (key.name === "escape") {
       return { kind: "command", command: { type: "focus_results" } };
     }
     if (key.name === "tab") {
       return { kind: "command", command: { type: "focus_next" } };
+    }
+    if (key.name === "space") {
+      return { kind: "command", command: { type: "toggle_detail_section_fold" } };
     }
     if (key.name === "up" || key.name === "k") {
       return { kind: "detail-scroll", delta: -1 };
@@ -62,8 +118,8 @@ export function resolveKeyAction(
     }
   }
 
-  if (ch && /^[1-9]$/.test(ch)) {
-    return { kind: "command", command: { type: "trigger_action", slot: Number(ch) } };
+  if (ch && /^[1-6]$/.test(ch)) {
+    return { kind: "command", command: { type: "activate_mode_index", index: Number(ch) - 1 } };
   }
   if (key.name === "q") {
     return { kind: "quit" };
@@ -86,8 +142,17 @@ export function resolveKeyAction(
   if (key.name === "enter" || key.name === "return") {
     return { kind: "command", command: { type: "toggle_detail" } };
   }
+  if (key.name === "z") {
+    return { kind: "command", command: { type: "toggle_detail_layout" } };
+  }
+  if (ch === "[" || key.name === "[") {
+    return { kind: "command", command: { type: "resize_detail", delta: -1 } };
+  }
+  if (ch === "]" || key.name === "]") {
+    return { kind: "command", command: { type: "resize_detail", delta: 1 } };
+  }
   if (
-    (ch === "/" || key.full === "/" || key.name === "slash") &&
+    isSlashKey(ch, key) &&
     (model.mode === "cross-search" || model.mode === "pr-search" || model.mode === "issue-search")
   ) {
     return { kind: "command", command: { type: "start_query" } };
@@ -105,6 +170,9 @@ export function resolveKeyAction(
     return { kind: "command", command: { type: "expand_cluster" } };
   }
   if (key.name === "v") {
+    if (key.shift) {
+      return { kind: "command", command: { type: "mark_visible_seen" } };
+    }
     return { kind: "command", command: { type: "mark_seen" } };
   }
   if (key.name === "w") {
@@ -114,6 +182,9 @@ export function resolveKeyAction(
     return { kind: "command", command: { type: "toggle_ignore" } };
   }
   if (key.name === "u") {
+    if (key.shift) {
+      return { kind: "command", command: { type: "undo_attention_state" } };
+    }
     return { kind: "command", command: { type: "clear_attention_state" } };
   }
   if (key.name === "s" && key.shift) {

@@ -43,6 +43,14 @@ export class TuiEffects {
     return this.service.getPrContextBundle(prNumber);
   }
 
+  clusterPr(prNumber: number, limit: number) {
+    return this.service.clusterPr(prNumber, limit);
+  }
+
+  verifyClusterPr(prNumber: number, limit: number) {
+    return this.service.verifyClusterPr(prNumber, limit);
+  }
+
   showIssue(issueNumber: number): Promise<IssueSearchResult | null> {
     return this.service.showIssue(issueNumber);
   }

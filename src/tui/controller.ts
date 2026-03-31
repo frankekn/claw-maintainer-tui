@@ -20,11 +20,12 @@ import type {
 import { buildRenderModel } from "./presenter.js";
 import {
   availableFocuses,
+  cloneQueryState,
   createInitialSessionState,
   createLandingDetailState,
   createViewSnapshot,
 } from "./state.js";
-import { TUI_MODE_ORDER } from "./types.js";
+import { DETAIL_WIDTH_PRESETS, TUI_MODE_ORDER } from "./types.js";
 import type {
   AttentionState,
   IssueSearchResult,
@@ -36,8 +37,12 @@ import type {
 import type {
   TuiAction,
   TuiActionId,
+  TuiBanner,
+  TuiClusterWorkspaceDetail,
+  TuiClusterWorkspaceState,
   TuiCommand,
   TuiContext,
+  TuiDetailFoldState,
   TuiDetailState,
   TuiDetailSection,
   TuiFocus,
@@ -48,6 +53,7 @@ import type {
   TuiSessionState,
   TuiSyncJobSnapshot,
   TuiSyncMode,
+  TuiAttentionMutation,
 } from "./types.js";
 
 type ControllerOptions = {
@@ -78,6 +84,7 @@ export class TuiController {
   private listRequestId = 0;
   private detailAutoRefreshInFlight = false;
   private readonly detailFreshness = new Map<string, TuiFreshness>();
+  private clusterWorkspaceRequestId = 0;
   private rateLimitSnapshot: Awaited<ReturnType<TuiEffects["rateLimit"]>> = null;
   private readonly syncJobs: Record<MetadataEntity, TuiSyncJobSnapshot> = {
     prs: {
@@ -101,6 +108,7 @@ export class TuiController {
   };
   private activeMetadataJob: MetadataEntity | null = null;
   private readonly manualPriority = new Set<MetadataEntity>();
+  private pendingListReplay = false;
   private idleRefreshTimer: NodeJS.Timeout | null = null;
   private replayTimer: NodeJS.Timeout | null = null;
   private lastInteractionAt = Date.now();
@@ -191,6 +199,62 @@ export class TuiController {
 
   private set query(value: string) {
     this.sessionState.query = value;
+  }
+
+  private get banner(): TuiBanner | null {
+    return this.sessionState.banner;
+  }
+
+  private set banner(value: TuiBanner | null) {
+    this.sessionState.banner = value;
+  }
+
+  private get bannerHidden(): boolean {
+    return this.sessionState.bannerHidden;
+  }
+
+  private set bannerHidden(value: boolean) {
+    this.sessionState.bannerHidden = value;
+  }
+
+  private get helpVisible(): boolean {
+    return this.sessionState.helpVisible;
+  }
+
+  private set helpVisible(value: boolean) {
+    this.sessionState.helpVisible = value;
+  }
+
+  private get detailLayoutMode(): Exclude<TuiRenderModel["layoutMode"], "single-pane"> {
+    return this.sessionState.detailLayoutMode;
+  }
+
+  private set detailLayoutMode(value: Exclude<TuiRenderModel["layoutMode"], "single-pane">) {
+    this.sessionState.detailLayoutMode = value;
+  }
+
+  private get detailWidthIndex(): number {
+    return this.sessionState.detailWidthIndex;
+  }
+
+  private set detailWidthIndex(value: number) {
+    this.sessionState.detailWidthIndex = value;
+  }
+
+  private get clusterWorkspace(): TuiClusterWorkspaceState | null {
+    return this.sessionState.clusterWorkspace;
+  }
+
+  private set clusterWorkspace(value: TuiClusterWorkspaceState | null) {
+    this.sessionState.clusterWorkspace = value;
+  }
+
+  private get lastAttentionMutation(): TuiAttentionMutation | null {
+    return this.sessionState.lastAttentionMutation;
+  }
+
+  private set lastAttentionMutation(value: TuiAttentionMutation | null) {
+    this.sessionState.lastAttentionMutation = value;
   }
 
   private get context(): TuiContext {
@@ -285,13 +349,35 @@ export class TuiController {
     this.detailState.focusSection = value;
   }
 
+  private get detailFoldedSections(): TuiDetailFoldState {
+    return this.detailState.foldedSections;
+  }
+
+  private set detailFoldedSections(value: TuiDetailFoldState) {
+    this.detailState.foldedSections = value;
+  }
+
   private resetDetailState(mode = this.mode): void {
     this.detailRequestId += 1;
+    this.clusterWorkspaceRequestId += 1;
     this.detailState = createLandingDetailState(mode, this.statusSnapshot);
   }
 
   private setDetailPayload(next: TuiDetailState): void {
-    this.detailState = next;
+    const foldedSections =
+      next.payload.kind === "pr"
+        ? next.identity === this.detailState.identity
+          ? {
+              ...defaultFoldedSections(next.payload),
+              ...this.detailState.foldedSections,
+              ...next.foldedSections,
+            }
+          : {
+              ...defaultFoldedSections(next.payload),
+              ...next.foldedSections,
+            }
+        : next.foldedSections;
+    this.detailState = { ...next, foldedSections };
   }
 
   async initialize(): Promise<void> {
@@ -308,6 +394,7 @@ export class TuiController {
     this.disposed = true;
     this.detailRequestId += 1;
     this.listRequestId += 1;
+    this.clusterWorkspaceRequestId += 1;
     this.detailAutoRefreshInFlight = false;
     if (this.idleRefreshTimer) {
       clearInterval(this.idleRefreshTimer);
@@ -322,6 +409,13 @@ export class TuiController {
   reportError(message: string, context = "Operation"): void {
     this.errorMessage = message;
     this.message = `${context} failed.`;
+    this.banner = {
+      tone: "error",
+      message: `${context} failed: ${message}`,
+      actions: ["Esc dismiss"],
+      dismissible: true,
+    };
+    this.bannerHidden = false;
     this.emit();
   }
 
@@ -344,11 +438,23 @@ export class TuiController {
       case "activate_mode":
         this.moveMode(command.delta);
         return;
+      case "activate_mode_index":
+        this.activateModeByIndex(command.index);
+        return;
       case "move_selection":
         this.moveSelection(command.delta);
         return;
       case "toggle_detail":
         await this.openSelected();
+        return;
+      case "toggle_detail_layout":
+        this.toggleDetailLayout();
+        return;
+      case "resize_detail":
+        this.resizeDetail(command.delta);
+        return;
+      case "toggle_detail_section_fold":
+        this.toggleCurrentDetailSectionFold();
         return;
       case "expand_cluster":
         await this.expandSelectedCluster();
@@ -359,6 +465,12 @@ export class TuiController {
           return;
         }
         await this.clusterSelected();
+        return;
+      case "toggle_help":
+        this.toggleHelp();
+        return;
+      case "dismiss_banner":
+        this.dismissBanner();
         return;
       case "start_query":
         this.startQueryEntry();
@@ -372,17 +484,23 @@ export class TuiController {
       case "backspace_query":
         this.backspaceQuery();
         return;
+      case "query_history_prev":
+        this.moveQueryHistory(-1);
+        return;
+      case "query_history_next":
+        this.moveQueryHistory(1);
+        return;
       case "submit_query":
         await this.submitCurrentQuery();
-        return;
-      case "trigger_action":
-        await this.triggerAction(command.slot);
         return;
       case "go_back":
         this.goBack();
         return;
       case "mark_seen":
         await this.markSeenSelected();
+        return;
+      case "mark_visible_seen":
+        await this.markVisiblePageSeen();
         return;
       case "toggle_watch":
         await this.toggleWatchSelected();
@@ -392,6 +510,9 @@ export class TuiController {
         return;
       case "clear_attention_state":
         await this.clearSelectedAttentionState();
+        return;
+      case "undo_attention_state":
+        await this.undoAttentionState();
         return;
       case "sync_prs":
         await this.syncPrs();
@@ -415,7 +536,7 @@ export class TuiController {
   }
 
   isNavFocus(): boolean {
-    return this.focus === "nav";
+    return false;
   }
 
   isDetailFocus(): boolean {
@@ -430,7 +551,8 @@ export class TuiController {
   }
 
   focusResults(): void {
-    this.focus = "results";
+    this.focus =
+      this.showDetail && this.detailLayoutMode === "detail-fullscreen" ? "detail" : "results";
     this.emit();
   }
 
@@ -442,6 +564,7 @@ export class TuiController {
     }
     this.pushHistory();
     this.mode = mode;
+    this.pendingListReplay = false;
     this.focus = "results";
     this.rows = [];
     this.selectedIndex = 0;
@@ -449,9 +572,15 @@ export class TuiController {
     this.detailAutoRefreshInFlight = false;
     this.context = null;
     this.activeUrl = null;
-    this.query = "";
+    this.query = this.queryForMode(mode);
     this.browseLimit = this.resultLimit;
     this.errorMessage = null;
+    this.banner = null;
+    this.bannerHidden = false;
+    this.helpVisible = false;
+    this.detailLayoutMode = "split-pane";
+    this.detailWidthIndex = 0;
+    this.clusterWorkspace = null;
     this.isLandingView = false;
     this.resultTitle = this.modeLabel(mode);
     this.message = this.isListMode(mode)
@@ -460,7 +589,11 @@ export class TuiController {
     this.emit();
 
     if (this.isListMode(mode)) {
-      void this.loadLandingRows(mode);
+      if (this.isQueryMode(mode) && this.query) {
+        void this.submitQuery(this.query);
+      } else {
+        void this.loadLandingRows(mode);
+      }
       this.scheduleAutoSync(mode);
       return;
     }
@@ -472,10 +605,19 @@ export class TuiController {
     }
   }
 
+  activateModeByIndex(index: number): void {
+    const target = TUI_MODE_ORDER[index];
+    if (!target) {
+      return;
+    }
+    this.activateMode(target.id);
+  }
+
   startQueryEntry(): void {
     if (!this.isQueryMode(this.mode)) {
       return;
     }
+    this.helpVisible = false;
     this.focus = "query";
     this.emit();
   }
@@ -488,7 +630,11 @@ export class TuiController {
     if (this.focus !== "query") {
       return;
     }
-    this.focus = "results";
+    if (this.isQueryMode(this.mode)) {
+      this.syncQueryState(this.mode, this.query);
+    }
+    this.focus =
+      this.showDetail && this.detailLayoutMode === "detail-fullscreen" ? "detail" : "results";
     this.emit();
   }
 
@@ -497,6 +643,9 @@ export class TuiController {
       return;
     }
     this.query += value;
+    if (this.isQueryMode(this.mode)) {
+      this.syncQueryState(this.mode, this.query);
+    }
     this.emit();
   }
 
@@ -505,6 +654,40 @@ export class TuiController {
       return;
     }
     this.query = this.query.slice(0, -1);
+    if (this.isQueryMode(this.mode)) {
+      this.syncQueryState(this.mode, this.query);
+    }
+    this.emit();
+  }
+
+  moveQueryHistory(delta: -1 | 1): void {
+    if (this.focus !== "query" || !this.isQueryMode(this.mode)) {
+      return;
+    }
+    const state = this.sessionState.queryState[this.mode];
+    if (state.history.length === 0) {
+      return;
+    }
+    if (state.historyIndex === null && delta === 1) {
+      return;
+    }
+    const nextIndex =
+      delta === -1
+        ? (state.historyIndex ?? -1) + 1
+        : state.historyIndex === null
+          ? null
+          : state.historyIndex - 1;
+    if (nextIndex === null || nextIndex < 0) {
+      state.historyIndex = null;
+      this.query = state.value;
+      this.emit();
+      return;
+    }
+    if (nextIndex >= state.history.length) {
+      return;
+    }
+    state.historyIndex = nextIndex;
+    this.query = state.history[nextIndex] ?? "";
     this.emit();
   }
 
@@ -519,10 +702,6 @@ export class TuiController {
   }
 
   moveSelection(delta: number): void {
-    if (this.focus === "nav") {
-      this.moveMode(delta);
-      return;
-    }
     if (this.focus !== "results" || this.rows.length === 0) {
       return;
     }
@@ -540,13 +719,49 @@ export class TuiController {
     this.activateMode(TUI_MODE_ORDER[nextIndex]!.id);
   }
 
+  toggleHelp(): void {
+    this.helpVisible = !this.helpVisible;
+    this.emit();
+  }
+
+  dismissBanner(): void {
+    this.bannerHidden = true;
+    this.helpVisible = false;
+    this.emit();
+  }
+
+  private queryForMode(mode: TuiMode): string {
+    return this.isQueryMode(mode) ? this.sessionState.queryState[mode].value : "";
+  }
+
+  private syncQueryState(mode: SearchMode, value: string): void {
+    const state = this.sessionState.queryState[mode];
+    state.value = value;
+    if (state.historyIndex !== null && state.historyIndex >= state.history.length) {
+      state.historyIndex = state.history.length;
+    }
+  }
+
+  private pushQueryHistory(mode: SearchMode, value: string): void {
+    if (!value) {
+      this.sessionState.queryState[mode].historyIndex = null;
+      return;
+    }
+    const state = this.sessionState.queryState[mode];
+    state.history = [value, ...state.history.filter((item) => item !== value)].slice(0, 12);
+    state.historyIndex = null;
+  }
+
   async submitQuery(value: string): Promise<void> {
     if (!this.isQueryMode(this.mode)) {
       return;
     }
     const mode = this.mode;
     this.query = value.trim();
+    this.syncQueryState(mode, this.query);
     this.errorMessage = null;
+    this.banner = null;
+    this.bannerHidden = false;
     this.isLandingView = false;
     this.resetDetailState(this.mode);
     this.activeUrl = null;
@@ -560,6 +775,7 @@ export class TuiController {
       if (requestId !== this.listRequestId || this.mode !== mode) {
         return;
       }
+      this.pushQueryHistory(mode, this.query);
       this.applyListResult(result);
       this.context = null;
       this.emit();
@@ -581,61 +797,10 @@ export class TuiController {
     }
     this.showDetail = true;
     this.isLandingView = false;
+    if (this.detailLayoutMode === "detail-fullscreen") {
+      this.focus = "detail";
+    }
     await this.refreshDetailForSelection(true, row.kind === "priority-cluster" ? "cluster" : null);
-  }
-
-  async triggerAction(slot: number): Promise<void> {
-    const action = this.buildActions().find((item) => item.slot === slot && item.enabled);
-    if (!action) {
-      return;
-    }
-    switch (action.id) {
-      case "query":
-        this.startQueryEntry();
-        return;
-      case "detail":
-        await this.openSelected();
-        return;
-      case "expand-cluster":
-        await this.expandSelectedCluster();
-        return;
-      case "jump-linked-issues":
-        await this.crossReferenceSelected();
-        return;
-      case "cluster":
-        await this.clusterSelected();
-        return;
-      case "mark-seen":
-        await this.markSeenSelected();
-        return;
-      case "toggle-watch":
-        await this.toggleWatchSelected();
-        return;
-      case "toggle-ignore":
-        await this.toggleIgnoreSelected();
-        return;
-      case "clear-state":
-        await this.clearSelectedAttentionState();
-        return;
-      case "sync-prs":
-        await this.syncPrs();
-        return;
-      case "sync-issues":
-        await this.syncIssues();
-        return;
-      case "refresh":
-        await this.refreshSelected();
-        return;
-      case "load-more":
-        await this.loadMore();
-        return;
-      case "back":
-        this.goBack();
-        return;
-      case "open-url":
-      default:
-        return;
-    }
   }
 
   async crossReferenceSelected(): Promise<void> {
@@ -656,23 +821,59 @@ export class TuiController {
 
   async expandSelectedCluster(): Promise<void> {
     const row = this.rows[this.selectedIndex];
-    if (!row || row.kind !== "priority-cluster") {
+    if (this.clusterWorkspace) {
+      if (!row || row.kind === "cluster-candidate" || row.kind === "cluster-excluded") {
+        await this.toggleClusterExcludedRows();
+        return;
+      }
+    }
+    if (!row) {
       return;
     }
-    this.pushHistory();
-    this.rows = row.cluster.openMembers.map((member) => this.toPrRow(member.pr, member));
-    this.selectedIndex = 0;
-    this.resultTitle = `Cluster · ${row.cluster.statusLabel}`;
-    this.message = `Expanded ${row.cluster.openMembers.length} open PR(s) from ${row.cluster.statusLabel}.`;
-    this.activeUrl = this.rowUrl(this.rows[0]);
-    this.isLandingView = false;
-    this.resetDetailState(this.mode);
-    this.focus = "results";
-    this.emit();
+    if (row.kind === "cluster-candidate" || row.kind === "cluster-excluded") {
+      await this.toggleClusterExcludedRows();
+      return;
+    }
+    if (!isPriorityDetailRow(row)) {
+      return;
+    }
+    await this.openClusterWorkspace(
+      row.kind === "priority-cluster" ? row.cluster.representative.pr.prNumber : row.pr.prNumber,
+    );
   }
 
   async markSeenSelected(): Promise<void> {
     await this.updateAttentionState("seen", "Marked PR as seen.");
+  }
+
+  async markVisiblePageSeen(): Promise<void> {
+    const targets = this.visiblePriorityPrNumbers();
+    if (targets.length === 0) {
+      return;
+    }
+    const previousStates = await Promise.all(
+      targets.map((prNumber) =>
+        this.currentAttentionState(prNumber, this.priorityStateFromRows(prNumber)),
+      ),
+    );
+    await Promise.all(
+      targets.map((prNumber) => this.effects.setPrAttentionState(prNumber, "seen")),
+    );
+    this.lastAttentionMutation = {
+      prNumbers: targets,
+      previousStates: previousStates.map((state) => (state === "new" ? null : state)),
+      nextState: "seen",
+      message: `Marked ${targets.length} PR${targets.length === 1 ? "" : "s"} on this page as seen.`,
+    };
+    this.message = this.lastAttentionMutation.message;
+    this.banner = {
+      tone: "success",
+      message: this.lastAttentionMutation.message,
+      actions: ["U undo", "Esc dismiss"],
+      dismissible: true,
+    };
+    this.bannerHidden = false;
+    await this.refreshActiveListPreservingUi();
   }
 
   async toggleWatchSelected(): Promise<void> {
@@ -709,6 +910,28 @@ export class TuiController {
     await this.updateAttentionState(null, "Cleared local triage state.");
   }
 
+  async undoAttentionState(): Promise<void> {
+    if (!this.lastAttentionMutation) {
+      return;
+    }
+    const mutation = this.lastAttentionMutation;
+    await Promise.all(
+      mutation.prNumbers.map((prNumber, index) =>
+        this.effects.setPrAttentionState(prNumber, mutation.previousStates[index] ?? null),
+      ),
+    );
+    this.lastAttentionMutation = null;
+    this.message = `Undid triage change for ${mutation.prNumbers.length} PR${mutation.prNumbers.length === 1 ? "" : "s"}.`;
+    this.banner = {
+      tone: "info",
+      message: this.message,
+      actions: ["Esc dismiss"],
+      dismissible: true,
+    };
+    this.bannerHidden = false;
+    await this.refreshActiveListPreservingUi();
+  }
+
   async syncPrs(): Promise<void> {
     this.queueMetadataSync("prs", "manual");
     this.emit();
@@ -726,8 +949,10 @@ export class TuiController {
       this.emit();
       return;
     }
+    this.clusterWorkspaceRequestId += 1;
     this.mode = snapshot.session.mode;
     this.query = snapshot.session.query;
+    this.sessionState.queryState = cloneQueryState(snapshot.session.queryState);
     this.rows = snapshot.session.rows;
     this.selectedIndex = snapshot.session.selectedIndex;
     this.activeUrl = snapshot.session.activeUrl;
@@ -735,19 +960,220 @@ export class TuiController {
     this.context = snapshot.session.context;
     this.isLandingView = snapshot.session.isLandingView;
     this.browseLimit = snapshot.session.browseLimit;
-    this.setDetailPayload(snapshot.detail);
+    this.banner = snapshot.session.banner;
+    this.bannerHidden = snapshot.session.bannerHidden;
+    this.helpVisible = snapshot.session.helpVisible;
+    this.detailLayoutMode = snapshot.session.detailLayoutMode;
+    this.detailWidthIndex = snapshot.session.detailWidthIndex;
+    this.clusterWorkspace = snapshot.session.clusterWorkspace;
+    this.lastAttentionMutation = snapshot.session.lastAttentionMutation;
+    this.detailState = snapshot.detail;
     this.errorMessage = null;
-    this.focus = "results";
+    this.focus =
+      snapshot.detail.visible && snapshot.session.detailLayoutMode === "detail-fullscreen"
+        ? "detail"
+        : "results";
     this.message = "Returned to previous view.";
     this.emit();
+    this.flushPendingListReplayIfNeeded();
   }
 
   getActiveUrl(): string | null {
     return this.activeUrl ?? this.rowUrl(this.rows[this.selectedIndex]);
   }
 
+  toggleDetailLayout(): void {
+    if (!this.showDetail) {
+      return;
+    }
+    this.detailLayoutMode =
+      this.detailLayoutMode === "detail-fullscreen" ? "split-pane" : "detail-fullscreen";
+    if (this.detailLayoutMode === "detail-fullscreen") {
+      this.focus = "detail";
+    }
+    this.emit();
+  }
+
+  resizeDetail(delta: -1 | 1): void {
+    if (!this.showDetail || this.detailLayoutMode !== "split-pane") {
+      return;
+    }
+    const nextIndex = Math.max(
+      0,
+      Math.min(DETAIL_WIDTH_PRESETS.length - 1, this.detailWidthIndex + delta),
+    );
+    if (nextIndex === this.detailWidthIndex) {
+      return;
+    }
+    this.detailWidthIndex = nextIndex;
+    this.message = `Detail width ${DETAIL_WIDTH_PRESETS[nextIndex]?.label ?? ""}.`;
+    this.emit();
+  }
+
+  toggleCurrentDetailSectionFold(): void {
+    if (!this.showDetail) {
+      return;
+    }
+    const section = currentFoldableSection(this.detailState);
+    if (!section) {
+      return;
+    }
+    const nextFolded = !this.detailFoldedSections[section];
+    this.detailFoldedSections = {
+      ...this.detailFoldedSections,
+      [section]: nextFolded,
+    };
+    this.detailFocusSection = section;
+    this.detailAnchorKey = `${this.detailIdentity ?? "detail"}:${section}:${++this.detailAnchorNonce}`;
+    this.message = `${detailSectionLabel(section)} ${nextFolded ? "collapsed" : "expanded"}.`;
+    this.emit();
+  }
+
+  private async openClusterWorkspace(
+    prNumber: number,
+    options: {
+      pushHistory?: boolean;
+      showExcluded?: boolean;
+      restoreSelectionIdentity?: string | null;
+    } = {},
+  ): Promise<void> {
+    const mode = this.mode;
+    const selectionIdentity = this.selectedRowIdentity();
+    const pushHistory = options.pushHistory ?? true;
+    const showExcluded = options.showExcluded ?? false;
+    const requestId = ++this.clusterWorkspaceRequestId;
+    await this.runBusy(`Opening cluster workspace for PR #${prNumber}`, async () => {
+      const { analysis, summary } = await this.effects.verifyClusterPr(prNumber, this.resultLimit);
+      if (
+        requestId !== this.clusterWorkspaceRequestId ||
+        this.mode !== mode ||
+        this.selectedRowIdentity() !== selectionIdentity
+      ) {
+        return;
+      }
+      if (!analysis) {
+        this.message = `No cluster workspace found for PR #${prNumber}.`;
+        return;
+      }
+      let effectiveShowExcluded = showExcluded;
+      let rows = this.buildClusterWorkspaceRows(analysis, summary, effectiveShowExcluded);
+      if (rows.length === 0 && !effectiveShowExcluded && analysis.nearbyButExcluded.length > 0) {
+        effectiveShowExcluded = true;
+        rows = this.buildClusterWorkspaceRows(analysis, summary, effectiveShowExcluded);
+      }
+      if (rows.length === 0) {
+        this.message = `No alternate cluster candidates found for PR #${prNumber}.`;
+        return;
+      }
+      if (pushHistory) {
+        this.pushHistory();
+      }
+      this.clusterWorkspace = {
+        seedPrNumber: prNumber,
+        analysis,
+        verification: summary,
+        showExcluded: effectiveShowExcluded,
+      };
+      this.rows = rows;
+      if (options.restoreSelectionIdentity) {
+        this.restoreSelection(options.restoreSelectionIdentity);
+      } else {
+        this.selectedIndex = 0;
+      }
+      this.resultTitle = `Cluster · #${prNumber}`;
+      this.message = clusterWorkspaceMessage(analysis, summary, effectiveShowExcluded);
+      this.activeUrl = this.rowUrl(this.rows[this.selectedIndex]);
+      this.isLandingView = false;
+      this.showDetail = true;
+      this.focus = this.detailLayoutMode === "detail-fullscreen" ? "detail" : "results";
+      await this.refreshDetailForSelection(true);
+    });
+  }
+
+  private async toggleClusterExcludedRows(): Promise<void> {
+    if (!this.clusterWorkspace) {
+      return;
+    }
+    const selectionIdentity = this.selectedRowIdentity();
+    const showExcluded = !this.clusterWorkspace.showExcluded;
+    this.clusterWorkspace = {
+      ...this.clusterWorkspace,
+      showExcluded,
+    };
+    this.rows = this.buildClusterWorkspaceRows(
+      this.clusterWorkspace.analysis,
+      this.clusterWorkspace.verification,
+      showExcluded,
+    );
+    this.restoreSelection(selectionIdentity);
+    this.message = showExcluded
+      ? `Showing ${this.clusterWorkspace.analysis.nearbyButExcluded.length} excluded cluster candidate${this.clusterWorkspace.analysis.nearbyButExcluded.length === 1 ? "" : "s"}.`
+      : "Hid excluded cluster candidates.";
+    this.activeUrl = this.rowUrl(this.rows[this.selectedIndex]);
+    if (this.showDetail && this.rows[this.selectedIndex]) {
+      await this.refreshDetailForSelection(true);
+      return;
+    }
+    if (this.rows.length === 0) {
+      this.resetDetailState();
+      this.context = null;
+      this.focus = "results";
+    }
+    this.emit();
+  }
+
+  private buildClusterWorkspaceRows(
+    analysis: Awaited<ReturnType<TuiEffects["verifyClusterPr"]>>["analysis"],
+    summary: Awaited<ReturnType<TuiEffects["verifyClusterPr"]>>["summary"],
+    showExcluded: boolean,
+  ): Array<Extract<TuiResultRow, { kind: "cluster-candidate" | "cluster-excluded" }>> {
+    if (!analysis) {
+      return [];
+    }
+    const detail = buildClusterWorkspaceDetail(analysis, summary);
+    const rows: Array<Extract<TuiResultRow, { kind: "cluster-candidate" | "cluster-excluded" }>> =
+      [];
+    if (analysis.bestBase) {
+      rows.push({
+        kind: "cluster-candidate",
+        candidate: analysis.bestBase,
+        verification: summary.state,
+        detail,
+      });
+    }
+    for (const candidate of analysis.sameClusterCandidates) {
+      if (candidate.prNumber === analysis.bestBase?.prNumber) {
+        continue;
+      }
+      rows.push({
+        kind: "cluster-candidate",
+        candidate,
+        verification: summary.state,
+        detail,
+      });
+    }
+    if (showExcluded) {
+      for (const candidate of analysis.nearbyButExcluded) {
+        rows.push({
+          kind: "cluster-excluded",
+          candidate,
+          verification: summary.state,
+          detail,
+        });
+      }
+    }
+    return rows;
+  }
+
   async refreshSelected(): Promise<void> {
     const row = this.rows[this.selectedIndex];
+    if (!row && this.clusterWorkspace) {
+      await this.openClusterWorkspace(this.clusterWorkspace.seedPrNumber, {
+        pushHistory: false,
+        showExcluded: this.clusterWorkspace.showExcluded,
+      });
+      return;
+    }
     if (!row) {
       return;
     }
@@ -757,6 +1183,17 @@ export class TuiController {
     }
     if (row.kind === "pr") {
       await this.refreshDetailForPr(row.pr.prNumber, true);
+      return;
+    }
+    if (row.kind === "cluster-candidate" || row.kind === "cluster-excluded") {
+      await this.openClusterWorkspace(
+        this.clusterWorkspace?.seedPrNumber ?? row.candidate.prNumber,
+        {
+          pushHistory: false,
+          showExcluded: this.clusterWorkspace?.showExcluded ?? row.kind === "cluster-excluded",
+          restoreSelectionIdentity: this.selectedRowIdentity(),
+        },
+      );
       return;
     }
     if (row.kind === "issue") {
@@ -784,18 +1221,47 @@ export class TuiController {
     if (!row) {
       return;
     }
+    let mutation: TuiAttentionMutation | null = null;
     if (row.kind === "pr") {
+      const previous = await this.currentAttentionState(
+        row.pr.prNumber,
+        row.priority?.attentionState,
+      );
       await this.effects.setPrAttentionState(row.pr.prNumber, state);
+      mutation = {
+        prNumbers: [row.pr.prNumber],
+        previousStates: [previous === "new" ? null : previous],
+        nextState: state,
+        message,
+      };
     } else if (row.kind === "priority-cluster") {
+      const prNumbers = row.cluster.openMembers.map((member) => member.pr.prNumber);
+      const previousStates = row.cluster.openMembers.map((member) =>
+        member.attentionState === "new" ? null : member.attentionState,
+      );
       await Promise.all(
         row.cluster.openMembers.map((member) =>
           this.effects.setPrAttentionState(member.pr.prNumber, state),
         ),
       );
+      mutation = {
+        prNumbers,
+        previousStates,
+        nextState: state,
+        message,
+      };
     } else {
       return;
     }
+    this.lastAttentionMutation = mutation;
     this.message = message;
+    this.banner = {
+      tone: "success",
+      message,
+      actions: ["U undo", "Esc dismiss"],
+      dismissible: true,
+    };
+    this.bannerHidden = false;
     await this.refreshActiveListPreservingUi();
   }
 
@@ -827,92 +1293,174 @@ export class TuiController {
     return bundle?.candidate.attentionState ?? "new";
   }
 
+  private priorityStateFromRows(prNumber: number): PriorityAttentionState | null {
+    for (const row of this.rows) {
+      if (row.kind === "pr" && row.pr.prNumber === prNumber) {
+        return row.priority?.attentionState ?? null;
+      }
+      if (row.kind === "priority-cluster") {
+        const member = row.cluster.openMembers.find(
+          (candidate) => candidate.pr.prNumber === prNumber,
+        );
+        if (member) {
+          return member.attentionState;
+        }
+      }
+    }
+    return null;
+  }
+
+  private visiblePriorityPrNumbers(): number[] {
+    return Array.from(
+      new Set(
+        this.rows.flatMap((row) => {
+          if (row.kind === "pr") {
+            return [row.pr.prNumber];
+          }
+          if (row.kind === "priority-cluster") {
+            return row.cluster.openMembers.map((member) => member.pr.prNumber);
+          }
+          return [];
+        }),
+      ),
+    );
+  }
+
   private buildActions(): TuiAction[] {
     const row = this.rows[this.selectedIndex];
     const hasRow = Boolean(row);
     const hasHistory = this.history.length > 0;
+    const clusterWorkspace = this.clusterWorkspace;
+    const inClusterWorkspace = clusterWorkspace !== null;
     const canLinked = row?.kind === "pr";
     const canCluster = isPriorityDetailRow(row);
-    const canExpand = row?.kind === "priority-cluster";
+    const canOpenClusterWorkspace = isPriorityDetailRow(row);
+    const canToggleExcluded =
+      inClusterWorkspace && clusterWorkspace.analysis.nearbyButExcluded.length > 0;
     const canTriage = isPriorityDetailRow(row);
     const canRefresh =
-      row?.kind === "pr" || row?.kind === "issue" || row?.kind === "priority-cluster";
+      inClusterWorkspace ||
+      row?.kind === "pr" ||
+      row?.kind === "issue" ||
+      row?.kind === "priority-cluster" ||
+      row?.kind === "cluster-candidate" ||
+      row?.kind === "cluster-excluded";
     const hasLocalState =
       row?.kind === "pr"
         ? (row.priority?.attentionState ?? "new") !== "new"
         : row?.kind === "priority-cluster"
           ? this.clusterAttentionState(row) !== "new"
           : false;
+    const canOpenUrl = Boolean(this.getActiveUrl());
+    const canUndoAttention = this.lastAttentionMutation !== null;
+    const canPageSeen = this.visiblePriorityPrNumbers().length > 0;
+    const isClusterWorkspaceRow =
+      row?.kind === "cluster-candidate" || row?.kind === "cluster-excluded";
+    const useClusterWorkspaceActions = inClusterWorkspace && (isClusterWorkspaceRow || !hasRow);
 
     switch (this.mode) {
       case "inbox":
       case "watchlist":
+        if (useClusterWorkspaceActions) {
+          return [
+            this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
+            this.action("expand-cluster", "Excluded", "e", canToggleExcluded),
+            this.action("refresh", "Refresh", "r", canRefresh),
+            this.action("back", "Back", "b", hasHistory),
+            this.action("open-url", "Open URL", "o", canOpenUrl),
+          ];
+        }
         return [
-          this.action(1, "detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
+          this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
           this.action(
-            2,
-            row?.kind === "priority-cluster" ? "expand-cluster" : "jump-linked-issues",
-            row?.kind === "priority-cluster" ? "Expand" : "Linked",
-            row?.kind === "priority-cluster" ? "e" : "x",
-            row?.kind === "priority-cluster" ? canExpand : canLinked,
+            "jump-linked-issues",
+            "Linked",
+            "x",
+            canLinked || row?.kind === "priority-cluster",
           ),
-          this.action(3, "cluster", "Cluster", "c", canCluster),
-          this.action(4, "mark-seen", "Seen", "v", canTriage),
-          this.action(5, "toggle-watch", "Watch", "w", canTriage),
-          this.action(6, "toggle-ignore", "Ignore", "i", canTriage),
-          this.action(7, "clear-state", "Clear", "u", hasLocalState),
-          this.action(8, "load-more", "More", "m", this.canLoadMore()),
+          this.action("cluster", "Cluster", "c", canCluster),
+          this.action("expand-cluster", "Workspace", "e", canOpenClusterWorkspace),
+          this.action("mark-seen", "Seen", "v", canTriage),
+          this.action("toggle-watch", "Watch", "w", canTriage),
+          this.action("toggle-ignore", "Ignore", "i", canTriage),
+          this.action("clear-state", "Clear", "u", hasLocalState),
+          this.action("mark-page-seen", "Seen Page", "V", canPageSeen),
+          this.action("undo", "Undo", "U", canUndoAttention),
+          this.action("back", "Back", "b", hasHistory),
+          this.action("load-more", "More", "m", this.canLoadMore()),
+          this.action("open-url", "Open URL", "o", canOpenUrl),
         ];
       case "cross-search":
+        if (useClusterWorkspaceActions) {
+          return [
+            this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
+            this.action("expand-cluster", "Excluded", "e", canToggleExcluded),
+            this.action("refresh", "Refresh", "r", canRefresh),
+            this.action("back", "Back", "b", hasHistory),
+            this.action("open-url", "Open URL", "o", canOpenUrl),
+          ];
+        }
         return [
-          this.action(1, "query", "Search", "/"),
-          this.action(2, "detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
-          this.action(3, "jump-linked-issues", "Linked", "x", canLinked),
-          this.action(4, "cluster", "Cluster", "c", canCluster),
-          this.action(5, "sync-prs", "Sync PRs", "s"),
-          this.action(6, "sync-issues", "Sync Issues", "S"),
-          this.action(7, "refresh", "Refresh", "r", canRefresh),
-          this.action(8, "load-more", "More", "m", this.canLoadMore()),
+          this.action("query", "Search", "/"),
+          this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
+          this.action("jump-linked-issues", "Linked", "x", canLinked),
+          this.action("cluster", "Cluster", "c", canCluster),
+          this.action("expand-cluster", "Workspace", "e", canOpenClusterWorkspace),
+          this.action("sync-prs", "Sync PRs", "s"),
+          this.action("sync-issues", "Sync Issues", "S"),
+          this.action("refresh", "Refresh", "r", canRefresh),
+          this.action("back", "Back", "b", hasHistory),
+          this.action("load-more", "More", "m", this.canLoadMore()),
+          this.action("open-url", "Open URL", "o", canOpenUrl),
         ];
       case "pr-search":
+        if (useClusterWorkspaceActions) {
+          return [
+            this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
+            this.action("expand-cluster", "Excluded", "e", canToggleExcluded),
+            this.action("refresh", "Refresh", "r", canRefresh),
+            this.action("back", "Back", "b", hasHistory),
+            this.action("open-url", "Open URL", "o", canOpenUrl),
+          ];
+        }
         return [
-          this.action(1, "query", "Search", "/"),
-          this.action(2, "detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
-          this.action(3, "jump-linked-issues", "Linked", "x", canLinked),
-          this.action(4, "cluster", "Cluster", "c", canCluster),
-          this.action(5, "mark-seen", "Seen", "v", canTriage),
-          this.action(6, "toggle-watch", "Watch", "w", canTriage),
-          this.action(7, "refresh", "Refresh", "r", canRefresh),
-          this.action(8, "load-more", "More", "m", this.canLoadMore()),
+          this.action("query", "Search", "/"),
+          this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
+          this.action("jump-linked-issues", "Linked", "x", canLinked),
+          this.action("cluster", "Cluster", "c", canCluster),
+          this.action("expand-cluster", "Workspace", "e", canOpenClusterWorkspace),
+          this.action("mark-seen", "Seen", "v", canTriage),
+          this.action("toggle-watch", "Watch", "w", canTriage),
+          this.action("mark-page-seen", "Seen Page", "V", canPageSeen),
+          this.action("undo", "Undo", "U", canUndoAttention),
+          this.action("refresh", "Refresh", "r", canRefresh),
+          this.action("back", "Back", "b", hasHistory),
+          this.action("load-more", "More", "m", this.canLoadMore()),
+          this.action("open-url", "Open URL", "o", canOpenUrl),
         ];
       case "issue-search":
         return [
-          this.action(1, "query", "Search", "/"),
-          this.action(2, "detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
-          this.action(3, "sync-issues", "Sync Issues", "S"),
-          this.action(4, "refresh", "Refresh", "r", canRefresh),
-          this.action(5, "back", "Back", "b", hasHistory),
-          this.action(6, "load-more", "More", "m", this.canLoadMore()),
+          this.action("query", "Search", "/"),
+          this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
+          this.action("sync-issues", "Sync Issues", "S"),
+          this.action("refresh", "Refresh", "r", canRefresh),
+          this.action("back", "Back", "b", hasHistory),
+          this.action("load-more", "More", "m", this.canLoadMore()),
+          this.action("open-url", "Open URL", "o", canOpenUrl),
         ];
       case "status":
         return [
-          this.action(1, "sync-prs", "Sync PRs", "s"),
-          this.action(2, "sync-issues", "Sync Issues", "S"),
-          this.action(3, "back", "Back", "b", hasHistory),
+          this.action("sync-prs", "Sync PRs", "s"),
+          this.action("sync-issues", "Sync Issues", "S"),
+          this.action("back", "Back", "b", hasHistory),
         ];
       default:
         return [];
     }
   }
 
-  private action(
-    slot: number,
-    id: TuiActionId,
-    label: string,
-    shortcut: string,
-    enabled = true,
-  ): TuiAction {
-    return { slot, id, label, shortcut, enabled };
+  private action(id: TuiActionId, label: string, shortcut: string, enabled = true): TuiAction {
+    return { id, label, shortcut, enabled };
   }
 
   private pushHistory(): void {
@@ -965,6 +1513,8 @@ export class TuiController {
     this.message = result.message;
     this.activeUrl = result.activeUrl;
     this.isLandingView = result.isLandingView;
+    this.clusterWorkspace = null;
+    this.pendingListReplay = false;
     this.resetDetailState(result.mode);
   }
 
@@ -1022,6 +1572,7 @@ export class TuiController {
           anchorKey: focusSection
             ? `pr:${bundle.candidate.pr.prNumber}:${focusSection}:${++this.detailAnchorNonce}`
             : null,
+          foldedSections: {},
         });
         this.context = { kind: "pr", prNumber: bundle.candidate.pr.prNumber };
         this.activeUrl = bundle.candidate.pr.url;
@@ -1044,6 +1595,7 @@ export class TuiController {
           status: `${row.cluster.statusLabel} · ${row.cluster.openPrCount} open / ${row.cluster.totalPrCount} total`,
           focusSection: targetSection,
           anchorKey: `${row.cluster.clusterKey}:${targetSection}:${++this.detailAnchorNonce}`,
+          foldedSections: {},
         });
         this.context = { kind: "pr", prNumber: bundle.candidate.pr.prNumber };
         this.activeUrl = row.cluster.representative.pr.url;
@@ -1063,9 +1615,30 @@ export class TuiController {
           status: `Freshness: ${this.rowFreshness(row).toUpperCase()}`,
           focusSection: null,
           anchorKey: null,
+          foldedSections: {},
         });
         this.context = { kind: "issue", issueNumber: issue.issueNumber };
         this.activeUrl = issue.url;
+        this.emit();
+        return;
+      }
+
+      if (row.kind === "cluster-candidate" || row.kind === "cluster-excluded") {
+        this.setDetailPayload({
+          visible: true,
+          payload: {
+            kind: "cluster",
+            analysis: row.detail,
+            candidate: row.candidate,
+          },
+          identity: `${row.kind}:${row.candidate.prNumber}`,
+          status: `Cluster ${row.verification.replaceAll("_", " ")}`,
+          focusSection: null,
+          anchorKey: null,
+          foldedSections: {},
+        });
+        this.context = { kind: "pr", prNumber: row.candidate.prNumber };
+        this.activeUrl = row.candidate.url;
         this.emit();
         return;
       }
@@ -1078,6 +1651,7 @@ export class TuiController {
           status: null,
           focusSection: null,
           anchorKey: null,
+          foldedSections: {},
         });
         this.activeUrl = null;
         this.emit();
@@ -1141,16 +1715,29 @@ export class TuiController {
       this.emit();
       return;
     }
+    const previousBanner = this.banner;
+    const previousBannerHidden = this.bannerHidden;
     this.busyMessage = label;
     this.errorMessage = null;
+    this.bannerHidden = false;
     this.emit();
     try {
       await task();
     } catch (error) {
       this.errorMessage = error instanceof Error ? error.message : String(error);
       this.message = "Operation failed.";
+      this.banner = {
+        tone: "error",
+        message: `${label} failed: ${this.errorMessage}`,
+        actions: ["Esc dismiss"],
+        dismissible: true,
+      };
+      this.bannerHidden = false;
     } finally {
       this.busyMessage = null;
+      if (!this.errorMessage && this.banner === previousBanner) {
+        this.bannerHidden = previousBannerHidden;
+      }
       this.emit();
     }
   }
@@ -1475,9 +2062,14 @@ export class TuiController {
     if (this.disposed) {
       return;
     }
+    if (this.clusterWorkspace) {
+      this.pendingListReplay = true;
+      return;
+    }
     if (!this.isListMode(this.mode)) {
       return;
     }
+    this.pendingListReplay = false;
     const selectionIdentity = this.selectedRowIdentity();
     const requestId = ++this.listRequestId;
     const result = await this.resolveRows(this.mode, this.isQueryMode(this.mode) ? this.query : "");
@@ -1499,6 +2091,15 @@ export class TuiController {
     this.emit();
   }
 
+  private flushPendingListReplayIfNeeded(): void {
+    if (!this.pendingListReplay || this.clusterWorkspace || !this.isListMode(this.mode)) {
+      return;
+    }
+    void this.refreshActiveListPreservingUi().catch((error) => {
+      this.reportError(error instanceof Error ? error.message : String(error), "Replay refresh");
+    });
+  }
+
   private modeLabel(mode: TuiMode): string {
     return TUI_MODE_ORDER.find((item) => item.id === mode)?.label ?? "Results";
   }
@@ -1511,4 +2112,94 @@ export class TuiController {
       listener();
     }
   }
+}
+
+function defaultFoldedSections(payload: TuiDetailState["payload"]): TuiDetailFoldState {
+  if (
+    payload.kind !== "pr" ||
+    (!payload.bundle.comments.length &&
+      !payload.bundle.latestReviewFact &&
+      !payload.bundle.mergeReadiness)
+  ) {
+    return {};
+  }
+  return { "sparse-extras": true };
+}
+
+function currentFoldableSection(detail: TuiDetailState): TuiDetailSection | null {
+  if (detail.payload.kind !== "pr") {
+    return null;
+  }
+  if (
+    detail.focusSection &&
+    ["linked-issues", "related-prs", "cluster", "maintainer-state", "sparse-extras"].includes(
+      detail.focusSection,
+    )
+  ) {
+    return detail.focusSection;
+  }
+  if (
+    detail.payload.bundle.comments.length > 0 ||
+    detail.payload.bundle.latestReviewFact ||
+    detail.payload.bundle.mergeReadiness
+  ) {
+    return "sparse-extras";
+  }
+  return null;
+}
+
+function detailSectionLabel(section: TuiDetailSection): string {
+  switch (section) {
+    case "linked-issues":
+      return "Linked Issues";
+    case "related-prs":
+      return "Related PRs";
+    case "cluster":
+      return "Cluster";
+    case "maintainer-state":
+      return "Maintainer State";
+    case "sparse-extras":
+      return "Sparse Extras";
+    case "summary":
+      return "Summary";
+    default:
+      return "Section";
+  }
+}
+
+function buildClusterWorkspaceDetail(
+  analysis: NonNullable<TuiClusterWorkspaceState["analysis"]>,
+  summary: TuiClusterWorkspaceState["verification"],
+): TuiClusterWorkspaceDetail {
+  return {
+    seedLabel: `#${analysis.seedPr.prNumber} ${analysis.seedPr.title}`,
+    clusterBasis: analysis.clusterBasis,
+    clusterIssues: analysis.clusterIssueNumbers,
+    verificationSummary: clusterVerificationSummary(summary),
+    mergeSummary: analysis.mergeReadiness
+      ? `${analysis.mergeReadiness.state} via ${analysis.mergeReadiness.source}`
+      : null,
+  };
+}
+
+function clusterVerificationSummary(
+  summary: TuiClusterWorkspaceState["verification"],
+): string | null {
+  return `${summary.state.replaceAll("_", " ")} · PR ${summary.verifiedPrCount} · Issue ${summary.verifiedIssueCount} · Missing ${summary.missingCount}`;
+}
+
+function clusterWorkspaceMessage(
+  analysis: NonNullable<TuiClusterWorkspaceState["analysis"]>,
+  summary: TuiClusterWorkspaceState["verification"],
+  showExcluded: boolean,
+): string {
+  const includedCount =
+    (analysis.bestBase ? 1 : 0) +
+    analysis.sameClusterCandidates.filter(
+      (candidate) => candidate.prNumber !== analysis.bestBase?.prNumber,
+    ).length;
+  const excludedLabel = showExcluded
+    ? `showing ${analysis.nearbyButExcluded.length} excluded`
+    : `${analysis.nearbyButExcluded.length} excluded hidden`;
+  return `Cluster workspace: ${includedCount} included · ${excludedLabel} · ${clusterVerificationSummary(summary)}`;
 }

@@ -20,14 +20,25 @@ const renderModel: TuiRenderModel = {
   footer: {
     hintText: "",
     message: "Ready.",
+    banner: null,
     queryPrompt: "Inbox",
     queryValue: "",
+    queryPlaceholder: "Browse-only mode",
+    queryHelpText: "Browse-only mode",
     actions: [],
+    keys: [],
     autoUpdateHint: null,
+  },
+  helpOverlay: {
+    visible: false,
+    title: "Inbox Help",
+    lines: [],
   },
   mode: "inbox",
   focus: "results",
   layoutMode: "single-pane",
+  resultsWidth: "100%",
+  detailWidth: "0%",
   resultsPane: {
     title: "Inbox",
     summary: null,
@@ -47,7 +58,6 @@ const renderModel: TuiRenderModel = {
   activeUrl: null,
   query: "",
   context: null,
-  queryPlaceholder: "",
   busy: false,
 };
 
@@ -142,6 +152,29 @@ describe("BlessedTuiRenderer", () => {
     expect(controller.dispatch).toHaveBeenNthCalledWith(4, { type: "clear_attention_state" });
   });
 
+  it("routes shifted triage shortcuts to page-seen and undo actions", async () => {
+    const controller = createControllerStub();
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness;
+    renderers.push(harness);
+
+    await harness.handleKeypress("V", {
+      name: "v",
+      shift: true,
+    } as blessed.Widgets.Events.IKeyEventArg);
+    await harness.handleKeypress("U", {
+      name: "u",
+      shift: true,
+    } as blessed.Widgets.Events.IKeyEventArg);
+
+    expect(controller.dispatch).toHaveBeenNthCalledWith(1, {
+      type: "mark_visible_seen",
+    });
+    expect(controller.dispatch).toHaveBeenNthCalledWith(2, {
+      type: "undo_attention_state",
+    });
+  });
+
   it("routes left and right arrows to mode changes from non-query focus", async () => {
     const controller = createControllerStub();
     const renderer = new BlessedTuiRenderer(controller as never);
@@ -153,6 +186,61 @@ describe("BlessedTuiRenderer", () => {
 
     expect(controller.dispatch).toHaveBeenNthCalledWith(1, { type: "activate_mode", delta: -1 });
     expect(controller.dispatch).toHaveBeenNthCalledWith(2, { type: "activate_mode", delta: 1 });
+  });
+
+  it("routes F1 to help even when query input is focused", async () => {
+    const controller = createControllerStub();
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness;
+    renderers.push(harness);
+    renderModel.focus = "query";
+
+    await harness.handleKeypress("", { name: "f1" } as blessed.Widgets.Events.IKeyEventArg);
+
+    expect(controller.dispatch).toHaveBeenCalledWith({ type: "toggle_help" });
+    renderModel.focus = "results";
+  });
+
+  it("routes z and bracket keys to detail layout controls", async () => {
+    const controller = createControllerStub();
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness;
+    renderers.push(harness);
+
+    await harness.handleKeypress("z", { name: "z" } as blessed.Widgets.Events.IKeyEventArg);
+    await harness.handleKeypress("[", { name: "[" } as blessed.Widgets.Events.IKeyEventArg);
+    await harness.handleKeypress("]", { name: "]" } as blessed.Widgets.Events.IKeyEventArg);
+
+    expect(controller.dispatch).toHaveBeenNthCalledWith(1, {
+      type: "toggle_detail_layout",
+    });
+    expect(controller.dispatch).toHaveBeenNthCalledWith(2, {
+      type: "resize_detail",
+      delta: -1,
+    });
+    expect(controller.dispatch).toHaveBeenNthCalledWith(3, {
+      type: "resize_detail",
+      delta: 1,
+    });
+  });
+
+  it("routes space to detail section folding when detail is focused", async () => {
+    const controller = createControllerStub();
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness;
+    renderers.push(harness);
+
+    renderModel.focus = "detail";
+    renderModel.detailPane.visible = true;
+
+    await harness.handleKeypress(" ", { name: "space" } as blessed.Widgets.Events.IKeyEventArg);
+
+    expect(controller.dispatch).toHaveBeenCalledWith({
+      type: "toggle_detail_section_fold",
+    });
+
+    renderModel.focus = "results";
+    renderModel.detailPane.visible = false;
   });
 
   it("deduplicates enter and return keypresses fired back-to-back", async () => {
@@ -180,7 +268,7 @@ describe("BlessedTuiRenderer", () => {
     expect(controller.reportError).toHaveBeenCalledWith("detail boom", "UI action");
   });
 
-  it("stops the spinner and disposes the controller when destroyed", async () => {
+  it("disposes the controller when destroyed during inline busy state", async () => {
     const controller = createControllerStub();
     controller.getRenderModel.mockReturnValue({
       ...renderModel,
@@ -193,7 +281,7 @@ describe("BlessedTuiRenderer", () => {
     const renderer = new BlessedTuiRenderer(controller as never);
     const harness = renderer as unknown as RendererHarness & {
       screen: blessed.Widgets.Screen;
-      spinnerInterval: NodeJS.Timeout | null;
+      helpBox: blessed.Widgets.BoxElement;
     };
     renderers.push(harness);
     const runPromise = renderer.run();
@@ -201,7 +289,58 @@ describe("BlessedTuiRenderer", () => {
     harness.screen.destroy();
     await runPromise;
 
-    expect(harness.spinnerInterval).toBeNull();
+    expect(harness.helpBox.hidden).toBe(true);
+    expect(controller.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("scrolls the help overlay instead of swallowing navigation keys", async () => {
+    const controller = createControllerStub();
+    controller.getRenderModel.mockReturnValue({
+      ...renderModel,
+      helpOverlay: {
+        visible: true,
+        title: "Inbox Help",
+        lines: Array.from({ length: 50 }, (_, index) => `Line ${index + 1}`),
+      },
+    });
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness & {
+      helpBox: blessed.Widgets.BoxElement;
+    };
+    renderers.push(harness);
+    const scrollSpy = vi.spyOn(harness.helpBox, "scroll");
+    const setScrollSpy = vi.spyOn(harness.helpBox, "setScroll");
+    const setScrollPercSpy = vi.spyOn(harness.helpBox, "setScrollPerc");
+
+    harness.render(controller.getRenderModel());
+    await harness.handleKeypress("", { name: "down" } as blessed.Widgets.Events.IKeyEventArg);
+    await harness.handleKeypress("", { name: "pageup" } as blessed.Widgets.Events.IKeyEventArg);
+    await harness.handleKeypress("", { name: "home" } as blessed.Widgets.Events.IKeyEventArg);
+    await harness.handleKeypress("", { name: "end" } as blessed.Widgets.Events.IKeyEventArg);
+
+    expect(scrollSpy).toHaveBeenNthCalledWith(1, 1);
+    expect(scrollSpy).toHaveBeenNthCalledWith(2, -(Number(harness.helpBox.height) || 10));
+    expect(setScrollSpy).toHaveBeenCalledWith(0);
+    expect(setScrollPercSpy).toHaveBeenCalledWith(100);
+    expect(controller.dispatch).not.toHaveBeenCalled();
+  });
+
+  it("still quits when q is pressed while help overlay is open", async () => {
+    const controller = createControllerStub();
+    controller.getRenderModel.mockReturnValue({
+      ...renderModel,
+      helpOverlay: {
+        visible: true,
+        title: "Inbox Help",
+        lines: ["Help line"],
+      },
+    });
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness;
+    renderers.push(harness);
+
+    await harness.handleKeypress("q", { name: "q" } as blessed.Widgets.Events.IKeyEventArg);
+
     expect(controller.dispose).toHaveBeenCalledTimes(1);
   });
 

@@ -182,6 +182,28 @@ function makeCluster(prNumber: number): ClusterPullRequestAnalysis {
   };
 }
 
+function makeExcludedClusterCandidate(prNumber: number) {
+  return {
+    prNumber,
+    title: `Excluded PR ${prNumber}`,
+    url: `https://github.com/openclaw/openclaw/pull/${prNumber}`,
+    state: "open" as const,
+    updatedAt: "2026-03-09T00:00:00.000Z",
+    headSha: `head-${prNumber}`,
+    matchedBy: "linked_issue" as const,
+    linkedIssues: [41789],
+    prodFiles: ["b.ts"],
+    testFiles: ["b.test.ts"],
+    otherFiles: [],
+    relevantProdFiles: [],
+    relevantTestFiles: [],
+    noiseFilesCount: 1,
+    excludedReasonCode: "noise_dominated" as const,
+    reason: "mostly unrelated churn",
+    featureVector: defaultFeatureVector,
+  };
+}
+
 const status: StatusSnapshot = {
   repo: "openclaw/openclaw",
   lastSyncAt: "2026-03-11T07:28:13.832Z",
@@ -467,7 +489,7 @@ describe("TuiController", () => {
 
     await controller.initialize();
 
-    const model = controller.getRenderModel();
+    let model = controller.getRenderModel();
     expect(model.mode).toBe("inbox");
     expect(model.resultsPane.title).toBe("Inbox");
     expect(model.resultsPane.rows).toHaveLength(20);
@@ -475,7 +497,7 @@ describe("TuiController", () => {
     expect(service.priorityInboxCalls).toEqual([{ limit: 20, scanLimit: 300 }]);
   });
 
-  it("renders collapsed cluster rows and expands them into member PRs", async () => {
+  it("renders collapsed cluster rows and opens a dedicated cluster workspace", async () => {
     const service = new FakeTuiDataService();
     service.inboxItems = [
       { kind: "cluster", cluster: makePriorityCluster([41793, 42212]) },
@@ -495,8 +517,325 @@ describe("TuiController", () => {
     await controller.expandSelectedCluster();
     model = controller.getRenderModel();
     expect(model.resultsPane.title).toContain("Cluster");
-    expect(model.resultsPane.rows.every((row) => row.kind === "pr")).toBe(true);
+    expect(model.resultsPane.rows[0]?.kind).toBe("cluster-candidate");
+    expect(model.resultsPane.lines[0]).toContain("Verify");
+    expect(model.detailPane.visible).toBe(true);
+    expect(model.detailPane.title).toBe("Cluster · #42212");
+    expect(model.detailPane.lines.join("\n")).toContain("CANDIDATE");
+  });
+
+  it("toggles excluded candidates inside the cluster workspace", async () => {
+    const service = new FakeTuiDataService();
+    service.verifyClusterPr = vi.fn(async (prNumber) => ({
+      analysis: {
+        ...makeCluster(prNumber),
+        nearbyButExcluded: [makeExcludedClusterCandidate(43001)],
+      },
+      summary: {
+        verifiedPrCount: 2,
+        verifiedIssueCount: 1,
+        missingCount: 0,
+        state: "done" as const,
+      },
+    }));
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.expandSelectedCluster();
+
+    let model = controller.getRenderModel();
+    expect(model.resultsPane.rows.some((row) => row.kind === "cluster-excluded")).toBe(false);
+
+    await controller.expandSelectedCluster();
+    model = controller.getRenderModel();
+    expect(model.resultsPane.rows.some((row) => row.kind === "cluster-excluded")).toBe(true);
+    expect(model.footer.message).toContain("Showing 1 excluded cluster candidate");
+
+    controller.goBack();
+    model = controller.getRenderModel();
+    expect(model.resultsPane.title).toBe("Inbox");
+    expect(model.resultsPane.rows[0]?.kind).toBe("pr");
+  });
+
+  it("opens the cluster workspace when only excluded candidates are available", async () => {
+    const service = new FakeTuiDataService();
+    service.verifyClusterPr = vi.fn(async (prNumber) => ({
+      analysis: {
+        ...makeCluster(prNumber),
+        bestBase: null,
+        sameClusterCandidates: [],
+        nearbyButExcluded: [makeExcludedClusterCandidate(43001)],
+      },
+      summary: {
+        verifiedPrCount: 1,
+        verifiedIssueCount: 1,
+        missingCount: 0,
+        state: "done" as const,
+      },
+    }));
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.expandSelectedCluster();
+
+    let model = controller.getRenderModel();
+    expect(model.resultsPane.title).toContain("Cluster");
+    expect(model.resultsPane.rows).toHaveLength(1);
+    expect(model.resultsPane.rows[0]?.kind).toBe("cluster-excluded");
+    expect(model.resultsPane.lines.join("\n")).toContain("EXCLUDED");
+    expect(model.detailPane.title).toBe("Cluster · #43001");
+
+    await controller.expandSelectedCluster();
+    model = controller.getRenderModel();
+    expect(model.resultsPane.rows).toHaveLength(0);
+    expect(model.footer.message).toContain("Hid excluded cluster candidates.");
+    expect(model.detailPane.visible).toBe(false);
+    expect(model.detailPane.title).toBe("Start Here");
+    expect(model.context).toBeNull();
+    expect(model.footer.actions.find((action) => action.id === "expand-cluster")).toMatchObject({
+      label: "Excluded",
+      shortcut: "e",
+      enabled: true,
+    });
+    expect(model.footer.actions.find((action) => action.id === "detail")).toMatchObject({
+      label: "Detail",
+      shortcut: "Enter",
+      enabled: false,
+    });
+
+    await controller.refreshSelected();
+    model = controller.getRenderModel();
+    expect(model.resultsPane.title).toContain("Cluster");
+    expect(model.resultsPane.rows).toHaveLength(1);
+    expect(model.resultsPane.rows[0]?.kind).toBe("cluster-excluded");
+    expect(model.footer.actions.find((action) => action.id === "refresh")).toMatchObject({
+      label: "Refresh",
+      shortcut: "r",
+      enabled: true,
+    });
+
+    await controller.expandSelectedCluster();
+    model = controller.getRenderModel();
+    expect(model.resultsPane.rows).toHaveLength(0);
+
+    await controller.expandSelectedCluster();
+    model = controller.getRenderModel();
+    expect(model.resultsPane.rows).toHaveLength(1);
+    expect(model.resultsPane.rows[0]?.kind).toBe("cluster-excluded");
+  });
+
+  it("does not add duplicate back-stack entries when refreshing an empty cluster workspace", async () => {
+    const service = new FakeTuiDataService();
+    service.verifyClusterPr = vi.fn(async (prNumber) => ({
+      analysis: {
+        ...makeCluster(prNumber),
+        bestBase: null,
+        sameClusterCandidates: [],
+        nearbyButExcluded: [makeExcludedClusterCandidate(43001)],
+      },
+      summary: {
+        verifiedPrCount: 1,
+        verifiedIssueCount: 1,
+        missingCount: 0,
+        state: "done" as const,
+      },
+    }));
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.expandSelectedCluster();
+    await controller.expandSelectedCluster();
+
+    let model = controller.getRenderModel();
+    expect(model.resultsPane.rows).toHaveLength(0);
+    expect(model.resultsPane.title).toContain("Cluster");
+
+    await controller.refreshSelected();
+    controller.goBack();
+
+    model = controller.getRenderModel();
+    expect(model.mode).toBe("inbox");
+    expect(model.resultsPane.title).toBe("Inbox");
+    expect(model.resultsPane.rows[0]?.kind).toBe("pr");
+  });
+
+  it("refreshes detail when hiding the selected excluded cluster row", async () => {
+    const service = new FakeTuiDataService();
+    service.verifyClusterPr = vi.fn(async (prNumber) => ({
+      analysis: {
+        ...makeCluster(prNumber),
+        nearbyButExcluded: [makeExcludedClusterCandidate(43001)],
+      },
+      summary: {
+        verifiedPrCount: 2,
+        verifiedIssueCount: 1,
+        missingCount: 0,
+        state: "done" as const,
+      },
+    }));
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.expandSelectedCluster();
+    await controller.expandSelectedCluster();
+
+    controller.moveSelection(1);
+    await flushMicrotasks();
+
+    let model = controller.getRenderModel();
+    expect(model.resultsPane.rows[1]?.kind).toBe("cluster-excluded");
+    expect(model.detailPane.title).toBe("Cluster · #43001");
+
+    await controller.expandSelectedCluster();
+
+    model = controller.getRenderModel();
+    expect(model.resultsPane.rows).toHaveLength(1);
+    expect(model.resultsPane.rows[0]?.kind).toBe("cluster-candidate");
+    expect(model.detailPane.title).toBe("Cluster · #42212");
+    expect(model.footer.message).toContain("Hid excluded cluster candidates.");
+  });
+
+  it("preserves cluster workspace selection and excluded rows on refresh", async () => {
+    const service = new FakeTuiDataService();
+    service.verifyClusterPr = vi.fn(async (prNumber) => ({
+      analysis: {
+        ...makeCluster(prNumber),
+        nearbyButExcluded: [makeExcludedClusterCandidate(43001)],
+      },
+      summary: {
+        verifiedPrCount: 2,
+        verifiedIssueCount: 1,
+        missingCount: 0,
+        state: "done" as const,
+      },
+    }));
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.expandSelectedCluster();
+    await controller.expandSelectedCluster();
+    controller.moveSelection(1);
+    await flushMicrotasks();
+
+    await controller.refreshSelected();
+
+    const model = controller.getRenderModel();
     expect(model.resultsPane.rows).toHaveLength(2);
+    expect(model.resultsPane.rows[1]?.kind).toBe("cluster-excluded");
+    expect(model.resultsPane.selectedIndex).toBe(1);
+    expect(model.detailPane.title).toBe("Cluster · #43001");
+  });
+
+  it("keeps detail focus when opening cluster workspace from fullscreen detail", async () => {
+    const service = new FakeTuiDataService();
+    service.inboxItems = [{ kind: "cluster", cluster: makePriorityCluster([41793, 42212]) }];
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.openSelected();
+    await controller.dispatch({ type: "toggle_detail_layout" });
+
+    let model = controller.getRenderModel();
+    expect(model.layoutMode).toBe("detail-fullscreen");
+    expect(model.focus).toBe("detail");
+
+    await controller.expandSelectedCluster();
+
+    model = controller.getRenderModel();
+    expect(model.layoutMode).toBe("detail-fullscreen");
+    expect(model.focus).toBe("detail");
+    expect(model.resultsPane.rows[0]?.kind).toBe("cluster-candidate");
+    expect(model.detailPane.title).toBe("Cluster · #42212");
+  });
+
+  it("restores detail focus when going back to fullscreen detail", async () => {
+    const service = new FakeTuiDataService();
+    service.inboxItems = [{ kind: "cluster", cluster: makePriorityCluster([41793, 42212]) }];
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.openSelected();
+    await controller.dispatch({ type: "toggle_detail_layout" });
+    await controller.expandSelectedCluster();
+
+    controller.goBack();
+
+    const model = controller.getRenderModel();
+    expect(model.layoutMode).toBe("detail-fullscreen");
+    expect(model.focus).toBe("detail");
+    expect(model.detailPane.visible).toBe(true);
+    expect(model.resultsPane.rows[0]?.kind).toBe("priority-cluster");
+  });
+
+  it("ignores stale cluster workspace loads after switching modes", async () => {
+    const service = new FakeTuiDataService();
+    service.inboxItems = [{ kind: "cluster", cluster: makePriorityCluster([41793, 42212]) }];
+    let releaseVerify: (() => void) | null = null;
+    service.verifyClusterPr = vi.fn(
+      async (prNumber): ReturnType<FakeTuiDataService["verifyClusterPr"]> =>
+        await new Promise(
+          (
+            resolve: (value: Awaited<ReturnType<FakeTuiDataService["verifyClusterPr"]>>) => void,
+          ) => {
+            releaseVerify = () =>
+              resolve({
+                analysis: makeCluster(prNumber),
+                summary: {
+                  verifiedPrCount: 2,
+                  verifiedIssueCount: 1,
+                  missingCount: 0,
+                  state: "done" as const,
+                },
+              });
+          },
+        ),
+    );
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    const expandPromise = controller.expandSelectedCluster();
+
+    controller.activateMode("watchlist");
+    releaseVerify!();
+    await expandPromise;
+    await flushMicrotasks();
+
+    const model = controller.getRenderModel();
+    expect(model.mode).toBe("watchlist");
+    expect(model.resultsPane.title).toBe("Watchlist");
+    expect(model.resultsPane.rows.some((row) => row.kind === "cluster-candidate")).toBe(false);
   });
 
   it("uses x on a collapsed cluster row to open linked-issue detail", async () => {
@@ -562,6 +901,107 @@ describe("TuiController", () => {
     expect(model.mode).toBe("inbox");
     expect(model.detailPane.anchorKey).not.toBeNull();
     expect(model.detailPane.lines.join("\n")).toContain("CLUSTER");
+  });
+
+  it("starts Sparse Extras collapsed and can expand it in detail", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.openSelected();
+
+    let model = controller.getRenderModel();
+    expect(model.detailPane.lines.join("\n")).toContain("SPARSE EXTRAS");
+    expect(model.detailPane.lines.join("\n")).toContain("[collapsed]");
+    expect(model.detailPane.lines.join("\n")).not.toContain("recent_comments");
+
+    controller.focusNext();
+    await controller.dispatch({ type: "toggle_detail_section_fold" });
+
+    model = controller.getRenderModel();
+    expect(model.detailPane.lines.join("\n")).toContain("recent_comments");
+    expect(model.footer.message).toContain("Sparse Extras expanded");
+  });
+
+  it("collapses the focused linked-issues section from detail focus", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.crossReferenceSelected();
+    controller.focusNext();
+    await controller.dispatch({ type: "toggle_detail_section_fold" });
+
+    const model = controller.getRenderModel();
+    expect(model.detailPane.lines.join("\n")).toContain("LINKED ISSUES");
+    expect(model.detailPane.lines.join("\n")).toContain("[collapsed]");
+    expect(model.detailPane.lines.join("\n")).not.toContain("Issue #41789");
+    expect(model.footer.message).toContain("Linked Issues collapsed");
+  });
+
+  it("toggles detail fullscreen and resizes split detail panes", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.openSelected();
+
+    let model = controller.getRenderModel();
+    expect(model.layoutMode).toBe("split-pane");
+    expect(model.detailWidth).toBe("36%");
+
+    await controller.dispatch({ type: "resize_detail", delta: 1 });
+    model = controller.getRenderModel();
+    expect(model.layoutMode).toBe("split-pane");
+    expect(model.detailWidth).toBe("42%");
+
+    await controller.dispatch({ type: "toggle_detail_layout" });
+    model = controller.getRenderModel();
+    expect(model.layoutMode).toBe("detail-fullscreen");
+    expect(model.detailWidth).toBe("100%");
+
+    await controller.dispatch({ type: "toggle_detail_layout" });
+    model = controller.getRenderModel();
+    expect(model.layoutMode).toBe("split-pane");
+    expect(model.detailWidth).toBe("42%");
+  });
+
+  it("restores detail focus when reopening fullscreen detail", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.openSelected();
+    await controller.dispatch({ type: "toggle_detail_layout" });
+    await controller.openSelected();
+
+    let model = controller.getRenderModel();
+    expect(model.layoutMode).toBe("single-pane");
+    expect(model.detailPane.visible).toBe(false);
+    expect(model.focus).toBe("results");
+
+    await controller.openSelected();
+
+    model = controller.getRenderModel();
+    expect(model.layoutMode).toBe("detail-fullscreen");
+    expect(model.detailPane.visible).toBe(true);
+    expect(model.focus).toBe("detail");
   });
 
   it("does not reopen detail if a background list replay finishes after closing it", async () => {
@@ -640,6 +1080,53 @@ describe("TuiController", () => {
     expect(model.resultsPane.rows[0]?.kind).toBe("pr");
   });
 
+  it("keeps dismissed banners hidden after busy refreshes finish", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.toggleWatchSelected();
+    expect(controller.getRenderModel().footer.banner?.message).toContain("watch");
+
+    controller.dismissBanner();
+    expect(controller.getRenderModel().footer.banner).toBeNull();
+
+    const refreshPromise = controller.refreshSelected();
+    await flushMicrotasks();
+    expect(controller.getRenderModel().footer.banner?.message).toContain("[REFRESHING]");
+
+    service.releaseRefreshPr();
+    await refreshPromise;
+
+    expect(controller.getRenderModel().footer.banner).toBeNull();
+  });
+
+  it("keeps dismissed banners hidden when the help overlay is toggled", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.toggleWatchSelected();
+    expect(controller.getRenderModel().footer.banner?.message).toContain("watch");
+
+    controller.dismissBanner();
+    expect(controller.getRenderModel().footer.banner).toBeNull();
+
+    controller.toggleHelp();
+    controller.toggleHelp();
+
+    expect(controller.getRenderModel().helpOverlay.visible).toBe(false);
+    expect(controller.getRenderModel().footer.banner).toBeNull();
+  });
+
   it("ignores PRs in Inbox without hiding them from other desks", async () => {
     const service = new FakeTuiDataService();
     const controller = new TuiController(service, {
@@ -657,6 +1144,30 @@ describe("TuiController", () => {
     controller.activateMode("pr-search");
     await flushMicrotasks();
     expect(controller.getRenderModel().resultsPane.rows[0]?.kind).toBe("pr");
+  });
+
+  it("marks the visible page as seen and can undo the batch change", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    await controller.markVisiblePageSeen();
+
+    expect(service.attentionState.get(41793)).toBe("seen");
+    expect(service.attentionState.get(41812)).toBe("seen");
+    expect(controller.getRenderModel().footer.actions.some((action) => action.id === "undo")).toBe(
+      true,
+    );
+
+    await controller.undoAttentionState();
+
+    expect(service.attentionState.has(41793)).toBe(false);
+    expect(service.attentionState.has(41812)).toBe(false);
+    expect(controller.getRenderModel().footer.banner?.message).toContain("Undid triage change");
   });
 
   it("loads more Inbox rows in batches of 20", async () => {
@@ -732,6 +1243,124 @@ describe("TuiController", () => {
     expect(loadMore?.enabled).toBe(true);
   });
 
+  it("recalls the newest query first in history navigation", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    controller.activateMode("cross-search");
+    await flushMicrotasks();
+    await controller.submitQuery("author:frank");
+    await controller.submitQuery("state:open");
+
+    controller.startQueryEntry();
+    controller.appendQueryCharacter(" ");
+
+    controller.moveQueryHistory(-1);
+    expect(controller.getRenderModel().query).toBe("state:open");
+
+    controller.moveQueryHistory(-1);
+    expect(controller.getRenderModel().query).toBe("author:frank");
+
+    controller.moveQueryHistory(1);
+    expect(controller.getRenderModel().query).toBe("state:open");
+
+    controller.moveQueryHistory(1);
+    expect(controller.getRenderModel().query).toBe("state:open ");
+  });
+
+  it("restores saved query history when going back to a search view", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    controller.activateMode("cross-search");
+    await flushMicrotasks();
+    await controller.submitQuery("author:frank");
+
+    controller.activateMode("watchlist");
+    await flushMicrotasks();
+    controller.activateMode("cross-search");
+    await flushMicrotasks();
+    await controller.submitQuery("state:open");
+
+    controller.goBack();
+    controller.goBack();
+
+    expect(controller.getRenderModel().mode).toBe("cross-search");
+    expect(controller.getRenderModel().query).toBe("author:frank");
+
+    controller.startQueryEntry();
+    controller.moveQueryHistory(-1);
+
+    expect(controller.getRenderModel().query).toBe("author:frank");
+  });
+
+  it.each([
+    ["cross-search", "Explore · author:frank"],
+    ["pr-search", "PRs · author:frank"],
+    ["issue-search", "Issues · author:frank"],
+  ] as const)("re-runs the saved query when re-activating %s", async (mode, expectedTitle) => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    controller.activateMode(mode);
+    await flushMicrotasks();
+    await controller.submitQuery("author:frank");
+
+    service.searchCalls = [];
+    service.issueSearchCalls = [];
+
+    controller.activateMode("watchlist");
+    await flushMicrotasks();
+    controller.activateMode(mode);
+    await flushMicrotasks();
+
+    const model = controller.getRenderModel();
+    expect(model.mode).toBe(mode);
+    expect(model.query).toBe("author:frank");
+    expect(model.resultsPane.title).toBe(expectedTitle);
+    expect(model.resultsPane.rows.length).toBeGreaterThan(0);
+
+    if (mode === "cross-search") {
+      expect(service.searchCalls.at(-1)?.query).toBe("author:frank");
+      expect(service.issueSearchCalls.at(-1)?.query).toBe("author:frank");
+      return;
+    }
+    if (mode === "pr-search") {
+      expect(service.searchCalls.at(-1)?.query).toBe("author:frank");
+      expect(service.issueSearchCalls).toHaveLength(0);
+      return;
+    }
+    expect(service.searchCalls).toHaveLength(0);
+    expect(service.issueSearchCalls.at(-1)?.query).toBe("author:frank");
+  });
+
+  it("does not duplicate browse guidance in the footer query line", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+
+    const model = controller.getRenderModel();
+    expect(model.footer.queryPlaceholder).toContain("Browse-only mode");
+    expect(model.footer.queryHelpText).toBe("");
+  });
+
   it("keeps inbox pagination enabled when collapsed clusters compress visible rows", async () => {
     const service = new FakeTuiDataService();
     service.listPriorityInbox = vi.fn(async ({ limit }) =>
@@ -786,6 +1415,55 @@ describe("TuiController", () => {
       const model = controller.getRenderModel();
       expect(model.header.errorMessage).toBe("replay boom");
       expect(model.footer.message).toBe("replay boom");
+    } finally {
+      controller?.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("replays deferred list refresh after leaving cluster workspace", async () => {
+    vi.useFakeTimers();
+    let controller: TuiController | null = null;
+    try {
+      const service = new FakeTuiDataService();
+      service.statusSnapshot = {
+        ...service.statusSnapshot,
+        lastSyncAt: new Date().toISOString(),
+        issueLastSyncAt: new Date().toISOString(),
+      };
+      service.inboxItems = [{ kind: "cluster", cluster: makePriorityCluster([41793, 42212]) }];
+      controller = new TuiController(service, {
+        repo: "openclaw/openclaw",
+        dbPath: "/tmp/clawlens.sqlite",
+        ftsOnly: false,
+      });
+
+      await controller.initialize();
+      await controller.expandSelectedCluster();
+      service.inboxItems = [{ kind: "pr", candidate: makePriorityCandidate(43001) }];
+
+      (
+        controller as unknown as {
+          scheduleListReplay: () => void;
+        }
+      ).scheduleListReplay();
+
+      await vi.advanceTimersByTimeAsync(200);
+      await flushMicrotasks();
+
+      let model = controller.getRenderModel();
+      expect(model.resultsPane.title).toContain("Cluster");
+
+      controller.goBack();
+      await flushMicrotasks(6);
+
+      model = controller.getRenderModel();
+      expect(model.mode).toBe("inbox");
+      expect(model.resultsPane.rows).toHaveLength(1);
+      expect(model.resultsPane.rows[0]?.kind).toBe("pr");
+      if (model.resultsPane.rows[0]?.kind === "pr") {
+        expect(model.resultsPane.rows[0].pr.prNumber).toBe(43001);
+      }
     } finally {
       controller?.dispose();
       vi.useRealTimers();
