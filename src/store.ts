@@ -133,7 +133,16 @@ const SUCCESSFUL_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
 const CLUSTER_EMBEDDING_PROVIDER = "cluster";
 const CLUSTER_LOCAL_PATH_LIMIT = 16;
 const CLUSTER_EMBEDDING_RERANK_LIMIT = 12;
+const CLUSTER_LIVE_SEARCH_CONCURRENCY = 3;
+const CLUSTER_CANDIDATE_HYDRATION_CONCURRENCY = 4;
 const EXACT_CLUSTER_PATH_CAP = 40;
+const LINK_SOURCE_PRIORITY: PullRequestLinkSource[] = [
+  "closing_reference",
+  "source_issue_marker",
+  "body_reference",
+  "title_reference",
+];
+const CLUSTER_LIVE_SEARCH_STATES = ["open", "closed"] as const;
 
 type IssueDocRow = {
   issue_number: number;
@@ -190,6 +199,31 @@ type CachedLinkedIssueClusterEvaluation = {
   bestBase: ClusterCandidate | null;
   sameClusterCandidates: ClusterCandidate[];
 };
+
+type CachedSemanticOnlyClusterEvaluation = {
+  sameClusterCandidates: ClusterCandidate[];
+  nearbyButExcluded: ClusterExcludedCandidate[];
+  decisionTrace: ClusterDecisionTrace[];
+};
+
+function linkSourcePriority(linkSource: PullRequestLinkSource): number {
+  const index = LINK_SOURCE_PRIORITY.indexOf(linkSource);
+  return index === -1 ? LINK_SOURCE_PRIORITY.length : index;
+}
+
+function pullRequestOpenStatePriority(state: PrRow["state"]): number {
+  if (state === "open") {
+    return 2;
+  }
+  if (state === "merged") {
+    return 1;
+  }
+  return 0;
+}
+
+function issueOpenStatePriority(state: IssueRow["state"]): number {
+  return state === "open" ? 1 : 0;
+}
 
 function toVectorBlob(values: number[]): Buffer {
   return Buffer.from(new Float32Array(values).buffer);
@@ -252,6 +286,10 @@ export class PrIndexStore {
   private initialized = false;
   private vectorDims: number | null = null;
   private readonly linkedIssueClusterCache = new Map<string, CachedLinkedIssueClusterEvaluation>();
+  private readonly semanticOnlyClusterCache = new Map<
+    string,
+    CachedSemanticOnlyClusterEvaluation
+  >();
 
   constructor(params: {
     dbPath: string;
@@ -538,6 +576,7 @@ export class PrIndexStore {
 
   private clearLinkedIssueClusterCache(): void {
     this.linkedIssueClusterCache.clear();
+    this.semanticOnlyClusterCache.clear();
   }
 
   private rebuildChangedFileTermsForPr(
@@ -1354,6 +1393,7 @@ export class PrIndexStore {
     source: PullRequestDataSource;
     full?: boolean;
     hydrateAll?: boolean;
+    maxFullSyncItems?: number;
     onProgress?: (event: SyncProgressEvent) => void;
   }): Promise<SyncSummary> {
     await this.init();
@@ -1388,6 +1428,7 @@ export class PrIndexStore {
     repo: RepoRef;
     source: IssueDataSource;
     full?: boolean;
+    maxFullSyncItems?: number;
     onProgress?: (event: SyncProgressEvent) => void;
   }): Promise<SyncSummary> {
     await this.init();
@@ -2360,6 +2401,28 @@ export class PrIndexStore {
     await this.ensurePullRequestFactsCached(repo, source, prNumber, refresh);
   }
 
+  private async ensureClusterCandidatesCached(
+    repo: RepoRef,
+    source: PullRequestDataSource,
+    prNumbers: number[],
+    refresh = false,
+  ): Promise<void> {
+    const uniquePrNumbers = Array.from(new Set(prNumbers)).filter((prNumber) =>
+      Number.isInteger(prNumber),
+    );
+    const result = await runTasksWithConcurrency({
+      tasks: uniquePrNumbers.map((prNumber) => async () => {
+        await this.ensureClusterCandidateCached(repo, source, prNumber, refresh);
+        return prNumber;
+      }),
+      limit: CLUSTER_CANDIDATE_HYDRATION_CONCURRENCY,
+      errorMode: "stop",
+    });
+    if (result.hasError) {
+      throw result.firstError;
+    }
+  }
+
   private loadClusterInputs(prNumbers: number[]): Map<number, ClusterInputBundle> {
     const uniqueNumbers = Array.from(new Set(prNumbers)).sort((a, b) => a - b);
     const bundles = new Map<number, ClusterInputBundle>();
@@ -2717,18 +2780,29 @@ export class PrIndexStore {
     limit: number,
   ): Promise<Map<number, ClusterMatchSource>> {
     const out = new Map<number, ClusterMatchSource>();
-    if (!source.searchPullRequestNumbers) {
+    const searchPullRequestNumbers = source.searchPullRequestNumbers?.bind(source);
+    if (!searchPullRequestNumbers) {
       return out;
     }
-    for (const issueNumber of issueNumbers) {
-      for (const state of ["open", "closed"] as const) {
-        const numbers = await source.searchPullRequestNumbers(repo, String(issueNumber), {
+    const tasks = issueNumbers.flatMap((issueNumber) =>
+      CLUSTER_LIVE_SEARCH_STATES.map((state) => async () => ({
+        numbers: await searchPullRequestNumbers(repo, String(issueNumber), {
           state,
           limit,
-        });
-        for (const prNumber of numbers) {
-          out.set(prNumber, "live_issue_search");
-        }
+        }),
+      })),
+    );
+    const result = await runTasksWithConcurrency({
+      tasks,
+      limit: CLUSTER_LIVE_SEARCH_CONCURRENCY,
+      errorMode: "stop",
+    });
+    if (result.hasError) {
+      throw result.firstError;
+    }
+    for (const item of result.results) {
+      for (const prNumber of item.numbers) {
+        out.set(prNumber, "live_issue_search");
       }
     }
     return out;
@@ -2741,19 +2815,30 @@ export class PrIndexStore {
     limit: number,
   ): Promise<Map<number, ClusterMatchSource>> {
     const out = new Map<number, ClusterMatchSource>();
-    if (!source.searchPullRequestNumbers) {
+    const searchPullRequestNumbers = source.searchPullRequestNumbers?.bind(source);
+    if (!searchPullRequestNumbers) {
       return out;
     }
-    for (const query of buildLiveSemanticQueries(seed)) {
-      for (const state of ["open", "closed"] as const) {
-        const numbers = await source.searchPullRequestNumbers(repo, query, {
+    const tasks = buildLiveSemanticQueries(seed).flatMap((query) =>
+      CLUSTER_LIVE_SEARCH_STATES.map((state) => async () => ({
+        numbers: await searchPullRequestNumbers(repo, query, {
           state,
           limit,
-        });
-        for (const prNumber of numbers) {
-          if (prNumber !== seed.number) {
-            out.set(prNumber, "live_semantic");
-          }
+        }),
+      })),
+    );
+    const result = await runTasksWithConcurrency({
+      tasks,
+      limit: CLUSTER_LIVE_SEARCH_CONCURRENCY,
+      errorMode: "stop",
+    });
+    if (result.hasError) {
+      throw result.firstError;
+    }
+    for (const item of result.results) {
+      for (const prNumber of item.numbers) {
+        if (prNumber !== seed.number) {
+          out.set(prNumber, "live_semantic");
         }
       }
     }
@@ -2815,13 +2900,13 @@ export class PrIndexStore {
         params.clusterIssueNumbers,
         params.liveIssueSearchLimit,
       );
+      await this.ensureClusterCandidatesCached(
+        params.repo,
+        params.source,
+        Array.from(liveIssueMatches.keys()),
+        params.refresh ?? false,
+      );
       for (const [prNumber, matchedBy] of liveIssueMatches) {
-        await this.ensureClusterCandidateCached(
-          params.repo,
-          params.source,
-          prNumber,
-          params.refresh ?? false,
-        );
         const linkedIssues = this.getLinkedIssuesForPr(prNumber).map((issue) => issue.issueNumber);
         if (linkedIssues.some((issue) => params.clusterIssueNumbers.includes(issue))) {
           exactMatches.set(prNumber, exactMatches.get(prNumber) ?? matchedBy);
@@ -2933,9 +3018,62 @@ export class PrIndexStore {
     return this.computeLinkedIssueClusterEvaluation(params);
   }
 
+  private buildClusterInputSignature(bundle: ClusterInputBundle): string {
+    const linkedIssueKey = bundle.linkedIssues.join(",");
+    const changedFileKey = bundle.changedFiles
+      .map((file) => `${file.kind}:${file.path}`)
+      .sort((left, right) => left.localeCompare(right))
+      .join("|");
+    return [
+      bundle.pr.number,
+      bundle.pr.updated_at,
+      bundle.headSha ?? "",
+      hashText(linkedIssueKey),
+      hashText(changedFileKey),
+    ].join("@");
+  }
+
+  private buildSemanticOnlyClusterCacheKey(params: {
+    repoKey: string;
+    seed: PrRow;
+    limit: number;
+    ftsOnly: boolean;
+    semanticNumbers: Array<[number, ClusterMatchSource]>;
+    bundles: Map<number, ClusterInputBundle>;
+  }): string {
+    const seedBundle = params.bundles.get(params.seed.number);
+    const seedSignature = seedBundle
+      ? this.buildClusterInputSignature(seedBundle)
+      : `${params.seed.number}@${params.seed.updated_at}`;
+    const sortedCandidateEntries = [...params.semanticNumbers].sort(
+      (left, right) => left[0] - right[0],
+    );
+    const candidateNumbers = sortedCandidateEntries.map(([prNumber]) => prNumber).join(",");
+    const candidateSignatures = sortedCandidateEntries
+      .map(([prNumber, matchedBy]) => {
+        const bundle = params.bundles.get(prNumber);
+        return `${prNumber}:${matchedBy}:${
+          bundle ? this.buildClusterInputSignature(bundle) : "missing"
+        }`;
+      })
+      .join("|");
+    return [
+      params.repoKey,
+      params.seed.number,
+      params.limit,
+      params.ftsOnly ? "fts" : "hybrid",
+      seedSignature,
+      candidateNumbers,
+      candidateSignatures,
+    ].join(":");
+  }
+
   private async collectSemanticOnlyDecisionSet(params: {
     seed: PrRow;
     semanticNumbers: Map<number, ClusterMatchSource>;
+    repoKey: string;
+    limit: number;
+    ftsOnly: boolean;
     repo?: RepoRef;
     source?: PullRequestDataSource;
     refresh?: boolean;
@@ -2947,20 +3085,35 @@ export class PrIndexStore {
     const sameClusterCandidates: ClusterCandidate[] = [];
     const nearbyButExcluded: ClusterExcludedCandidate[] = [];
     const decisionTrace: ClusterDecisionTrace[] = [];
-    const seedChangedFiles = this.getChangedFilesForPr(params.seed.number);
     const semanticNumbers = Array.from(params.semanticNumbers.entries());
 
     if (params.repo && params.source) {
-      for (const [prNumber] of semanticNumbers) {
-        await this.ensureClusterCandidateCached(
-          params.repo,
-          params.source,
-          prNumber,
-          params.refresh ?? false,
-        );
-      }
+      await this.ensureClusterCandidatesCached(
+        params.repo,
+        params.source,
+        semanticNumbers.map(([prNumber]) => prNumber),
+        params.refresh ?? false,
+      );
     }
-    const bundles = this.loadClusterInputs(semanticNumbers.map(([prNumber]) => prNumber));
+    const bundles = this.loadClusterInputs([
+      params.seed.number,
+      ...semanticNumbers.map(([prNumber]) => prNumber),
+    ]);
+    const cacheKey = this.buildSemanticOnlyClusterCacheKey({
+      repoKey: params.repoKey,
+      seed: params.seed,
+      limit: params.limit,
+      ftsOnly: params.ftsOnly,
+      semanticNumbers,
+      bundles,
+    });
+    const cached = !params.refresh ? this.semanticOnlyClusterCache.get(cacheKey) : undefined;
+    if (cached) {
+      return cached;
+    }
+    const seedBundle = bundles.get(params.seed.number);
+    const seedChangedFiles =
+      seedBundle?.changedFiles ?? this.getChangedFilesForPr(params.seed.number);
     const semanticCandidates = semanticNumbers.flatMap(([prNumber, matchedBy]) => {
       const bundle = bundles.get(prNumber);
       if (!bundle) {
@@ -3009,11 +3162,15 @@ export class PrIndexStore {
       }
     }
 
-    return {
+    const cacheEntry: CachedSemanticOnlyClusterEvaluation = {
       sameClusterCandidates,
       nearbyButExcluded,
       decisionTrace,
     };
+    if (!params.refresh) {
+      this.semanticOnlyClusterCache.set(cacheKey, cacheEntry);
+    }
+    return cacheEntry;
   }
 
   private async collectNearbyExcludedCandidates(params: {
@@ -3040,14 +3197,12 @@ export class PrIndexStore {
     );
 
     if (params.repo && params.source) {
-      for (const [prNumber] of nearbyNumbers) {
-        await this.ensureClusterCandidateCached(
-          params.repo,
-          params.source,
-          prNumber,
-          params.refresh ?? false,
-        );
-      }
+      await this.ensureClusterCandidatesCached(
+        params.repo,
+        params.source,
+        nearbyNumbers.map(([prNumber]) => prNumber),
+        params.refresh ?? false,
+      );
     }
     const bundles = this.loadClusterInputs(nearbyNumbers.map(([prNumber]) => prNumber));
     const nearbyCandidates = nearbyNumbers.flatMap(([prNumber, matchedBy]) => {
@@ -3217,6 +3372,145 @@ export class PrIndexStore {
     };
   }
 
+  private toExactPullRequestSearchResult(pr: PrRow): SearchResult {
+    return {
+      prNumber: pr.number,
+      title: pr.title,
+      url: pr.url,
+      state: pr.state,
+      author: pr.author,
+      labels: this.getLabelsForPr(pr.number),
+      updatedAt: pr.updated_at,
+      score: 1,
+      matchedDocKind: "pr_body",
+      matchedExcerpt: truncateUtf16Safe(normalizeSearchText(pr.body || pr.title), 280),
+    };
+  }
+
+  private toExactIssueSearchResult(issue: IssueRow): IssueSearchResult {
+    return {
+      issueNumber: issue.number,
+      title: issue.title,
+      url: issue.url,
+      state: issue.state,
+      author: issue.author,
+      labels: this.getLabelsForIssue(issue.number),
+      updatedAt: issue.updated_at,
+      score: 1,
+      matchedExcerpt: truncateUtf16Safe(normalizeSearchText(issue.body || issue.title), 280),
+    };
+  }
+
+  private getExactPullRequestsForIssue(issueNumber: number, limit: number): SearchResult[] {
+    if (limit <= 0) {
+      return [];
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT p.*, li.link_source
+           FROM pr_linked_issues li
+           JOIN prs p ON p.number = li.pr_number
+          WHERE li.issue_number = ?`,
+      )
+      .all(issueNumber) as Array<PrRow & { link_source: PullRequestLinkSource }>;
+    const bestByPr = new Map<number, { pr: PrRow; linkSource: PullRequestLinkSource }>();
+    for (const row of rows) {
+      const existing = bestByPr.get(row.number);
+      if (
+        !existing ||
+        linkSourcePriority(row.link_source) < linkSourcePriority(existing.linkSource)
+      ) {
+        bestByPr.set(row.number, { pr: row, linkSource: row.link_source });
+      }
+    }
+    return Array.from(bestByPr.values())
+      .sort((left, right) => {
+        const sourceDelta =
+          linkSourcePriority(left.linkSource) - linkSourcePriority(right.linkSource);
+        if (sourceDelta !== 0) {
+          return sourceDelta;
+        }
+        const stateDelta =
+          pullRequestOpenStatePriority(right.pr.state) - pullRequestOpenStatePriority(left.pr.state);
+        if (stateDelta !== 0) {
+          return stateDelta;
+        }
+        return (
+          right.pr.updated_at.localeCompare(left.pr.updated_at) || right.pr.number - left.pr.number
+        );
+      })
+      .slice(0, limit)
+      .map((entry) => this.toExactPullRequestSearchResult(entry.pr));
+  }
+
+  private getExactIssuesForPullRequest(prNumber: number, limit: number): IssueSearchResult[] {
+    if (limit <= 0) {
+      return [];
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT i.*, li.link_source
+           FROM pr_linked_issues li
+           JOIN issues i ON i.number = li.issue_number
+          WHERE li.pr_number = ?`,
+      )
+      .all(prNumber) as Array<IssueRow & { link_source: PullRequestLinkSource }>;
+    const bestByIssue = new Map<
+      number,
+      { issue: IssueRow; linkSource: PullRequestLinkSource }
+    >();
+    for (const row of rows) {
+      const existing = bestByIssue.get(row.number);
+      if (
+        !existing ||
+        linkSourcePriority(row.link_source) < linkSourcePriority(existing.linkSource)
+      ) {
+        bestByIssue.set(row.number, { issue: row, linkSource: row.link_source });
+      }
+    }
+    return Array.from(bestByIssue.values())
+      .sort((left, right) => {
+        const sourceDelta =
+          linkSourcePriority(left.linkSource) - linkSourcePriority(right.linkSource);
+        if (sourceDelta !== 0) {
+          return sourceDelta;
+        }
+        const stateDelta =
+          issueOpenStatePriority(right.issue.state) - issueOpenStatePriority(left.issue.state);
+        if (stateDelta !== 0) {
+          return stateDelta;
+        }
+        return (
+          right.issue.updated_at.localeCompare(left.issue.updated_at) ||
+          right.issue.number - left.issue.number
+        );
+      })
+      .slice(0, limit)
+      .map((entry) => this.toExactIssueSearchResult(entry.issue));
+  }
+
+  private mergeExactFirstResults<T>(
+    exactResults: T[],
+    fuzzyResults: T[],
+    limit: number,
+    keyForResult: (result: T) => number,
+  ): T[] {
+    const out: T[] = [];
+    const seen = new Set<number>();
+    for (const result of [...exactResults, ...fuzzyResults]) {
+      const key = keyForResult(result);
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      out.push(result);
+      if (out.length >= limit) {
+        break;
+      }
+    }
+    return out;
+  }
+
   async crossReferenceIssueToPullRequests(
     issueNumber: number,
     limit = DEFAULT_SEARCH_LIMIT,
@@ -3225,10 +3519,20 @@ export class PrIndexStore {
     if (!issue) {
       return { issue: null, pullRequests: [] };
     }
+    const exactPullRequests = this.getExactPullRequestsForIssue(issueNumber, limit);
     const query = buildCrossReferenceQuery(issue.title, issue.matchedExcerpt);
+    const fuzzyPullRequests =
+      exactPullRequests.length >= limit
+        ? []
+        : await this.search(query, limit + exactPullRequests.length);
     return {
       issue,
-      pullRequests: await this.search(query, limit),
+      pullRequests: this.mergeExactFirstResults(
+        exactPullRequests,
+        fuzzyPullRequests,
+        limit,
+        (result) => result.prNumber,
+      ),
     };
   }
 
@@ -3240,10 +3544,18 @@ export class PrIndexStore {
     if (!payload.pr) {
       return { pullRequest: null, issues: [] };
     }
+    const exactIssues = this.getExactIssuesForPullRequest(prNumber, limit);
     const query = buildCrossReferenceQuery(payload.pr.title, payload.pr.matchedExcerpt);
+    const fuzzyIssues =
+      exactIssues.length >= limit ? [] : await this.searchIssues(query, limit + exactIssues.length);
     return {
       pullRequest: payload.pr,
-      issues: await this.searchIssues(query, limit),
+      issues: this.mergeExactFirstResults(
+        exactIssues,
+        fuzzyIssues,
+        limit,
+        (result) => result.issueNumber,
+      ),
     };
   }
 
@@ -3315,6 +3627,11 @@ export class PrIndexStore {
       const semanticDecisionSet = await this.collectSemanticOnlyDecisionSet({
         seed,
         semanticNumbers,
+        repoKey:
+          params.repoKey ??
+          (params.repo ? this.repoKey(params.repo) : (this.getMeta(META_REPO) ?? "")),
+        limit,
+        ftsOnly: params.ftsOnly ?? false,
         repo: params.repo,
         source: params.source,
         refresh: params.refresh ?? false,
