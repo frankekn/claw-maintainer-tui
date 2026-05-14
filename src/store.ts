@@ -3431,7 +3431,8 @@ export class PrIndexStore {
           return sourceDelta;
         }
         const stateDelta =
-          pullRequestOpenStatePriority(right.pr.state) - pullRequestOpenStatePriority(left.pr.state);
+          pullRequestOpenStatePriority(right.pr.state) -
+          pullRequestOpenStatePriority(left.pr.state);
         if (stateDelta !== 0) {
           return stateDelta;
         }
@@ -3455,10 +3456,7 @@ export class PrIndexStore {
           WHERE li.pr_number = ?`,
       )
       .all(prNumber) as Array<IssueRow & { link_source: PullRequestLinkSource }>;
-    const bestByIssue = new Map<
-      number,
-      { issue: IssueRow; linkSource: PullRequestLinkSource }
-    >();
+    const bestByIssue = new Map<number, { issue: IssueRow; linkSource: PullRequestLinkSource }>();
     for (const row of rows) {
       const existing = bestByIssue.get(row.number);
       if (
