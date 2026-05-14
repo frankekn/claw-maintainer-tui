@@ -107,6 +107,14 @@ function buildHelpOverlay(
     ...queryHints,
     "",
     ...nextSteps,
+    "",
+    "LEGEND",
+    "- I = linked issues",
+    "- R = related PRs",
+    "- D = draft",
+    "- M = maintainer",
+    "- V = mark visible page seen",
+    "- U = undo",
   ];
   return {
     visible: session.helpVisible,
@@ -172,6 +180,9 @@ export function buildRenderModel(
       banner,
       queryPrompt: modeInfo.queryPrompt,
       queryValue: session.query,
+      queryCursorIndex:
+        session.queryState[session.mode as "cross-search" | "pr-search" | "issue-search"]
+          ?.cursorIndex ?? session.query.length,
       queryPlaceholder:
         session.focus === "query"
           ? ""

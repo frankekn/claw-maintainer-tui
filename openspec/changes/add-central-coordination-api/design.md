@@ -69,7 +69,9 @@ The Go module is the coordination service.
 ## Design principles
 
 ### Preserve existing seams
+
 The current repo already separates:
+
 - acquisition (`PullRequestDataSource`, `IssueDataSource`)
 - local read model and search (`PrIndexStore`)
 - TUI consumption (`TuiDataService`)
@@ -78,7 +80,9 @@ Do not rewrite those boundaries first.
 Add `ApiPullRequestDataSource` and `ApiIssueDataSource` that satisfy the existing contracts.
 
 ### Separate shared facts from local preferences
+
 Centralize:
+
 - PR/issue state
 - linked issues
 - changed files and terms
@@ -88,20 +92,25 @@ Centralize:
 - backfill and job metadata
 
 Keep local-only or per-user:
+
 - watch / ignore / seen
 - personal filters and attention decisions
 
 When centralized, attention state must be keyed by user identity.
 
 ### Separate problem from solution
+
 The analysis model must always store:
+
 - `problem_intent`
 - `solution_shape`
 
 This prevents “same human problem, different fixes” from collapsing into one opaque bucket.
 
 ### Start deterministic, add vectors later
+
 The server starts with:
+
 - linked issue overlap
 - changed-file-term overlap
 - FTS over title/body/comment and `problem_intent`
@@ -116,26 +125,32 @@ Optional vector search is phase 5+, behind a feature flag.
 ## External system choices
 
 ### GitHub
+
 Use a GitHub App.
 
 Reasons:
+
 - centralized webhook delivery
 - installation-token automation
 - user access tokens for user-attributed auth
 - org membership checks during login
 
 ### OpenClaw
+
 Use a dedicated hook agent, not the main operator agent.
 The hook agent receives external trigger work only.
 It runs with:
+
 - dedicated `hooks.token`
 - `hooks.allowedAgentIds` restricted to the triage agent
 - loopback or tailnet-only ingress
 - strict tool policy and sandboxing
 
 ### Server storage
+
 Use SQLite in WAL mode.
 Enable:
+
 - normalized relational tables
 - FTS5 for text search
 - JSON columns only where structure is genuinely open-ended
@@ -150,19 +165,24 @@ Do not make spreadsheets authoritative.
 ## Modes
 
 ### Automation mode
+
 The server authenticates as the GitHub App installation.
 Use this mode for:
+
 - webhook follow-up calls
 - hydration
 - fetching PR facts
 - backfill enumeration
 
 ### User mode
+
 The server authenticates users through GitHub App user authorization and then mints server sessions.
 
 ## Why the server brokers device flow
+
 For CLI/TUI login, the client should not hold the GitHub App client secret.
 Therefore:
+
 1. CLI calls `POST /v1/auth/device/start`
 2. Server starts GitHub device flow and returns:
    - `user_code`
@@ -183,13 +203,17 @@ Web UI can later use the normal web application flow.
 ## Session model
 
 ### Access token
+
 Short-lived bearer token for API calls.
 
 ### Refresh token
+
 Longer-lived token used only against the server’s refresh endpoint.
 
 ### User record
+
 Stored fields:
+
 - GitHub user id
 - login
 - avatar URL (optional)
@@ -197,7 +221,9 @@ Stored fields:
 - last authenticated at
 
 ### Authorization
+
 Initial role model:
+
 - `org_member`
 - `admin`
 
@@ -210,17 +236,22 @@ The system may later add repo-specific roles, but not in the first implementatio
 ## Core identity rules
 
 ### Repo identity
+
 Canonical repo key is `owner/name`.
 Internally, use numeric surrogate IDs.
 
 ### Item identity
+
 Use:
+
 - `item_kind`: `pull_request` or `issue`
 - `item_number`
 - `repo_id`
 
 ### PR analysis identity
+
 A PR analysis record is unique on:
+
 - `repo_id`
 - `pr_number`
 - `head_sha`
@@ -234,8 +265,10 @@ If the head SHA changes, the previous analysis becomes historical.
 ## Tables
 
 ### `github_webhook_events`
+
 Purpose: idempotent ingest and replay.
 Columns:
+
 - `delivery_id` TEXT PRIMARY KEY
 - `event_name` TEXT NOT NULL
 - `action` TEXT
@@ -248,6 +281,7 @@ Columns:
 - `processing_error` TEXT
 
 ### `repos`
+
 - `id`
 - `owner`
 - `name`
@@ -257,6 +291,7 @@ Columns:
 - `updated_at`
 
 ### `pull_requests`
+
 - `repo_id`
 - `number`
 - `title`
@@ -276,12 +311,15 @@ Columns:
 - `last_hydrated_at`
 
 ### `issues`
+
 - same identity pattern as pull requests
 - issue-specific state and labels
 - `last_hydrated_at`
 
 ### `item_comments`
+
 Unify issue comments, PR reviews, and review comments with:
+
 - `repo_id`
 - `item_kind`
 - `item_number`
@@ -295,25 +333,30 @@ Unify issue comments, PR reviews, and review comments with:
 - `updated_at`
 
 ### `linked_issues`
+
 - `repo_id`
 - `pr_number`
 - `issue_number`
 - `link_source`
 
 ### `changed_files`
+
 - `repo_id`
 - `pr_number`
 - `path`
 - `kind`
 
 ### `changed_file_terms`
+
 - `repo_id`
 - `pr_number`
 - `term_kind`
 - `term_value`
 
 ### `pr_review_facts`
+
 Port the current review-fact shape nearly unchanged:
+
 - `repo_key`
 - `pr_number`
 - `head_sha`
@@ -325,8 +368,10 @@ Port the current review-fact shape nearly unchanged:
 - `recorded_at`
 
 ### `maintainer_analyses`
+
 Primary shared intelligence table.
 Columns:
+
 - `id`
 - `repo_id`
 - `item_kind`
@@ -352,8 +397,10 @@ Columns:
 - `created_at`
 
 ### `analysis_relationships`
+
 Stores explicit agent decisions between analyses or between an analysis and candidate items.
 Columns:
+
 - `repo_id`
 - `source_analysis_id`
 - `target_item_kind`
@@ -364,12 +411,14 @@ Columns:
 - `reason`
 
 Relationships:
+
 - `duplicate`
 - `same_problem_variant`
 - `related`
 - `distinct`
 
 ### `clusters`
+
 - `id`
 - `repo_id`
 - `cluster_key`
@@ -379,6 +428,7 @@ Relationships:
 - `updated_at`
 
 ### `cluster_members`
+
 - `cluster_id`
 - `item_kind`
 - `item_number`
@@ -387,7 +437,9 @@ Relationships:
 - `added_at`
 
 ### `user_item_state`
+
 Central per-user watch state:
+
 - `user_id`
 - `repo_id`
 - `item_kind`
@@ -396,6 +448,7 @@ Central per-user watch state:
 - `updated_at`
 
 ### `jobs`
+
 - `id`
 - `job_type`
 - `repo_id`
@@ -411,6 +464,7 @@ Central per-user watch state:
 - `error`
 
 ### `backfill_runs`
+
 - `id`
 - `repo_id`
 - `scope`
@@ -429,9 +483,11 @@ The server speaks JSON over HTTP.
 ## Auth endpoints
 
 ### `POST /v1/auth/device/start`
+
 Starts server-brokered GitHub device flow.
 
 Response:
+
 ```json
 {
   "login_request_id": "lrq_123",
@@ -443,17 +499,21 @@ Response:
 ```
 
 ### `POST /v1/auth/device/poll`
+
 Input:
+
 ```json
 { "login_request_id": "lrq_123" }
 ```
 
 Possible responses:
+
 - `pending`
 - `authorized`
 - `expired`
 
 Authorized response:
+
 ```json
 {
   "status": "authorized",
@@ -468,15 +528,19 @@ Authorized response:
 ```
 
 ### `POST /v1/auth/refresh`
+
 Refreshes a server access token.
 
 ### `POST /v1/auth/logout`
+
 Revokes the current server session.
 
 ## Webhook endpoint
 
 ### `POST /webhooks/github`
+
 Responsibilities:
+
 - verify GitHub signature
 - dedupe on `delivery_id`
 - normalize summary state
@@ -488,11 +552,14 @@ Do not run heavy analysis inline.
 ## Repo and item endpoints
 
 ### `GET /v1/repos/{owner}/{repo}/pulls/changed?since=...`
+
 Returns PR summaries changed since the watermark.
 Purpose: API-backed sync into the current local store.
 
 ### `GET /v1/repos/{owner}/{repo}/pulls/{number}`
+
 Returns hydrated PR detail:
+
 - PR summary
 - comments
 - linked issues
@@ -501,15 +568,19 @@ Returns hydrated PR detail:
 - latest stored analysis summary
 
 ### `GET /v1/repos/{owner}/{repo}/issues/changed?since=...`
+
 Same pattern for issues.
 
 ### `GET /v1/repos/{owner}/{repo}/issues/{number}`
+
 Hydrated issue detail.
 
 ## Analysis endpoints
 
 ### `GET /v1/context/pulls/{owner}/{repo}/{number}`
+
 Returns the context bundle the OpenClaw triage agent needs:
+
 - PR summary
 - recent comments
 - linked issues with titles/bodies
@@ -519,10 +590,13 @@ Returns the context bundle the OpenClaw triage agent needs:
 - candidate related-intent items
 
 ### `GET /v1/context/issues/{owner}/{repo}/{number}`
+
 Issue equivalent.
 
 ### `POST /v1/analyses/candidate-search`
+
 Input:
+
 ```json
 {
   "repo": "owner/name",
@@ -537,13 +611,16 @@ Input:
 ```
 
 Behavior:
+
 - deterministic candidate generation using FTS, linked issues, changed-file-term overlap, labels, and recency
 - optional vector rerank later
 
 ### `POST /v1/analyses`
+
 Ingests structured maintainer analysis.
 
 Canonical payload:
+
 ```json
 {
   "repo": "owner/name",
@@ -563,11 +640,7 @@ Canonical payload:
   "ai_review_status": "not_run",
   "ci_status": "not_checked",
   "final_recommendation": "escalate",
-  "labels": [
-    "intent:auth-session-persistence",
-    "risk:medium",
-    "lane:human"
-  ],
+  "labels": ["intent:auth-session-persistence", "risk:medium", "lane:human"],
   "reviewer_candidates": ["alice", "bob"],
   "evidence": [
     "PR only changes UI text while linked issue describes state persistence.",
@@ -587,14 +660,17 @@ Canonical payload:
 ```
 
 ### `GET /v1/analyses/latest?...`
+
 Fetches the latest analysis for a given item/head SHA.
 
 ### `GET /v1/related-intents?...`
+
 Returns related clusters or items for operator views and TUI.
 
 ## Review-fact endpoints
 
 ### `POST /v1/review-facts`
+
 Accepts the same shape currently handled by `review-fact import`.
 This is the lowest-risk first worker integration.
 
@@ -605,10 +681,13 @@ This is the lowest-risk first worker integration.
 Reuse the current concept of summary versus hydrate refresh.
 
 ### Summary write
+
 Use webhook payload data to upsert lightweight PR or issue summaries immediately.
 
 ### Hydrate job
+
 Queue a hydrate when:
+
 - the item is first seen
 - the PR head SHA changed
 - payload lacks fields needed by the store
@@ -622,20 +701,24 @@ This preserves current efficiency.
 ## OpenClaw integration design
 
 ## Dedicated agent
+
 Use an agent id such as `maintainer-triage`.
 
 It should not be the user’s main operator agent.
 Its workspace should contain:
+
 - the maintainer triage skill
 - optional backfill skill
 - minimal hook-specific instructions
 
 ## Trigger path
+
 The server dispatch worker calls OpenClaw on loopback or tailnet:
 
 `POST /hooks/agent`
 
 Payload shape:
+
 ```json
 {
   "agentId": "maintainer-triage",
@@ -649,7 +732,9 @@ Payload shape:
 ```
 
 ## Triage skill responsibilities
+
 The skill must instruct the agent to:
+
 1. fetch the normalized context bundle from the API
 2. recover `problem_intent` in plain human language
 3. describe `solution_shape`
@@ -661,11 +746,14 @@ The skill must instruct the agent to:
 9. stop before Codex review if `human_attention_required=true`
 
 ## Why the agent should not own candidate generation
+
 Server-side candidate generation is cheaper, repeatable, and shared.
 The agent should decide among candidates, not search the whole universe from scratch.
 
 ## Optional later stage: ACP/Codex review
+
 After the autonomy gate passes:
+
 - the system may trigger a later review stage that uses Codex through ACP
 - this is not required for the first server rollout
 - the triage analysis must carry enough structure to gate that later stage
@@ -675,9 +763,11 @@ After the autonomy gate passes:
 ## Historical backfill design
 
 ## Coordinator
+
 Use a server-side backfill coordinator, not a separate reasoning model.
 
 Responsibilities:
+
 - enumerate existing items from GitHub using installation auth
 - write summary state
 - enqueue hydrate jobs
@@ -686,23 +776,29 @@ Responsibilities:
 - respect repo and time-range filters
 
 ## Initial backfill scope
+
 MVP order:
+
 1. open PRs
 2. open issues
 3. merged PRs from last 90 days
 4. closed issues only when explicitly requested
 
 ## Resume rules
+
 A backfill run is resumable if the server restarts.
 Store cursor state in `backfill_runs.cursor_json`.
 
 ## Reanalysis rules
+
 Do not re-run expensive analysis when:
+
 - the same item has the same head SHA
 - the same analyzer and schema version already produced a success record
 - no force-recompute flag is present
 
 Do re-run when:
+
 - head SHA changed
 - analyzer version changed
 - schema version changed
@@ -714,7 +810,9 @@ Do re-run when:
 ## Dedupe and clustering design
 
 ## Signals
+
 Candidate generation uses:
+
 1. exact linked-issue overlap
 2. changed-file-term overlap
 3. FTS over title/body/comments and previous `problem_intent`
@@ -723,17 +821,21 @@ Candidate generation uses:
 6. optional vector rerank later
 
 ## Problem-first clustering
+
 A cluster is a family of items solving the same human problem.
 Different solution variants can live in one cluster.
 
 ## Relationship semantics
+
 - `duplicate`: same problem, materially same fix direction
 - `same_problem_variant`: same problem, different fix direction or scope
 - `related`: nearby but not same family
 - `distinct`: not the same family
 
 ## Reviewer hints
+
 Phase 5 reviewer hints can be heuristic:
+
 - recent reviewers on similar changed-file terms
 - authors of recent accepted fixes in the same area
 - maintainers historically involved in the linked issues
@@ -745,20 +847,26 @@ Store these as suggestions, never as required routing.
 ## Client integration design
 
 ## New API-backed data sources
+
 Add:
+
 - `ApiPullRequestDataSource`
 - `ApiIssueDataSource`
 
 They must satisfy the current interfaces used by the store.
 
 ## Local store remains
+
 The local SQLite store still exists as a read model for:
+
 - TUI speed
 - offline-ish operation after sync
 - local search / clustering reuse during transition
 
 ## API-aware CLI
+
 Add commands:
+
 - `clawlens auth login --api-url ...`
 - `clawlens auth status`
 - `clawlens auth logout`
@@ -768,6 +876,7 @@ Add commands:
 Keep existing `gh`-backed behavior as the default when no API URL is configured.
 
 ## Attention state migration
+
 Current local attention state is repo-wide local state.
 Central mode must use `user_item_state`.
 If central mode is enabled, TUI writes attention changes to the API first, then mirrors them locally.
@@ -779,12 +888,15 @@ If central mode is enabled, TUI writes attention changes to the API first, then 
 Use export, not source-of-truth.
 
 ## Exports
+
 Add:
+
 - `GET /v1/exports/triage.csv`
 - `GET /v1/exports/clusters.csv`
 - `GET /v1/exports/review-facts.csv`
 
 Fields should be operator-friendly:
+
 - repo
 - item kind
 - number
@@ -800,7 +912,9 @@ Fields should be operator-friendly:
 - updated at
 
 ## Why not spreadsheet as source-of-truth
+
 A spreadsheet does not provide:
+
 - webhook-safe idempotency
 - typed relationships
 - efficient search
@@ -815,17 +929,21 @@ Use CSV or sheet export for sorting and human review only.
 ## Failure handling and observability
 
 ## Idempotency
+
 - webhook dedupe on delivery id
 - analysis dedupe on item + head SHA + analyzer + schema
 - job dedupe on job type + item identity + head SHA + status window
 
 ## Retries
+
 - exponential backoff for GitHub hydration failures
 - capped retries for OpenClaw dispatch failures
 - dead-letter state in `jobs`
 
 ## Metrics
+
 Track:
+
 - webhook ingest latency
 - normalize latency
 - hydration success rate
@@ -835,7 +953,9 @@ Track:
 - related-intent query latency
 
 ## Logs
+
 Each request and job should include:
+
 - request/job id
 - repo
 - item kind
@@ -849,16 +969,19 @@ Each request and job should include:
 ## Testing strategy
 
 ## Go server
+
 - unit tests for auth, webhook verification, normalization, storage, and job dedupe
 - integration tests with fixture webhook payloads and SQLite temp DBs
 - API contract tests for auth, changed feeds, and analysis ingest
 
 ## TypeScript client
+
 - tests for API-backed data-source adapters
 - tests for CLI auth command flows using mocked server responses
 - regression tests that local-only flows still work when no API config exists
 
 ## OpenClaw skill artifacts
+
 - prompt snapshot tests or golden files for generated analysis payload shape
 - fixture-driven tests for context-bundle parsing if helper scripts exist
 
@@ -867,10 +990,13 @@ Each request and job should include:
 ## Phase plan
 
 ### Phase 0
+
 Land OpenSpec files and directory scaffolding.
 
 ### Phase 1
+
 Implement:
+
 - `/server` module
 - config loading
 - SQLite schema
@@ -880,7 +1006,9 @@ Implement:
 - hydrate/analyze job tables
 
 ### Phase 2
+
 Implement:
+
 - auth device-flow broker
 - refresh/logout
 - repo change feeds
@@ -888,7 +1016,9 @@ Implement:
 - review-fact ingest
 
 ### Phase 3
+
 Implement:
+
 - OpenClaw dispatch client
 - `maintainer-triage` skill
 - context endpoints
@@ -896,14 +1026,18 @@ Implement:
 - latest-analysis lookup
 
 ### Phase 4
+
 Implement:
+
 - backfill coordinator
 - resumable cursors
 - operator-triggered backfill endpoints
 - skip rules for already-analyzed head SHAs
 
 ### Phase 5
+
 Implement:
+
 - candidate-search endpoint
 - relationship persistence
 - cluster tables
@@ -911,14 +1045,18 @@ Implement:
 - reviewer hints
 
 ### Phase 6
+
 Implement:
+
 - API-backed data sources in TypeScript
 - CLI auth/config
 - optional TUI central mode
 - per-user attention state sync
 
 ### Phase 7
+
 Implement:
+
 - CSV exports
 - metrics/logging polish
 - docs and rollout guide

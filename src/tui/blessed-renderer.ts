@@ -33,7 +33,7 @@ export function getUrlOpenCommand(
 
 export class BlessedTuiRenderer {
   private readonly screen = blessed.screen({
-    smartCSR: false,
+    fastCSR: true,
     dockBorders: true,
     fullUnicode: true,
     autoPadding: false,
@@ -75,9 +75,7 @@ export class BlessedTuiRenderer {
       width: "100%",
       height: TUI_THEME.layout.tabsHeight,
       tags: true,
-      border: "line",
       style: {
-        border: { fg: TUI_THEME.colors.border },
         fg: TUI_THEME.colors.text,
         bg: TUI_THEME.colors.panelBg,
       },
@@ -163,13 +161,6 @@ export class BlessedTuiRenderer {
   }
 
   private render(model: TuiRenderModel): void {
-    (this.screen as blessed.Widgets.Screen & { realloc: () => void }).realloc();
-    this.screen.clearRegion(0, this.screen.cols, 0, this.screen.rows);
-    (
-      this.screen as blessed.Widgets.Screen & {
-        program?: { clearScreen?: () => void };
-      }
-    ).program?.clearScreen?.();
     const layoutChanged = this.transitionLayout(model);
     this.headerBox.setContent(formatHeader(model.header));
     this.tabsBox.setLabel(panelLabel("MODES"));
@@ -218,20 +209,22 @@ export class BlessedTuiRenderer {
         }`
       : `${keyLabel("STATUS")} ${statusTone}${listSummary ? `  ${listSummary}` : ""}`;
     this.messageBox.setContent(
-      `${bannerLine}\n${keyLabel("ACTIONS")} ${formatActionBar(model.footer.actions)}  ${keyLabel("KEYS")} ${formatActionBar(
-        model.footer.keys,
-      )}${model.footer.autoUpdateHint ? `  ${keyLabel("AUTO")} ${text(model.footer.autoUpdateHint, "dim")}` : ""}`,
+      `${bannerLine}  ${keyLabel("ACTIONS")} ${formatActionBar(model.footer.actions)}`,
     );
     const promptPrefix = `${keyLabel("QUERY")} ${text(model.footer.queryPrompt.toUpperCase(), "dim")} >`;
-    const queryValue =
-      model.footer.queryValue.length > 0
-        ? text(model.footer.queryValue)
-        : model.focus === "query"
-          ? ""
-          : text(model.footer.queryPlaceholder, "dim");
+    const rawQuery = model.footer.queryValue;
+    const cursorIndex = model.footer.queryCursorIndex;
     const cursor = model.focus === "query" ? "█" : "";
+    const beforeCursor = rawQuery.length > 0 ? text(rawQuery.slice(0, cursorIndex)) : "";
+    const afterCursor = rawQuery.length > 0 ? text(rawQuery.slice(cursorIndex)) : "";
+    const queryDisplay =
+      rawQuery.length > 0
+        ? `${beforeCursor}${cursor}${afterCursor}`
+        : model.focus === "query"
+          ? cursor
+          : text(model.footer.queryPlaceholder, "dim");
     this.inputBox.setContent(
-      `${promptPrefix} ${queryValue}${cursor}${model.footer.queryHelpText ? `  ${text(model.footer.queryHelpText, "dim")}` : ""}`,
+      `${promptPrefix} ${queryDisplay}${model.footer.queryHelpText ? `  ${text(model.footer.queryHelpText, "dim")}` : ""}`,
     );
     this.updateFocusStyle(model);
     this.syncScroll(model);
@@ -338,7 +331,9 @@ export class BlessedTuiRenderer {
   }
 
   private updateFocusStyle(model: TuiRenderModel): void {
-    this.tabsBox.style.border.fg = TUI_THEME.colors.border;
+    if (this.tabsBox.style.border) {
+      this.tabsBox.style.border.fg = TUI_THEME.colors.border;
+    }
     this.resultsBox.style.border.fg =
       model.focus === "results" ? TUI_THEME.colors.focus : TUI_THEME.colors.border;
     this.detailBox.style.border.fg =
@@ -383,10 +378,16 @@ export class BlessedTuiRenderer {
     }
     this.controller.noteInteraction();
     const action = resolveKeyAction(this.controller.getRenderModel(), ch, key);
+    if (action.kind !== "command" || action.command.type !== "confirm_quit") {
+      this.controller.clearQuitConfirm();
+    }
     try {
       switch (action.kind) {
         case "command":
           await this.controller.dispatch(action.command);
+          if (this.controller.shouldExit()) {
+            this.destroyScreen();
+          }
           return;
         case "detail-scroll":
           this.detailBox.scroll(action.delta);
@@ -419,9 +420,6 @@ export class BlessedTuiRenderer {
         case "help-end":
           this.helpBox.setScrollPerc(100);
           this.screen.render();
-          return;
-        case "quit":
-          this.destroyScreen();
           return;
         case "open-url":
           await this.openActiveUrl();

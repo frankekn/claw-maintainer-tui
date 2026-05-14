@@ -1,8 +1,8 @@
 export const TUI_THEME = {
   layout: {
     headerHeight: 1,
-    tabsHeight: 3,
-    footerHeight: 2,
+    tabsHeight: 1,
+    footerHeight: 1,
     queryHeight: 1,
     detailWidth: "36%",
     resultsWidthWithDetail: "64%",
@@ -137,7 +137,12 @@ export function selectedLine(textValue: string, active = true): string {
       "bold",
     );
   }
-  return wrap(textValue, `${TUI_THEME.colors.focus}-fg`, "bold");
+  return wrap(
+    textValue,
+    `${TUI_THEME.colors.text}-fg`,
+    `${TUI_THEME.colors.borderSoft}-bg`,
+    "bold",
+  );
 }
 
 export function valueTone(textValue: string, tone: "ok" | "warn" | "error" | "muted"): string {
