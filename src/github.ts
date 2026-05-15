@@ -461,16 +461,24 @@ export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueD
 
   async *listAllPullRequests(
     repo: RepoRef,
-    options: { limit?: number; newestFirst?: boolean } = {},
+    options: {
+      limit?: number;
+      newestFirst?: boolean;
+      sort?: "created" | "updated";
+      direction?: "asc" | "desc";
+      startPage?: number;
+    } = {},
   ): AsyncGenerator<PullRequestRecord> {
     if (options.limit !== undefined && options.limit <= 0) {
       return;
     }
-    const direction = options.newestFirst ? "desc" : "asc";
+    const sort = options.sort ?? "created";
+    const direction = options.direction ?? (options.newestFirst ? "desc" : "asc");
+    const startPage = Math.max(1, options.startPage ?? 1);
     let yielded = 0;
-    for (let page = 1; ; page += 1) {
+    for (let page = startPage; ; page += 1) {
       const items = await this.fetchJson<RestPullRequest[]>(
-        `repos/${repo.owner}/${repo.name}/pulls?state=all&sort=created&direction=${direction}&per_page=${PAGE_SIZE}&page=${page}`,
+        `repos/${repo.owner}/${repo.name}/pulls?state=all&sort=${sort}&direction=${direction}&per_page=${PAGE_SIZE}&page=${page}`,
       );
       if (items.length === 0) {
         break;
@@ -528,16 +536,24 @@ export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueD
 
   async *listAllIssues(
     repo: RepoRef,
-    options: { limit?: number; newestFirst?: boolean } = {},
+    options: {
+      limit?: number;
+      newestFirst?: boolean;
+      sort?: "created" | "updated";
+      direction?: "asc" | "desc";
+      startPage?: number;
+    } = {},
   ): AsyncGenerator<IssueRecord> {
     if (options.limit !== undefined && options.limit <= 0) {
       return;
     }
-    const direction = options.newestFirst ? "desc" : "asc";
+    const sort = options.sort ?? "created";
+    const direction = options.direction ?? (options.newestFirst ? "desc" : "asc");
+    const startPage = Math.max(1, options.startPage ?? 1);
     let yielded = 0;
-    for (let page = 1; ; page += 1) {
+    for (let page = startPage; ; page += 1) {
       const items = await this.fetchJson<RestIssue[]>(
-        `repos/${repo.owner}/${repo.name}/issues?state=all&sort=created&direction=${direction}&per_page=${PAGE_SIZE}&page=${page}`,
+        `repos/${repo.owner}/${repo.name}/issues?state=all&sort=${sort}&direction=${direction}&per_page=${PAGE_SIZE}&page=${page}`,
       );
       if (items.length === 0) {
         break;

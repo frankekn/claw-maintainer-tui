@@ -12,6 +12,11 @@ import type {
   SyncSummary,
 } from "../types.js";
 
+export const HOT_PR_LIMIT = 500;
+export const HOT_ISSUE_LIMIT = 500;
+export const BACKFILL_PAGES_PER_SLICE = 2;
+export const PAGE_SIZE = 100;
+
 export type PullRequestSyncWorkflowResult = {
   summary: SyncSummary;
   touchedPrNumbers: number[];
@@ -286,5 +291,377 @@ export async function syncIssuesWorkflow(params: {
     vectorAvailable: params.vectorAvailable,
     lastSyncAt: syncedAt,
     lastSyncWatermark: syncStartedAt,
+  };
+}
+
+export async function syncHotPullRequestsWorkflow(params: {
+  repo: RepoRef;
+  source: PullRequestDataSource;
+  onProgress?: (event: SyncProgressEvent) => void;
+  repoName: string;
+  vectorAvailable: boolean;
+  upsertPullRequestSummary: (pr: PullRequestRecord, authority: "authoritative" | "partial") => void;
+  setMeta: (key: string, value: string) => void;
+  countRows: (table: string) => number;
+  existingLastSyncWatermark: string | null;
+  metaKeys: {
+    repo: string;
+    hotSyncAt: string;
+  };
+}): Promise<SyncSummary> {
+  const hotSyncAt = isoNow();
+  params.setMeta(params.metaKeys.repo, params.repoName);
+
+  let processedPrs = 0;
+  const skippedPrs = 0;
+  const emitProgress = (
+    phase: SyncProgressEvent["phase"],
+    currentId: number | null = null,
+    currentTitle: string | null = null,
+  ) => {
+    params.onProgress?.({
+      entity: "prs",
+      phase,
+      processed: processedPrs,
+      skipped: skippedPrs,
+      queued: 0,
+      totalKnown: null,
+      currentId,
+      currentTitle,
+    });
+  };
+
+  for await (const pr of params.source.listAllPullRequests(params.repo, {
+    sort: "updated",
+    direction: "desc",
+    limit: HOT_PR_LIMIT,
+  })) {
+    emitProgress("syncing", pr.number, pr.title);
+    params.upsertPullRequestSummary(pr, "partial");
+    processedPrs += 1;
+    emitProgress("syncing", pr.number, pr.title);
+  }
+
+  params.setMeta(params.metaKeys.hotSyncAt, hotSyncAt);
+  emitProgress("complete");
+
+  return {
+    mode: "hot",
+    entity: "prs",
+    repo: params.repoName,
+    processedPrs,
+    processedIssues: 0,
+    skippedPrs,
+    skippedIssues: 0,
+    docCount: params.countRows("search_docs"),
+    commentCount: params.countRows("pr_comments"),
+    labelCount: params.countRows("pr_labels"),
+    vectorAvailable: params.vectorAvailable,
+    lastSyncAt: hotSyncAt,
+    lastSyncWatermark: params.existingLastSyncWatermark,
+  };
+}
+
+export async function syncHotIssuesWorkflow(params: {
+  repo: RepoRef;
+  source: IssueDataSource;
+  onProgress?: (event: SyncProgressEvent) => void;
+  repoName: string;
+  vectorAvailable: boolean;
+  upsertIssue: (issue: IssueRecord) => void;
+  setMeta: (key: string, value: string) => void;
+  countRows: (table: string) => number;
+  existingLastSyncWatermark: string | null;
+  metaKeys: {
+    repo: string;
+    hotSyncAt: string;
+  };
+}): Promise<SyncSummary> {
+  const hotSyncAt = isoNow();
+  params.setMeta(params.metaKeys.repo, params.repoName);
+
+  let processedIssues = 0;
+  const skippedIssues = 0;
+  const emitProgress = (
+    phase: SyncProgressEvent["phase"],
+    currentId: number | null = null,
+    currentTitle: string | null = null,
+  ) => {
+    params.onProgress?.({
+      entity: "issues",
+      phase,
+      processed: processedIssues,
+      skipped: skippedIssues,
+      queued: 0,
+      totalKnown: null,
+      currentId,
+      currentTitle,
+    });
+  };
+
+  for await (const issue of params.source.listAllIssues(params.repo, {
+    sort: "updated",
+    direction: "desc",
+    limit: HOT_ISSUE_LIMIT,
+  })) {
+    emitProgress("syncing", issue.number, issue.title);
+    params.upsertIssue(issue);
+    processedIssues += 1;
+    emitProgress("syncing", issue.number, issue.title);
+  }
+
+  params.setMeta(params.metaKeys.hotSyncAt, hotSyncAt);
+  emitProgress("complete");
+
+  return {
+    mode: "hot",
+    entity: "issues",
+    repo: params.repoName,
+    processedPrs: 0,
+    processedIssues,
+    skippedPrs: 0,
+    skippedIssues,
+    docCount: params.countRows("search_docs"),
+    commentCount: params.countRows("pr_comments"),
+    labelCount: params.countRows("issue_labels"),
+    vectorAvailable: params.vectorAvailable,
+    lastSyncAt: hotSyncAt,
+    lastSyncWatermark: params.existingLastSyncWatermark,
+  };
+}
+
+export async function backfillPullRequestsWorkflow(params: {
+  repo: RepoRef;
+  source: PullRequestDataSource;
+  onProgress?: (event: SyncProgressEvent) => void;
+  repoName: string;
+  vectorAvailable: boolean;
+  upsertPullRequestSummary: (pr: PullRequestRecord, authority: "authoritative" | "partial") => void;
+  setMeta: (key: string, value: string) => void;
+  countRows: (table: string) => number;
+  cursor: number | null;
+  completedAt: string | null;
+  metaKeys: {
+    repo: string;
+    backfillCursor: string;
+    backfillCompletedAt: string;
+  };
+}): Promise<SyncSummary> {
+  if (params.completedAt) {
+    return {
+      mode: "backfill",
+      entity: "prs",
+      repo: params.repoName,
+      processedPrs: 0,
+      processedIssues: 0,
+      skippedPrs: 0,
+      skippedIssues: 0,
+      docCount: params.countRows("search_docs"),
+      commentCount: params.countRows("pr_comments"),
+      labelCount: params.countRows("pr_labels"),
+      vectorAvailable: params.vectorAvailable,
+      lastSyncAt: null,
+      lastSyncWatermark: null,
+      reason: "backfill_complete",
+      nextBackfillCursor: null,
+    };
+  }
+  params.setMeta(params.metaKeys.repo, params.repoName);
+
+  const startCursor = Math.max(1, params.cursor ?? 1);
+  let cursor = startCursor;
+  let processedPrs = 0;
+  let itemsInCurrentPage = 0;
+  let lastPageWasPartial = false;
+
+  const emitProgress = (
+    phase: SyncProgressEvent["phase"],
+    currentId: number | null = null,
+    currentTitle: string | null = null,
+  ) => {
+    params.onProgress?.({
+      entity: "prs",
+      phase,
+      processed: processedPrs,
+      skipped: 0,
+      queued: 0,
+      totalKnown: null,
+      currentId,
+      currentTitle,
+    });
+  };
+
+  const limit = BACKFILL_PAGES_PER_SLICE * PAGE_SIZE;
+  let yielded = 0;
+  for await (const pr of params.source.listAllPullRequests(params.repo, {
+    sort: "created",
+    direction: "asc",
+    startPage: cursor,
+    limit,
+  })) {
+    emitProgress("syncing", pr.number, pr.title);
+    params.upsertPullRequestSummary(pr, "partial");
+    processedPrs += 1;
+    yielded += 1;
+    itemsInCurrentPage += 1;
+    if (itemsInCurrentPage >= PAGE_SIZE) {
+      cursor += 1;
+      params.setMeta(params.metaKeys.backfillCursor, String(cursor));
+      itemsInCurrentPage = 0;
+    }
+    emitProgress("syncing", pr.number, pr.title);
+  }
+
+  // If the last page (or only page) returned a partial result, the data source has been exhausted.
+  if (itemsInCurrentPage > 0) {
+    lastPageWasPartial = true;
+    cursor += 1;
+    params.setMeta(params.metaKeys.backfillCursor, String(cursor));
+  } else if (yielded < limit) {
+    // We may have yielded an exact page boundary but no further pages exist.
+    lastPageWasPartial = true;
+  }
+
+  let nextBackfillCursor: number | null = cursor;
+  if (lastPageWasPartial) {
+    const completedAt = isoNow();
+    params.setMeta(params.metaKeys.backfillCompletedAt, completedAt);
+    nextBackfillCursor = null;
+  }
+
+  emitProgress("complete");
+
+  return {
+    mode: "backfill",
+    entity: "prs",
+    repo: params.repoName,
+    processedPrs,
+    processedIssues: 0,
+    skippedPrs: 0,
+    skippedIssues: 0,
+    docCount: params.countRows("search_docs"),
+    commentCount: params.countRows("pr_comments"),
+    labelCount: params.countRows("pr_labels"),
+    vectorAvailable: params.vectorAvailable,
+    lastSyncAt: null,
+    lastSyncWatermark: null,
+    nextBackfillCursor,
+  };
+}
+
+export async function backfillIssuesWorkflow(params: {
+  repo: RepoRef;
+  source: IssueDataSource;
+  onProgress?: (event: SyncProgressEvent) => void;
+  repoName: string;
+  vectorAvailable: boolean;
+  upsertIssue: (issue: IssueRecord) => void;
+  setMeta: (key: string, value: string) => void;
+  countRows: (table: string) => number;
+  cursor: number | null;
+  completedAt: string | null;
+  metaKeys: {
+    repo: string;
+    backfillCursor: string;
+    backfillCompletedAt: string;
+  };
+}): Promise<SyncSummary> {
+  if (params.completedAt) {
+    return {
+      mode: "backfill",
+      entity: "issues",
+      repo: params.repoName,
+      processedPrs: 0,
+      processedIssues: 0,
+      skippedPrs: 0,
+      skippedIssues: 0,
+      docCount: params.countRows("search_docs"),
+      commentCount: params.countRows("pr_comments"),
+      labelCount: params.countRows("issue_labels"),
+      vectorAvailable: params.vectorAvailable,
+      lastSyncAt: null,
+      lastSyncWatermark: null,
+      reason: "backfill_complete",
+      nextBackfillCursor: null,
+    };
+  }
+  params.setMeta(params.metaKeys.repo, params.repoName);
+
+  const startCursor = Math.max(1, params.cursor ?? 1);
+  let cursor = startCursor;
+  let processedIssues = 0;
+  let itemsInCurrentPage = 0;
+  let lastPageWasPartial = false;
+
+  const emitProgress = (
+    phase: SyncProgressEvent["phase"],
+    currentId: number | null = null,
+    currentTitle: string | null = null,
+  ) => {
+    params.onProgress?.({
+      entity: "issues",
+      phase,
+      processed: processedIssues,
+      skipped: 0,
+      queued: 0,
+      totalKnown: null,
+      currentId,
+      currentTitle,
+    });
+  };
+
+  const limit = BACKFILL_PAGES_PER_SLICE * PAGE_SIZE;
+  let yielded = 0;
+  for await (const issue of params.source.listAllIssues(params.repo, {
+    sort: "created",
+    direction: "asc",
+    startPage: cursor,
+    limit,
+  })) {
+    emitProgress("syncing", issue.number, issue.title);
+    params.upsertIssue(issue);
+    processedIssues += 1;
+    yielded += 1;
+    itemsInCurrentPage += 1;
+    if (itemsInCurrentPage >= PAGE_SIZE) {
+      cursor += 1;
+      params.setMeta(params.metaKeys.backfillCursor, String(cursor));
+      itemsInCurrentPage = 0;
+    }
+    emitProgress("syncing", issue.number, issue.title);
+  }
+
+  if (itemsInCurrentPage > 0) {
+    lastPageWasPartial = true;
+    cursor += 1;
+    params.setMeta(params.metaKeys.backfillCursor, String(cursor));
+  } else if (yielded < limit) {
+    lastPageWasPartial = true;
+  }
+
+  let nextBackfillCursor: number | null = cursor;
+  if (lastPageWasPartial) {
+    const completedAt = isoNow();
+    params.setMeta(params.metaKeys.backfillCompletedAt, completedAt);
+    nextBackfillCursor = null;
+  }
+
+  emitProgress("complete");
+
+  return {
+    mode: "backfill",
+    entity: "issues",
+    repo: params.repoName,
+    processedPrs: 0,
+    processedIssues,
+    skippedPrs: 0,
+    skippedIssues: 0,
+    docCount: params.countRows("search_docs"),
+    commentCount: params.countRows("pr_comments"),
+    labelCount: params.countRows("issue_labels"),
+    vectorAvailable: params.vectorAvailable,
+    lastSyncAt: null,
+    lastSyncWatermark: null,
+    nextBackfillCursor,
   };
 }

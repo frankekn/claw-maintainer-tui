@@ -21,6 +21,22 @@ import type {
 const repo: RepoRef = { owner: "openclaw", name: "openclaw" };
 const MISSING_MODEL = "/tmp/clawlens-missing-model.gguf";
 
+type ListAllPrCallOptions = {
+  limit?: number;
+  newestFirst?: boolean;
+  sort?: "created" | "updated";
+  direction?: "asc" | "desc";
+  startPage?: number;
+};
+
+type ListAllIssueCallOptions = {
+  limit?: number;
+  newestFirst?: boolean;
+  sort?: "created" | "updated";
+  direction?: "asc" | "desc";
+  startPage?: number;
+};
+
 class FakePullRequestDataSource implements PullRequestDataSource {
   private readonly hydrated = new Map<number, HydratedPullRequest>();
   private readonly facts = new Map<number, PullRequestFactRecord>();
@@ -31,6 +47,9 @@ class FakePullRequestDataSource implements PullRequestDataSource {
   summaryCalls: number[] = [];
   factCalls: number[] = [];
   searchCalls: Array<{ query: string; state: "open" | "closed"; limit: number }> = [];
+  listAllPrCalls: ListAllPrCallOptions[] = [];
+  pageSize = 100;
+  failAfterYielding: number | null = null;
   searchDelayMs = 0;
   searchError: Error | null = null;
   activeSearchCalls = 0;
@@ -61,10 +80,38 @@ class FakePullRequestDataSource implements PullRequestDataSource {
     this.searchResults.set(`${state}:${query}`, [...prNumbers]);
   }
 
-  async *listAllPullRequests(_repo: RepoRef): AsyncGenerator<PullRequestRecord> {
-    const items = Array.from(this.hydrated.values()).sort((a, b) => a.pr.number - b.pr.number);
-    for (const item of items) {
-      yield item.pr;
+  async *listAllPullRequests(
+    _repo: RepoRef,
+    options: ListAllPrCallOptions = {},
+  ): AsyncGenerator<PullRequestRecord> {
+    this.listAllPrCalls.push({ ...options });
+    const sort = options.sort ?? "created";
+    const direction = options.direction ?? (options.newestFirst ? "desc" : "asc");
+    const sorted = Array.from(this.hydrated.values())
+      .map((item) => item.pr)
+      .sort((a, b) => {
+        const cmpField = sort === "updated" ? "updatedAt" : "createdAt";
+        const left = a[cmpField];
+        const right = b[cmpField];
+        if (left === right) {
+          return a.number - b.number;
+        }
+        return direction === "desc" ? right.localeCompare(left) : left.localeCompare(right);
+      });
+    const startPage = Math.max(1, options.startPage ?? 1);
+    const skip = (startPage - 1) * this.pageSize;
+    const limit = options.limit;
+    let yielded = 0;
+    for (let index = skip; index < sorted.length; index += 1) {
+      const item = sorted[index]!;
+      yield item;
+      yielded += 1;
+      if (this.failAfterYielding !== null && yielded >= this.failAfterYielding) {
+        throw new Error("simulated listAllPullRequests failure");
+      }
+      if (limit !== undefined && yielded >= limit) {
+        return;
+      }
     }
   }
 
@@ -139,6 +186,9 @@ class FakeIssueDataSource implements IssueDataSource {
   changedIssueNumbers: number[] = [];
   changedIssues: IssueRecord[] = [];
   getIssueCalls: number[] = [];
+  listAllIssueCalls: ListAllIssueCallOptions[] = [];
+  pageSize = 100;
+  failAfterYielding: number | null = null;
 
   constructor(items: IssueRecord[]) {
     for (const item of items) {
@@ -150,10 +200,36 @@ class FakeIssueDataSource implements IssueDataSource {
     this.issues.set(item.number, item);
   }
 
-  async *listAllIssues(_repo: RepoRef): AsyncGenerator<IssueRecord> {
-    const items = Array.from(this.issues.values()).sort((a, b) => a.number - b.number);
-    for (const item of items) {
+  async *listAllIssues(
+    _repo: RepoRef,
+    options: ListAllIssueCallOptions = {},
+  ): AsyncGenerator<IssueRecord> {
+    this.listAllIssueCalls.push({ ...options });
+    const sort = options.sort ?? "created";
+    const direction = options.direction ?? (options.newestFirst ? "desc" : "asc");
+    const sorted = Array.from(this.issues.values()).sort((a, b) => {
+      const cmpField = sort === "updated" ? "updatedAt" : "createdAt";
+      const left = a[cmpField];
+      const right = b[cmpField];
+      if (left === right) {
+        return a.number - b.number;
+      }
+      return direction === "desc" ? right.localeCompare(left) : left.localeCompare(right);
+    });
+    const startPage = Math.max(1, options.startPage ?? 1);
+    const skip = (startPage - 1) * this.pageSize;
+    const limit = options.limit;
+    let yielded = 0;
+    for (let index = skip; index < sorted.length; index += 1) {
+      const item = sorted[index]!;
       yield item;
+      yielded += 1;
+      if (this.failAfterYielding !== null && yielded >= this.failAfterYielding) {
+        throw new Error("simulated listAllIssues failure");
+      }
+      if (limit !== undefined && yielded >= limit) {
+        return;
+      }
     }
   }
 
@@ -2396,6 +2472,243 @@ describe("PrIndexStore", () => {
     expect(bundle?.mergeReadiness).toMatchObject({
       source: "review_fact",
       summary: "Repo A review fact should win.",
+    });
+  });
+
+  describe("hot metadata sync", () => {
+    it("requests updated-desc ordering and writes only the hot timestamp", async () => {
+      const store = await createStore();
+      const prA = makePullRequest(70001, {
+        title: "hot pr a",
+        body: "Hot sync candidate.",
+        updatedAt: "2026-03-10T00:00:00.000Z",
+        createdAt: "2026-03-09T00:00:00.000Z",
+      });
+      const prB = makePullRequest(70002, {
+        title: "hot pr b",
+        body: "Hot sync candidate.",
+        updatedAt: "2026-03-12T00:00:00.000Z",
+        createdAt: "2026-03-08T00:00:00.000Z",
+      });
+      const source = new FakePullRequestDataSource([prA, prB]);
+
+      await store.sync({ repo, source, full: true, hydrateAll: false });
+      const statusBefore = await store.status();
+      const watermarkBefore = statusBefore.lastSyncWatermark;
+      source.hydrateCalls = [];
+      source.factCalls = [];
+      source.listAllPrCalls = [];
+
+      const summary = await store.syncHotPullRequests({ repo, source });
+
+      expect(summary.mode).toBe("hot");
+      expect(summary.processedPrs).toBe(2);
+      expect(summary.entity).toBe("prs");
+      expect(source.listAllPrCalls).toHaveLength(1);
+      expect(source.listAllPrCalls[0]).toMatchObject({
+        sort: "updated",
+        direction: "desc",
+        limit: 500,
+      });
+      expect(source.hydrateCalls).toEqual([]);
+      expect(source.factCalls).toEqual([]);
+
+      const statusAfter = await store.status();
+      expect(statusAfter.prHotSyncAt).not.toBeNull();
+      expect(statusAfter.lastSyncWatermark).toBe(watermarkBefore);
+      expect(summary.lastSyncWatermark).toBe(watermarkBefore);
+    });
+
+    it("does not hydrate PRs or call comment fetchers during hot sync", async () => {
+      const store = await createStore();
+      const pr = makePullRequest(70010);
+      const source = new FakePullRequestDataSource([pr]);
+
+      await store.syncHotPullRequests({ repo, source });
+
+      expect(source.hydrateCalls).toEqual([]);
+      expect(source.factCalls).toEqual([]);
+      expect(source.summaryCalls).toEqual([]);
+    });
+
+    it("syncHotIssues writes only the issue hot timestamp", async () => {
+      const store = await createStore();
+      const issueA = makeIssue(80001, {
+        updatedAt: "2026-03-10T00:00:00.000Z",
+        createdAt: "2026-03-09T00:00:00.000Z",
+      });
+      const issueB = makeIssue(80002, {
+        updatedAt: "2026-03-12T00:00:00.000Z",
+        createdAt: "2026-03-08T00:00:00.000Z",
+      });
+      const issueSource = new FakeIssueDataSource([issueA, issueB]);
+
+      await store.syncIssues({ repo, source: issueSource, full: true });
+      const statusBefore = await store.status();
+      const issueWatermarkBefore = statusBefore.issueLastSyncWatermark;
+      issueSource.listAllIssueCalls = [];
+
+      const summary = await store.syncHotIssues({ repo, source: issueSource });
+
+      expect(summary.mode).toBe("hot");
+      expect(summary.processedIssues).toBe(2);
+      expect(summary.entity).toBe("issues");
+      expect(issueSource.listAllIssueCalls[0]).toMatchObject({
+        sort: "updated",
+        direction: "desc",
+        limit: 500,
+      });
+
+      const statusAfter = await store.status();
+      expect(statusAfter.issueHotSyncAt).not.toBeNull();
+      expect(statusAfter.issueLastSyncWatermark).toBe(issueWatermarkBefore);
+    });
+
+    it("returns processedPrs > 0 and mode 'hot' for the SyncSummary contract", async () => {
+      const store = await createStore();
+      const source = new FakePullRequestDataSource([
+        makePullRequest(70100),
+        makePullRequest(70101),
+      ]);
+
+      const summary = await store.syncHotPullRequests({ repo, source });
+
+      expect(summary.mode).toBe("hot");
+      expect(summary.processedPrs).toBeGreaterThan(0);
+      expect(summary.processedIssues).toBe(0);
+    });
+  });
+
+  describe("resumable backfill", () => {
+    function makeManyPrs(count: number, startNumber = 90000): HydratedPullRequest[] {
+      const out: HydratedPullRequest[] = [];
+      for (let index = 0; index < count; index += 1) {
+        const dayIndex = String(index + 1).padStart(2, "0");
+        out.push(
+          makePullRequest(startNumber + index, {
+            createdAt: `2025-01-${dayIndex}T00:00:00.000Z`,
+            updatedAt: `2025-01-${dayIndex}T00:00:00.000Z`,
+          }),
+        );
+      }
+      return out;
+    }
+
+    it("advances the cursor after each fully processed page", async () => {
+      const store = await createStore();
+      // 250 PRs => 3 pages (100, 100, 50). One slice = 2 pages = 200 items.
+      const source = new FakePullRequestDataSource(makeManyPrs(250));
+
+      const summary = await store.runBackfillSlice({ entity: "prs", repo, source });
+
+      expect(summary.mode).toBe("backfill");
+      expect(summary.processedPrs).toBe(200);
+      // Start was page 1; after two complete pages cursor advances to 3.
+      expect(summary.nextBackfillCursor).toBe(3);
+      const status = await store.status();
+      expect(status.prBackfillCursor).toBe(3);
+      expect(status.prBackfillCompletedAt).toBeNull();
+    });
+
+    it("sets the completion sentinel when the final page is partial", async () => {
+      const store = await createStore();
+      // 150 PRs total => one full page of 100, then partial page of 50.
+      const source = new FakePullRequestDataSource(makeManyPrs(150));
+
+      const summary = await store.runBackfillSlice({ entity: "prs", repo, source });
+
+      expect(summary.mode).toBe("backfill");
+      expect(summary.processedPrs).toBe(150);
+      expect(summary.nextBackfillCursor).toBeNull();
+      const status = await store.status();
+      expect(status.prBackfillCompletedAt).not.toBeNull();
+      expect(summary.lastSyncWatermark).toBeNull();
+      expect(summary.lastSyncAt).toBeNull();
+    });
+
+    it("returns backfill_complete without fetching once completion sentinel is set", async () => {
+      const store = await createStore();
+      const source = new FakePullRequestDataSource(makeManyPrs(50));
+
+      const first = await store.runBackfillSlice({ entity: "prs", repo, source });
+      expect(first.nextBackfillCursor).toBeNull();
+      source.listAllPrCalls = [];
+
+      const second = await store.runBackfillSlice({ entity: "prs", repo, source });
+      expect(second.mode).toBe("backfill");
+      expect(second.reason).toBe("backfill_complete");
+      expect(second.nextBackfillCursor).toBeNull();
+      expect(source.listAllPrCalls).toEqual([]);
+    });
+
+    it("is idempotent on retry after a thrown error mid-page", async () => {
+      const store = await createStore();
+      const source = new FakePullRequestDataSource(makeManyPrs(300));
+      // Fail after 50 items so the first slice never completes its first page.
+      source.failAfterYielding = 50;
+
+      await expect(store.runBackfillSlice({ entity: "prs", repo, source })).rejects.toThrow(
+        /simulated listAllPullRequests failure/,
+      );
+
+      const statusAfterError = await store.status();
+      expect(statusAfterError.prBackfillCursor).toBeNull();
+      expect(statusAfterError.prBackfillCompletedAt).toBeNull();
+
+      // Retry without the failure injection should start over from cursor 1
+      // and successfully advance through 2 pages.
+      source.failAfterYielding = null;
+      source.listAllPrCalls = [];
+      const retry = await store.runBackfillSlice({ entity: "prs", repo, source });
+
+      expect(retry.processedPrs).toBe(200);
+      expect(retry.nextBackfillCursor).toBe(3);
+      expect(source.listAllPrCalls[0]).toMatchObject({
+        sort: "created",
+        direction: "asc",
+        startPage: 1,
+      });
+
+      const finalStatus = await store.status();
+      expect(finalStatus.prBackfillCursor).toBe(3);
+    });
+
+    it("nextBackfillCursor matches the persisted meta key", async () => {
+      const store = await createStore();
+      const source = new FakePullRequestDataSource(makeManyPrs(250));
+
+      const summary = await store.runBackfillSlice({ entity: "prs", repo, source });
+
+      const status = await store.status();
+      expect(summary.nextBackfillCursor).toBe(status.prBackfillCursor);
+    });
+
+    it("backfills issues with the same cursor semantics", async () => {
+      const store = await createStore();
+      const issues: IssueRecord[] = [];
+      for (let index = 0; index < 150; index += 1) {
+        const dayIndex = String(index + 1).padStart(2, "0");
+        issues.push(
+          makeIssue(90000 + index, {
+            createdAt: `2025-01-${dayIndex}T00:00:00.000Z`,
+            updatedAt: `2025-01-${dayIndex}T00:00:00.000Z`,
+          }),
+        );
+      }
+      const source = new FakeIssueDataSource(issues);
+
+      const summary = await store.runBackfillSlice({ entity: "issues", repo, source });
+
+      expect(summary.mode).toBe("backfill");
+      expect(summary.processedIssues).toBe(150);
+      expect(summary.nextBackfillCursor).toBeNull();
+      const status = await store.status();
+      expect(status.issueBackfillCompletedAt).not.toBeNull();
+      expect(source.listAllIssueCalls[0]).toMatchObject({
+        sort: "created",
+        direction: "asc",
+        startPage: 1,
+      });
     });
   });
 });

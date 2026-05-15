@@ -57,12 +57,12 @@ type PlannerDecision =
 
 ### 2. Rate-limit bands and staleness threshold
 
-| Remaining quota | Band     | Allowed modes                                              |
-|-----------------|----------|------------------------------------------------------------|
-| `< 100`         | reserve  | `skip` only                                                |
-| `100..499`      | moderate | `hot`, `incremental`                                       |
-| `>= 500`        | healthy  | `hot`, `incremental`, `full`, `backfill` (one slice/tick)  |
-| `null` snapshot | moderate | treat as moderate, never `backfill`                        |
+| Remaining quota | Band     | Allowed modes                                             |
+| --------------- | -------- | --------------------------------------------------------- |
+| `< 100`         | reserve  | `skip` only                                               |
+| `100..499`      | moderate | `hot`, `incremental`                                      |
+| `>= 500`        | healthy  | `hot`, `incremental`, `full`, `backfill` (one slice/tick) |
+| `null` snapshot | moderate | treat as moderate, never `backfill`                       |
 
 Bands are constants on the planner module. Tunable later, but the reserve is a hard floor.
 
@@ -158,23 +158,21 @@ The TUI controller already routes manual `s`/`S` through `queueMetadataSync(...)
 `SyncSummary` extends from `{ mode: "full" | "incremental"; ... }` to:
 
 ```ts
-type SyncSummary =
-  & { entity: "prs" | "issues"; repo: string }
-  & {
-      mode: "full" | "incremental" | "hot" | "backfill" | "skipped";
-      processedPrs: number;
-      processedIssues: number;
-      skippedPrs: number;
-      skippedIssues: number;
-      docCount: number;
-      commentCount: number;
-      labelCount: number;
-      vectorAvailable: boolean;
-      lastSyncAt: string | null;
-      lastSyncWatermark: string | null;
-      reason?: "rate_limit_reserve" | "already_fresh" | "backfill_complete";
-      nextBackfillCursor?: number | null;
-    };
+type SyncSummary = { entity: "prs" | "issues"; repo: string } & {
+  mode: "full" | "incremental" | "hot" | "backfill" | "skipped";
+  processedPrs: number;
+  processedIssues: number;
+  skippedPrs: number;
+  skippedIssues: number;
+  docCount: number;
+  commentCount: number;
+  labelCount: number;
+  vectorAvailable: boolean;
+  lastSyncAt: string | null;
+  lastSyncWatermark: string | null;
+  reason?: "rate_limit_reserve" | "already_fresh" | "backfill_complete";
+  nextBackfillCursor?: number | null;
+};
 ```
 
 `lastSyncAt` and `lastSyncWatermark` move to `string | null` so the `skipped` and `backfill` cases can return without lying about authoritative incremental state. Existing producers in `syncPullRequestsWorkflow` continue to return strings for `full`/`incremental`. The `TuiController.drainMetadataJobs` bookkeeping switches off `summary.mode` for `totalKnown`, `lastCompletedAt`, `nextAutoUpdateAt`, and the "running rerun" decision; `skipped` jobs MUST NOT advance `nextAutoUpdateAt` so the auto-sync timer retries when quota recovers.

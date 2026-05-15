@@ -459,6 +459,12 @@ export type StatusSnapshot = {
   lastSyncWatermark: string | null;
   issueLastSyncAt: string | null;
   issueLastSyncWatermark: string | null;
+  prHotSyncAt: string | null;
+  issueHotSyncAt: string | null;
+  prBackfillCursor: number | null;
+  prBackfillCompletedAt: string | null;
+  issueBackfillCursor: number | null;
+  issueBackfillCompletedAt: string | null;
   prCount: number;
   issueCount: number;
   labelCount: number;
@@ -472,7 +478,7 @@ export type StatusSnapshot = {
 };
 
 export type SyncSummary = {
-  mode: "full" | "incremental";
+  mode: "full" | "incremental" | "hot" | "backfill" | "skipped";
   entity: "prs" | "issues";
   repo: string;
   processedPrs: number;
@@ -483,8 +489,10 @@ export type SyncSummary = {
   commentCount: number;
   labelCount: number;
   vectorAvailable: boolean;
-  lastSyncAt: string;
-  lastSyncWatermark: string;
+  lastSyncAt: string | null;
+  lastSyncWatermark: string | null;
+  reason?: "rate_limit_reserve" | "already_fresh" | "backfill_complete";
+  nextBackfillCursor?: number | null;
 };
 
 export type SyncProgressEvent = {
@@ -517,7 +525,13 @@ export type PrContextBundle = {
 export interface PullRequestDataSource {
   listAllPullRequests(
     repo: RepoRef,
-    options?: { limit?: number; newestFirst?: boolean },
+    options?: {
+      limit?: number;
+      newestFirst?: boolean;
+      sort?: "created" | "updated";
+      direction?: "asc" | "desc";
+      startPage?: number;
+    },
   ): AsyncGenerator<PullRequestRecord>;
   listChangedPullRequestNumbersSince(repo: RepoRef, since: string): Promise<number[]>;
   listChangedPullRequestsSince?(repo: RepoRef, since: string): Promise<PullRequestRecord[]>;
@@ -539,7 +553,13 @@ export interface PullRequestDataSource {
 export interface IssueDataSource {
   listAllIssues(
     repo: RepoRef,
-    options?: { limit?: number; newestFirst?: boolean },
+    options?: {
+      limit?: number;
+      newestFirst?: boolean;
+      sort?: "created" | "updated";
+      direction?: "asc" | "desc";
+      startPage?: number;
+    },
   ): AsyncGenerator<IssueRecord>;
   listChangedIssueNumbersSince(repo: RepoRef, since: string): Promise<number[]>;
   listChangedIssuesSince?(repo: RepoRef, since: string): Promise<IssueRecord[]>;

@@ -170,8 +170,12 @@ export type TuiSyncJobSnapshot = {
   progress: SyncProgressEvent | null;
   errorMessage: string | null;
   pendingRerun: boolean;
+  pendingTrigger: "manual" | "auto" | null;
   nextAutoUpdateAt: string | null;
   lastCompletedAt: string | null;
+  lastMode: SyncSummary["mode"] | null;
+  lastReason: SyncSummary["reason"] | null;
+  nextBackfillCursor: number | null;
 };
 
 export type TuiRateLimitSnapshot = {
@@ -431,8 +435,14 @@ export interface TuiDataService {
     analysis: ClusterPullRequestAnalysis | null;
     summary: TuiClusterVerificationSummary;
   }>;
-  syncPrs(options?: { onProgress?: (event: SyncProgressEvent) => void }): Promise<SyncSummary>;
-  syncIssues(options?: { onProgress?: (event: SyncProgressEvent) => void }): Promise<SyncSummary>;
+  syncPrs(options?: {
+    onProgress?: (event: SyncProgressEvent) => void;
+    trigger?: "manual" | "auto";
+  }): Promise<SyncSummary>;
+  syncIssues(options?: {
+    onProgress?: (event: SyncProgressEvent) => void;
+    trigger?: "manual" | "auto";
+  }): Promise<SyncSummary>;
   refreshPrDetail(prNumber: number): Promise<void>;
   refreshIssueDetail(issueNumber: number): Promise<void>;
   rateLimit(): Promise<TuiRateLimitSnapshot | null>;

@@ -210,6 +210,12 @@ const status: StatusSnapshot = {
   lastSyncWatermark: "2026-03-11T07:28:13.832Z",
   issueLastSyncAt: "2026-03-11T07:43:23.912Z",
   issueLastSyncWatermark: "2026-03-11T07:43:23.912Z",
+  prHotSyncAt: null,
+  issueHotSyncAt: null,
+  prBackfillCursor: null,
+  prBackfillCompletedAt: null,
+  issueBackfillCursor: null,
+  issueBackfillCompletedAt: null,
   prCount: 23935,
   issueCount: 17535,
   labelCount: 61148,
@@ -314,7 +320,7 @@ class FakeTuiDataService implements TuiDataService {
 
   async search(query: string, limit: number) {
     this.searchCalls.push({ query, limit });
-    if (query === "state:open") {
+    if (query === "state:all") {
       return Array.from({ length: limit }, (_, index) => makePr(43000 + index));
     }
     return [makePr(41793), makePr(42212, { score: 0.88 })];
@@ -322,7 +328,7 @@ class FakeTuiDataService implements TuiDataService {
 
   async searchIssues(query: string, limit: number) {
     this.issueSearchCalls.push({ query, limit });
-    if (query === "state:open") {
+    if (query === "state:all") {
       return Array.from({ length: limit }, (_, index) => makeIssue(52000 + index));
     }
     return [makeIssue(41789)];
@@ -383,8 +389,17 @@ class FakeTuiDataService implements TuiDataService {
     };
   }
 
-  async syncPrs(options?: { onProgress?: (event: SyncProgressEvent) => void }) {
+  syncPrsTriggers: Array<"manual" | "auto"> = [];
+  syncIssuesTriggers: Array<"manual" | "auto"> = [];
+  syncPrsResult: SyncSummary | (() => SyncSummary) | null = null;
+  syncIssuesResult: SyncSummary | (() => SyncSummary) | null = null;
+
+  async syncPrs(options?: {
+    onProgress?: (event: SyncProgressEvent) => void;
+    trigger?: "manual" | "auto";
+  }) {
     this.syncPrsCalls += 1;
+    this.syncPrsTriggers.push(options?.trigger ?? "manual");
     options?.onProgress?.({
       entity: "prs",
       phase: "syncing",
@@ -403,6 +418,19 @@ class FakeTuiDataService implements TuiDataService {
         this.syncPrsRelease = resolve;
       });
     }
+    if (this.syncPrsResult !== null) {
+      const result =
+        typeof this.syncPrsResult === "function" ? this.syncPrsResult() : this.syncPrsResult;
+      // Default: update status only for incremental/full to mimic legacy behavior
+      if (result.mode === "incremental" || result.mode === "full") {
+        this.statusSnapshot = {
+          ...this.statusSnapshot,
+          lastSyncAt: result.lastSyncAt ?? this.statusSnapshot.lastSyncAt,
+          lastSyncWatermark: result.lastSyncWatermark ?? this.statusSnapshot.lastSyncWatermark,
+        };
+      }
+      return result;
+    }
     this.statusSnapshot = {
       ...this.statusSnapshot,
       lastSyncAt: "2026-03-12T01:00:00.000Z",
@@ -411,8 +439,12 @@ class FakeTuiDataService implements TuiDataService {
     return syncSummary;
   }
 
-  async syncIssues(options?: { onProgress?: (event: SyncProgressEvent) => void }) {
+  async syncIssues(options?: {
+    onProgress?: (event: SyncProgressEvent) => void;
+    trigger?: "manual" | "auto";
+  }) {
     this.syncIssuesCalls += 1;
+    this.syncIssuesTriggers.push(options?.trigger ?? "manual");
     options?.onProgress?.({
       entity: "issues",
       phase: "syncing",
@@ -423,6 +455,21 @@ class FakeTuiDataService implements TuiDataService {
       currentId: 41789,
       currentTitle: "Issue 41789",
     });
+    if (this.syncIssuesResult !== null) {
+      const result =
+        typeof this.syncIssuesResult === "function"
+          ? this.syncIssuesResult()
+          : this.syncIssuesResult;
+      if (result.mode === "incremental" || result.mode === "full") {
+        this.statusSnapshot = {
+          ...this.statusSnapshot,
+          issueLastSyncAt: result.lastSyncAt ?? this.statusSnapshot.issueLastSyncAt,
+          issueLastSyncWatermark:
+            result.lastSyncWatermark ?? this.statusSnapshot.issueLastSyncWatermark,
+        };
+      }
+      return result;
+    }
     this.statusSnapshot = {
       ...this.statusSnapshot,
       issueLastSyncAt: "2026-03-12T01:00:00.000Z",
@@ -1684,5 +1731,206 @@ describe("TuiController", () => {
     controller.startQueryEntry();
     controller.moveQueryHistory(-1);
     expect(controller.getRenderModel().footer.queryCursorIndex).toBe("author:frank".length);
+  });
+
+  it("passes trigger='manual' for s key sync", async () => {
+    const service = new FakeTuiDataService();
+    service.statusSnapshot = {
+      ...service.statusSnapshot,
+      lastSyncAt: new Date().toISOString(),
+      issueLastSyncAt: new Date().toISOString(),
+    };
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+    await controller.initialize();
+    await controller.syncPrs();
+    await flushMicrotasks();
+    await flushMicrotasks();
+    expect(service.syncPrsTriggers).toEqual(["manual"]);
+  });
+
+  it("passes trigger='auto' for auto sync timer paths", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-13T00:00:00.000Z"));
+    const service = new FakeTuiDataService();
+    service.statusSnapshot = {
+      ...service.statusSnapshot,
+      lastSyncAt: "2026-03-12T23:45:00.000Z",
+      issueLastSyncAt: "2026-03-13T00:00:00.000Z",
+    };
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+    await controller.initialize();
+    vi.advanceTimersByTime(16 * 60 * 1000);
+    controller.activateMode("inbox");
+    await flushMicrotasks();
+    await flushMicrotasks();
+    expect(service.syncPrsTriggers).toEqual(["auto"]);
+  });
+
+  it("incremental bookkeeping: totalKnown = processed + skipped and advances nextAutoUpdateAt", async () => {
+    const service = new FakeTuiDataService();
+    service.statusSnapshot = {
+      ...service.statusSnapshot,
+      lastSyncAt: new Date().toISOString(),
+      issueLastSyncAt: new Date().toISOString(),
+    };
+    service.syncPrsResult = {
+      mode: "incremental",
+      entity: "prs",
+      repo: "openclaw/openclaw",
+      processedPrs: 4,
+      processedIssues: 0,
+      skippedPrs: 7,
+      skippedIssues: 0,
+      docCount: 10,
+      commentCount: 0,
+      labelCount: 0,
+      vectorAvailable: true,
+      lastSyncAt: "2026-03-12T02:00:00.000Z",
+      lastSyncWatermark: "2026-03-12T02:00:00.000Z",
+    };
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+    await controller.initialize();
+    await controller.syncPrs();
+    await flushMicrotasks();
+    await flushMicrotasks();
+    const job = controller.getRenderModel().header.syncJobs.find((item) => item.entity === "prs")!;
+    expect(job.state).toBe("cooldown");
+    expect(job.progress?.totalKnown).toBe(11);
+    expect(job.lastCompletedAt).toBe("2026-03-12T02:00:00.000Z");
+    expect(job.nextAutoUpdateAt).not.toBeNull();
+    expect(job.lastMode).toBe("incremental");
+  });
+
+  it("hot bookkeeping: totalKnown = processed + skipped and lastCompletedAt advances when set", async () => {
+    const service = new FakeTuiDataService();
+    service.statusSnapshot = {
+      ...service.statusSnapshot,
+      lastSyncAt: new Date().toISOString(),
+      issueLastSyncAt: new Date().toISOString(),
+    };
+    service.syncPrsResult = {
+      mode: "hot",
+      entity: "prs",
+      repo: "openclaw/openclaw",
+      processedPrs: 312,
+      processedIssues: 0,
+      skippedPrs: 0,
+      skippedIssues: 0,
+      docCount: 0,
+      commentCount: 0,
+      labelCount: 0,
+      vectorAvailable: true,
+      lastSyncAt: "2026-03-12T03:00:00.000Z",
+      lastSyncWatermark: null,
+    };
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+    await controller.initialize();
+    await controller.syncPrs();
+    await flushMicrotasks();
+    await flushMicrotasks();
+    const job = controller.getRenderModel().header.syncJobs.find((item) => item.entity === "prs")!;
+    expect(job.state).toBe("cooldown");
+    expect(job.lastMode).toBe("hot");
+    expect(job.progress?.processed).toBe(312);
+    expect(job.progress?.totalKnown).toBe(312);
+    expect(job.lastCompletedAt).toBe("2026-03-12T03:00:00.000Z");
+    expect(job.nextAutoUpdateAt).not.toBeNull();
+  });
+
+  it("backfill bookkeeping: totalKnown null, surfaces nextBackfillCursor", async () => {
+    const service = new FakeTuiDataService();
+    service.statusSnapshot = {
+      ...service.statusSnapshot,
+      lastSyncAt: new Date().toISOString(),
+      issueLastSyncAt: new Date().toISOString(),
+    };
+    service.syncPrsResult = {
+      mode: "backfill",
+      entity: "prs",
+      repo: "openclaw/openclaw",
+      processedPrs: 200,
+      processedIssues: 0,
+      skippedPrs: 0,
+      skippedIssues: 0,
+      docCount: 0,
+      commentCount: 0,
+      labelCount: 0,
+      vectorAvailable: true,
+      lastSyncAt: null,
+      lastSyncWatermark: null,
+      nextBackfillCursor: 14,
+    };
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+    await controller.initialize();
+    await controller.syncPrs();
+    await flushMicrotasks();
+    await flushMicrotasks();
+    const job = controller.getRenderModel().header.syncJobs.find((item) => item.entity === "prs")!;
+    expect(job.state).toBe("cooldown");
+    expect(job.lastMode).toBe("backfill");
+    expect(job.progress?.totalKnown).toBeNull();
+    expect(job.nextBackfillCursor).toBe(14);
+    expect(controller.getRenderModel().footer.message).toContain("cursor 14");
+    expect(job.nextAutoUpdateAt).not.toBeNull();
+  });
+
+  it("skipped bookkeeping: does NOT advance nextAutoUpdateAt and surfaces reason", async () => {
+    const service = new FakeTuiDataService();
+    service.statusSnapshot = {
+      ...service.statusSnapshot,
+      lastSyncAt: new Date().toISOString(),
+      issueLastSyncAt: new Date().toISOString(),
+    };
+    service.syncPrsResult = {
+      mode: "skipped",
+      entity: "prs",
+      repo: "openclaw/openclaw",
+      processedPrs: 0,
+      processedIssues: 0,
+      skippedPrs: 0,
+      skippedIssues: 0,
+      docCount: 0,
+      commentCount: 0,
+      labelCount: 0,
+      vectorAvailable: false,
+      lastSyncAt: null,
+      lastSyncWatermark: null,
+      reason: "rate_limit_reserve",
+    };
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+    await controller.initialize();
+    await controller.syncPrs();
+    await flushMicrotasks();
+    await flushMicrotasks();
+    const job = controller.getRenderModel().header.syncJobs.find((item) => item.entity === "prs")!;
+    expect(job.state).toBe("cooldown");
+    expect(job.lastMode).toBe("skipped");
+    expect(job.lastReason).toBe("rate_limit_reserve");
+    expect(job.nextAutoUpdateAt).toBeNull();
+    expect(controller.getRenderModel().footer.message).toContain("rate_limit_reserve");
   });
 });

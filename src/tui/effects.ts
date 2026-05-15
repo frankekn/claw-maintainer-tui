@@ -59,12 +59,24 @@ export class TuiEffects {
     return this.service.setPrAttentionState(prNumber, state);
   }
 
-  syncPrs(options?: { onProgress?: (event: SyncProgressEvent) => void }): Promise<SyncSummary> {
-    return this.service.syncPrs(options);
+  syncPrs(options?: {
+    onProgress?: (event: SyncProgressEvent) => void;
+    trigger?: "manual" | "auto";
+  }): Promise<SyncSummary> {
+    return this.service.syncPrs({
+      onProgress: options?.onProgress,
+      trigger: options?.trigger ?? "manual",
+    });
   }
 
-  syncIssues(options?: { onProgress?: (event: SyncProgressEvent) => void }): Promise<SyncSummary> {
-    return this.service.syncIssues(options);
+  syncIssues(options?: {
+    onProgress?: (event: SyncProgressEvent) => void;
+    trigger?: "manual" | "auto";
+  }): Promise<SyncSummary> {
+    return this.service.syncIssues({
+      onProgress: options?.onProgress,
+      trigger: options?.trigger ?? "manual",
+    });
   }
 
   refreshPrDetail(prNumber: number): Promise<void> {

@@ -93,8 +93,12 @@ export class TuiController {
       progress: null,
       errorMessage: null,
       pendingRerun: false,
+      pendingTrigger: null,
       nextAutoUpdateAt: null,
       lastCompletedAt: null,
+      lastMode: null,
+      lastReason: null,
+      nextBackfillCursor: null,
     },
     issues: {
       entity: "issues",
@@ -102,8 +106,12 @@ export class TuiController {
       progress: null,
       errorMessage: null,
       pendingRerun: false,
+      pendingTrigger: null,
       nextAutoUpdateAt: null,
       lastCompletedAt: null,
+      lastMode: null,
+      lastReason: null,
+      nextBackfillCursor: null,
     },
   };
   private activeMetadataJob: MetadataEntity | null = null;
@@ -2047,15 +2055,24 @@ export class TuiController {
     job.errorMessage = null;
     if (job.state === "running") {
       job.pendingRerun = true;
+      // Manual triggers escalate the pending rerun trigger; otherwise keep the
+      // strongest pending trigger we already have.
+      if (trigger === "manual" || job.pendingTrigger === null) {
+        job.pendingTrigger = trigger;
+      }
       this.message = `${entity === "prs" ? "PR" : "Issue"} metadata sync will rerun after the current job.`;
       this.emit();
       return;
     }
     if (job.state === "queued") {
+      if (trigger === "manual" || job.pendingTrigger === null) {
+        job.pendingTrigger = trigger;
+      }
       this.emit();
       return;
     }
     job.state = "queued";
+    job.pendingTrigger = trigger;
     this.message =
       trigger === "manual"
         ? `Queued ${entity === "prs" ? "PR" : "issue"} metadata sync.`
@@ -2087,6 +2104,8 @@ export class TuiController {
       return;
     }
     const job = this.syncJobs[nextEntity];
+    const trigger: "manual" | "auto" = job.pendingTrigger ?? "manual";
+    job.pendingTrigger = null;
     this.activeMetadataJob = nextEntity;
     this.manualPriority.delete(nextEntity);
     job.state = "running";
@@ -2102,36 +2121,84 @@ export class TuiController {
     };
     this.emit();
 
+    const label = nextEntity === "prs" ? "PR" : "issue";
+
     try {
       const summary =
         nextEntity === "prs"
           ? await this.effects.syncPrs({
               onProgress: (event) => this.handleMetadataProgress(nextEntity, event),
+              trigger,
             })
           : await this.effects.syncIssues({
               onProgress: (event) => this.handleMetadataProgress(nextEntity, event),
+              trigger,
             });
       await this.refreshStatus();
-      job.state = "cooldown";
-      job.progress = {
-        entity: nextEntity,
-        phase: "complete",
-        processed: nextEntity === "prs" ? summary.processedPrs : summary.processedIssues,
-        skipped: nextEntity === "prs" ? summary.skippedPrs : summary.skippedIssues,
-        queued: 0,
-        totalKnown:
-          summary.mode === "incremental"
-            ? nextEntity === "prs"
-              ? summary.processedPrs + summary.skippedPrs
-              : summary.processedIssues + summary.skippedIssues
-            : null,
-        currentId: null,
-        currentTitle: null,
-      };
-      job.lastCompletedAt = summary.lastSyncAt;
-      job.nextAutoUpdateAt = new Date(Date.now() + IDLE_INTERVAL_MS).toISOString();
-      this.message = `Synced ${nextEntity === "prs" ? "PR" : "issue"} metadata: processed ${job.progress.processed}, skipped ${job.progress.skipped}.`;
-      this.scheduleListReplay();
+      const processed = nextEntity === "prs" ? summary.processedPrs : summary.processedIssues;
+      const skipped = nextEntity === "prs" ? summary.skippedPrs : summary.skippedIssues;
+
+      job.lastMode = summary.mode;
+      job.lastReason = summary.reason ?? null;
+      job.nextBackfillCursor = summary.nextBackfillCursor ?? null;
+
+      if (summary.mode === "skipped") {
+        // Skipped: do NOT advance nextAutoUpdateAt so auto-sync retries when
+        // quota recovers; expose reason in the job message.
+        job.state = "cooldown";
+        job.progress = {
+          entity: nextEntity,
+          phase: "complete",
+          processed: 0,
+          skipped: 0,
+          queued: 0,
+          totalKnown: null,
+          currentId: null,
+          currentTitle: null,
+        };
+        const reasonLabel = summary.reason ?? "skipped";
+        this.message = `Skipped ${label} metadata sync (${reasonLabel}).`;
+      } else {
+        job.state = "cooldown";
+        let totalKnown: number | null;
+        switch (summary.mode) {
+          case "incremental":
+            totalKnown = processed + skipped;
+            break;
+          case "hot":
+            totalKnown = processed + skipped;
+            break;
+          case "backfill":
+            totalKnown = null;
+            break;
+          default:
+            totalKnown = null;
+        }
+        job.progress = {
+          entity: nextEntity,
+          phase: "complete",
+          processed,
+          skipped,
+          queued: 0,
+          totalKnown,
+          currentId: null,
+          currentTitle: null,
+        };
+        if (summary.lastSyncAt) {
+          job.lastCompletedAt = summary.lastSyncAt;
+        }
+        job.nextAutoUpdateAt = new Date(Date.now() + IDLE_INTERVAL_MS).toISOString();
+        if (summary.mode === "backfill") {
+          const cursorSuffix =
+            summary.nextBackfillCursor !== null && summary.nextBackfillCursor !== undefined
+              ? ` (cursor ${summary.nextBackfillCursor})`
+              : "";
+          this.message = `Backfilled ${label} metadata${cursorSuffix}: processed ${processed}, skipped ${skipped}.`;
+        } else {
+          this.message = `Synced ${label} metadata: processed ${processed}, skipped ${skipped}.`;
+        }
+        this.scheduleListReplay();
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       job.state = "error";
