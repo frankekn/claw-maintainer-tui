@@ -13,6 +13,14 @@ This tool is a local-first OpenClaw maintainer cockpit:
 
 The CLI only syncs when you ask it to. Search and TUI flows read from the local index by default and use `gh` for sync/refresh operations.
 
+## Backend behavior
+
+The local store keeps PRs, issues, labels, comments, review facts, and derived issue links in SQLite. Cross-reference commands use exact `pr_linked_issues` matches first, then fill remaining result slots with fuzzy search. Exact matches are ordered by link-source strength, open state, and recency so linked PRs and issues rank above text-only neighbors.
+
+Issue sync limits count accepted issue rows, not raw GitHub `/issues` rows. Pull requests returned by that endpoint are skipped before the limit is consumed, so `--max-issues` fetches the requested number of real issues when enough are available.
+
+Cluster recovery keeps live GitHub work bounded. Independent search variants run with limited concurrency, duplicate candidate PR numbers are hydrated once, and semantic-only cluster decisions are cached in memory until the seed or candidate signatures change.
+
 ## Requirements
 
 - Node `>=22`
@@ -43,9 +51,10 @@ pnpm clawlens status --repo openclaw/openclaw
 
 ```bash
 pnpm verify
+pnpm gate:backend
 ```
 
-This runs typecheck, tests, and formatting checks.
+`pnpm verify` runs typecheck, tests, and formatting checks. `pnpm gate:backend` runs typecheck plus the backend-focused coverage gate for store, GitHub, semantic, and lower-level helper paths while excluding the TUI surface.
 
 ## Install as `clawlens`
 
