@@ -62,11 +62,18 @@ function formatSyncJobBadge(job: TuiSyncJobSnapshot): string | null {
   return badge(`${prefix} SYNC ${countLabel}`, "warn");
 }
 
+function truncateRepo(repo: string): string {
+  if (repo.length <= 24) {
+    return repo;
+  }
+  return `${repo.slice(0, 21)}...`;
+}
+
 export function formatHeader(model: TuiHeaderModel, now = new Date()): string {
   const status = model.status;
   const segments = [
     badge(`MODE ${model.activeModeLabel}`, "focus"),
-    badge(`REPO ${model.repo}`, "neutral"),
+    badge(`REPO ${truncateRepo(model.repo)}`, "neutral"),
   ];
   if (status) {
     segments.push(
@@ -123,7 +130,6 @@ export function formatHeader(model: TuiHeaderModel, now = new Date()): string {
 
 export function formatActionBar(actions: TuiAction[]): string {
   return actions
-    .filter((action) => action.enabled)
     .map((action) => `${actionChip(action.shortcut, action.enabled)} ${action.label}`)
     .join(` ${text("·", "dim")} `);
 }

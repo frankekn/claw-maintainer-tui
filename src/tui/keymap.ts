@@ -11,7 +11,6 @@ export type TuiKeyAction =
   | { kind: "help-page"; delta: number }
   | { kind: "help-home" }
   | { kind: "help-end" }
-  | { kind: "quit" }
   | { kind: "open-url" }
   | { kind: "noop" };
 
@@ -26,7 +25,7 @@ export function resolveKeyAction(
 ): TuiKeyAction {
   if (model.helpOverlay.visible) {
     if (key.name === "q") {
-      return { kind: "quit" };
+      return { kind: "command", command: { type: "confirm_quit" } };
     }
     if (key.name === "escape" || key.name === "f1" || key.name === "question mark" || ch === "?") {
       return { kind: "command", command: { type: "toggle_help" } };
@@ -75,6 +74,30 @@ export function resolveKeyAction(
     if (key.name === "backspace" || key.name === "delete") {
       return { kind: "command", command: { type: "backspace_query" } };
     }
+    if (key.name === "left") {
+      return { kind: "command", command: { type: "move_query_cursor_left" } };
+    }
+    if (key.name === "right") {
+      return { kind: "command", command: { type: "move_query_cursor_right" } };
+    }
+    if (key.name === "home") {
+      return { kind: "command", command: { type: "move_query_cursor_home" } };
+    }
+    if (key.name === "end") {
+      return { kind: "command", command: { type: "move_query_cursor_end" } };
+    }
+    if (key.ctrl && key.name === "a") {
+      return { kind: "command", command: { type: "move_query_cursor_home" } };
+    }
+    if (key.ctrl && key.name === "e") {
+      return { kind: "command", command: { type: "move_query_cursor_end" } };
+    }
+    if (key.ctrl && key.name === "u") {
+      return { kind: "command", command: { type: "clear_query" } };
+    }
+    if (key.ctrl && key.name === "w") {
+      return { kind: "command", command: { type: "delete_query_word" } };
+    }
     if (!key.ctrl && !key.meta && ch && ch >= " ") {
       return { kind: "command", command: { type: "append_query", value: ch } };
     }
@@ -90,7 +113,7 @@ export function resolveKeyAction(
 
   if (model.focus === "detail") {
     if (key.name === "escape") {
-      return { kind: "command", command: { type: "focus_results" } };
+      return { kind: "command", command: { type: "escape" } };
     }
     if (key.name === "tab") {
       return { kind: "command", command: { type: "focus_next" } };
@@ -118,11 +141,15 @@ export function resolveKeyAction(
     }
   }
 
+  if (key.name === "escape" && model.focus === "results") {
+    return { kind: "command", command: { type: "escape" } };
+  }
+
   if (ch && /^[1-6]$/.test(ch)) {
     return { kind: "command", command: { type: "activate_mode_index", index: Number(ch) - 1 } };
   }
   if (key.name === "q") {
-    return { kind: "quit" };
+    return { kind: "command", command: { type: "confirm_quit" } };
   }
   if (key.name === "tab") {
     return { kind: "command", command: { type: "focus_next" } };

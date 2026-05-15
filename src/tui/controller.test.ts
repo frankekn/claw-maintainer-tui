@@ -1590,4 +1590,99 @@ describe("TuiController", () => {
 
     expect(listener).not.toHaveBeenCalled();
   });
+
+  it("inserts characters at the cursor position", () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+    controller.activateMode("cross-search");
+    controller.startQueryEntry();
+    controller.appendQueryCharacter("a");
+    controller.appendQueryCharacter("b");
+    controller.dispatch({ type: "move_query_cursor_left" });
+    controller.appendQueryCharacter("x");
+    expect(controller.getRenderModel().query).toBe("axb");
+  });
+
+  it("backspace deletes before the cursor", () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+    controller.activateMode("cross-search");
+    controller.startQueryEntry();
+    controller.appendQueryCharacter("a");
+    controller.appendQueryCharacter("b");
+    controller.dispatch({ type: "move_query_cursor_left" });
+    controller.backspaceQuery();
+    expect(controller.getRenderModel().query).toBe("b");
+  });
+
+  it("backspace removes the character before the cursor", () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+    controller.activateMode("cross-search");
+    controller.startQueryEntry();
+    controller.appendQueryCharacter("a");
+    controller.appendQueryCharacter("b");
+    controller.dispatch({ type: "move_query_cursor_left" });
+    controller.backspaceQuery();
+    expect(controller.getRenderModel().query).toBe("b");
+  });
+
+  it("clear_query empties the entire query", () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+    controller.activateMode("cross-search");
+    controller.startQueryEntry();
+    controller.appendQueryCharacter("a");
+    controller.appendQueryCharacter("b");
+    controller.clearQuery();
+    expect(controller.getRenderModel().query).toBe("");
+  });
+
+  it("delete_query_word removes the previous word", () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+    controller.activateMode("cross-search");
+    controller.startQueryEntry();
+    controller.appendQueryCharacter("a");
+    controller.appendQueryCharacter("b");
+    controller.appendQueryCharacter(" ");
+    controller.appendQueryCharacter("c");
+    controller.deleteQueryWord();
+    expect(controller.getRenderModel().query).toBe("ab ");
+  });
+
+  it("places the cursor at the end after selecting history", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+    controller.activateMode("cross-search");
+    await flushMicrotasks();
+    await controller.submitQuery("author:frank");
+    controller.startQueryEntry();
+    controller.moveQueryHistory(-1);
+    expect(controller.getRenderModel().footer.queryCursorIndex).toBe("author:frank".length);
+  });
 });

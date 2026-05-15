@@ -113,6 +113,8 @@ export class TuiController {
   private replayTimer: NodeJS.Timeout | null = null;
   private lastInteractionAt = Date.now();
   private disposed = false;
+  private quitConfirmAt: number | null = null;
+  private exitRequested = false;
 
   constructor(
     service: TuiEffects | ConstructorParameters<typeof TuiEffects>[0],
@@ -427,7 +429,14 @@ export class TuiController {
     this.lastInteractionAt = Date.now();
   }
 
+  clearQuitConfirm(): void {
+    this.quitConfirmAt = null;
+  }
+
   async dispatch(command: TuiCommand): Promise<void> {
+    if (command.type !== "confirm_quit" && this.quitConfirmAt !== null) {
+      this.quitConfirmAt = null;
+    }
     switch (command.type) {
       case "focus_next":
         this.focusNext();
@@ -484,6 +493,26 @@ export class TuiController {
       case "backspace_query":
         this.backspaceQuery();
         return;
+      case "clear_query":
+        this.clearQuery();
+        return;
+      case "delete_query_word":
+        this.deleteQueryWord();
+        return;
+      case "move_query_cursor_left":
+        this.moveQueryCursor(-1);
+        return;
+      case "move_query_cursor_right":
+        this.moveQueryCursor(1);
+        return;
+      case "move_query_cursor_home":
+        this.moveQueryCursorTo(0);
+        this.emit();
+        return;
+      case "move_query_cursor_end":
+        this.moveQueryCursorTo(this.query.length);
+        this.emit();
+        return;
       case "query_history_prev":
         this.moveQueryHistory(-1);
         return;
@@ -495,6 +524,12 @@ export class TuiController {
         return;
       case "go_back":
         this.goBack();
+        return;
+      case "escape":
+        this.handleEscape();
+        return;
+      case "confirm_quit":
+        this.handleConfirmQuit();
         return;
       case "mark_seen":
         await this.markSeenSelected();
@@ -541,6 +576,41 @@ export class TuiController {
 
   isDetailFocus(): boolean {
     return this.focus === "detail";
+  }
+
+  handleConfirmQuit(): void {
+    if (this.quitConfirmAt !== null) {
+      const elapsed = Date.now() - this.quitConfirmAt;
+      if (elapsed < 1500) {
+        this.quitConfirmAt = null;
+        this.exitRequested = true;
+        return;
+      }
+    }
+    this.quitConfirmAt = Date.now();
+    this.message = "Press q again to quit.";
+    this.emit();
+  }
+
+  shouldExit(): boolean {
+    if (this.exitRequested) {
+      this.exitRequested = false;
+      return true;
+    }
+    return false;
+  }
+
+  handleEscape(): void {
+    if (this.showDetail) {
+      this.openSelected();
+      return;
+    }
+    if (this.history.length > 0) {
+      this.goBack();
+      return;
+    }
+    this.message = "Nothing to go back to.";
+    this.emit();
   }
 
   focusNext(): void {
@@ -619,6 +689,7 @@ export class TuiController {
     }
     this.helpVisible = false;
     this.focus = "query";
+    this.moveQueryCursorTo(this.query.length);
     this.emit();
   }
 
@@ -642,7 +713,9 @@ export class TuiController {
     if (this.focus !== "query") {
       return;
     }
-    this.query += value;
+    const cursor = this.queryCursor();
+    this.query = this.query.slice(0, cursor) + value + this.query.slice(cursor);
+    this.moveQueryCursorTo(cursor + 1);
     if (this.isQueryMode(this.mode)) {
       this.syncQueryState(this.mode, this.query);
     }
@@ -653,11 +726,76 @@ export class TuiController {
     if (this.focus !== "query" || this.query.length === 0) {
       return;
     }
-    this.query = this.query.slice(0, -1);
+    const cursor = this.queryCursor();
+    if (cursor === 0) {
+      return;
+    }
+    this.query = this.query.slice(0, cursor - 1) + this.query.slice(cursor);
+    this.moveQueryCursorTo(cursor - 1);
     if (this.isQueryMode(this.mode)) {
       this.syncQueryState(this.mode, this.query);
     }
     this.emit();
+  }
+
+  clearQuery(): void {
+    if (this.focus !== "query") {
+      return;
+    }
+    this.query = "";
+    this.moveQueryCursorTo(0);
+    if (this.isQueryMode(this.mode)) {
+      this.syncQueryState(this.mode, this.query);
+    }
+    this.emit();
+  }
+
+  deleteQueryWord(): void {
+    if (this.focus !== "query" || this.query.length === 0) {
+      return;
+    }
+    const cursor = this.queryCursor();
+    if (cursor === 0) {
+      return;
+    }
+    let start = cursor - 1;
+    while (start > 0 && this.query[start] === " ") {
+      start -= 1;
+    }
+    while (start > 0 && this.query[start - 1] !== " ") {
+      start -= 1;
+    }
+    this.query = this.query.slice(0, start) + this.query.slice(cursor);
+    this.moveQueryCursorTo(start);
+    if (this.isQueryMode(this.mode)) {
+      this.syncQueryState(this.mode, this.query);
+    }
+    this.emit();
+  }
+
+  moveQueryCursor(delta: number): void {
+    if (this.focus !== "query") {
+      return;
+    }
+    const cursor = this.queryCursor();
+    this.moveQueryCursorTo(Math.max(0, Math.min(this.query.length, cursor + delta)));
+    this.emit();
+  }
+
+  moveQueryCursorTo(index: number): void {
+    if (this.isQueryMode(this.mode)) {
+      this.sessionState.queryState[this.mode].cursorIndex = Math.max(
+        0,
+        Math.min(this.query.length, index),
+      );
+    }
+  }
+
+  private queryCursor(): number {
+    if (!this.isQueryMode(this.mode)) {
+      return this.query.length;
+    }
+    return this.sessionState.queryState[this.mode].cursorIndex;
   }
 
   moveQueryHistory(delta: -1 | 1): void {
@@ -680,6 +818,7 @@ export class TuiController {
     if (nextIndex === null || nextIndex < 0) {
       state.historyIndex = null;
       this.query = state.value;
+      this.moveQueryCursorTo(this.query.length);
       this.emit();
       return;
     }
@@ -688,6 +827,7 @@ export class TuiController {
     }
     state.historyIndex = nextIndex;
     this.query = state.history[nextIndex] ?? "";
+    this.moveQueryCursorTo(this.query.length);
     this.emit();
   }
 
@@ -1374,17 +1514,17 @@ export class TuiController {
           this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
           this.action(
             "jump-linked-issues",
-            "Linked",
+            "Linked Issues",
             "x",
             canLinked || row?.kind === "priority-cluster",
           ),
           this.action("cluster", "Cluster", "c", canCluster),
-          this.action("expand-cluster", "Workspace", "e", canOpenClusterWorkspace),
+          this.action("expand-cluster", "Cluster Workspace", "e", canOpenClusterWorkspace),
           this.action("mark-seen", "Seen", "v", canTriage),
           this.action("toggle-watch", "Watch", "w", canTriage),
           this.action("toggle-ignore", "Ignore", "i", canTriage),
           this.action("clear-state", "Clear", "u", hasLocalState),
-          this.action("mark-page-seen", "Seen Page", "V", canPageSeen),
+          this.action("mark-page-seen", "Seen Visible", "V", canPageSeen),
           this.action("undo", "Undo", "U", canUndoAttention),
           this.action("back", "Back", "b", hasHistory),
           this.action("load-more", "More", "m", this.canLoadMore()),
@@ -1403,9 +1543,9 @@ export class TuiController {
         return [
           this.action("query", "Search", "/"),
           this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
-          this.action("jump-linked-issues", "Linked", "x", canLinked),
+          this.action("jump-linked-issues", "Linked Issues", "x", canLinked),
           this.action("cluster", "Cluster", "c", canCluster),
-          this.action("expand-cluster", "Workspace", "e", canOpenClusterWorkspace),
+          this.action("expand-cluster", "Cluster Workspace", "e", canOpenClusterWorkspace),
           this.action("sync-prs", "Sync PRs", "s"),
           this.action("sync-issues", "Sync Issues", "S"),
           this.action("refresh", "Refresh", "r", canRefresh),
@@ -1426,12 +1566,12 @@ export class TuiController {
         return [
           this.action("query", "Search", "/"),
           this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
-          this.action("jump-linked-issues", "Linked", "x", canLinked),
+          this.action("jump-linked-issues", "Linked Issues", "x", canLinked),
           this.action("cluster", "Cluster", "c", canCluster),
-          this.action("expand-cluster", "Workspace", "e", canOpenClusterWorkspace),
+          this.action("expand-cluster", "Cluster Workspace", "e", canOpenClusterWorkspace),
           this.action("mark-seen", "Seen", "v", canTriage),
           this.action("toggle-watch", "Watch", "w", canTriage),
-          this.action("mark-page-seen", "Seen Page", "V", canPageSeen),
+          this.action("mark-page-seen", "Seen Visible", "V", canPageSeen),
           this.action("undo", "Undo", "U", canUndoAttention),
           this.action("refresh", "Refresh", "r", canRefresh),
           this.action("back", "Back", "b", hasHistory),

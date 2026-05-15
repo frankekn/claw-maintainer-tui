@@ -23,6 +23,7 @@ const renderModel: TuiRenderModel = {
     banner: null,
     queryPrompt: "Inbox",
     queryValue: "",
+    queryCursorIndex: 0,
     queryPlaceholder: "Browse-only mode",
     queryHelpText: "Browse-only mode",
     actions: [],
@@ -71,6 +72,8 @@ function createControllerStub() {
     initialize: vi.fn(async () => {}),
     reportError: vi.fn(),
     dispose: vi.fn(),
+    shouldExit: vi.fn(() => false),
+    clearQuitConfirm: vi.fn(),
   };
 }
 
@@ -104,7 +107,7 @@ describe("BlessedTuiRenderer", () => {
     });
   });
 
-  it("uses full repaint mode for layout changes", () => {
+  it("enables incremental rendering for reduced flicker", () => {
     const controller = createControllerStub();
     const renderer = new BlessedTuiRenderer(controller as never);
     const harness = renderer as unknown as RendererHarness & {
@@ -112,10 +115,10 @@ describe("BlessedTuiRenderer", () => {
     };
     renderers.push(harness);
 
-    expect(harness.screen.options.smartCSR).toBe(false);
+    expect(harness.screen.options.fastCSR).toBe(true);
   });
 
-  it("reallocates the screen buffer before rendering", () => {
+  it("does not clear or realloc the screen on normal render", () => {
     const controller = createControllerStub();
     const renderer = new BlessedTuiRenderer(controller as never);
     const harness = renderer as unknown as RendererHarness & {
@@ -131,8 +134,22 @@ describe("BlessedTuiRenderer", () => {
 
     harness.render(renderModel);
 
-    expect(reallocSpy).toHaveBeenCalledTimes(1);
-    expect(clearScreenSpy).toHaveBeenCalledTimes(1);
+    expect(reallocSpy).not.toHaveBeenCalled();
+    expect(clearScreenSpy).not.toHaveBeenCalled();
+  });
+
+  it("still renders after layout transitions", () => {
+    const controller = createControllerStub();
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness & {
+      screen: blessed.Widgets.Screen;
+    };
+    renderers.push(harness);
+    const renderSpy = vi.spyOn(harness.screen, "render");
+
+    harness.render({ ...renderModel, layoutMode: "split-pane" });
+
+    expect(renderSpy).toHaveBeenCalled();
   });
 
   it("routes v/w/i/u shortcuts to triage actions", async () => {
@@ -199,6 +216,50 @@ describe("BlessedTuiRenderer", () => {
 
     expect(controller.dispatch).toHaveBeenCalledWith({ type: "toggle_help" });
     renderModel.focus = "results";
+  });
+
+  it("routes q to confirm_quit in results mode", async () => {
+    const controller = createControllerStub();
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness;
+    renderers.push(harness);
+
+    await harness.handleKeypress("q", { name: "q" } as blessed.Widgets.Events.IKeyEventArg);
+
+    expect(controller.dispatch).toHaveBeenCalledWith({ type: "confirm_quit" });
+    expect(controller.dispose).not.toHaveBeenCalled();
+  });
+
+  it("routes escape to escape command in results mode", async () => {
+    const controller = createControllerStub();
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness;
+    renderers.push(harness);
+
+    await harness.handleKeypress("", { name: "escape" } as blessed.Widgets.Events.IKeyEventArg);
+
+    expect(controller.dispatch).toHaveBeenCalledWith({ type: "escape" });
+  });
+
+  it("destroys screen when controller signals exit after confirm_quit", async () => {
+    const controller = createControllerStub();
+    controller.shouldExit.mockReturnValue(true);
+    controller.getRenderModel.mockReturnValue({
+      ...renderModel,
+      helpOverlay: {
+        visible: true,
+        title: "Inbox Help",
+        lines: ["Help line"],
+      },
+    });
+    const renderer = new BlessedTuiRenderer(controller as never);
+    const harness = renderer as unknown as RendererHarness;
+    renderers.push(harness);
+
+    await harness.handleKeypress("q", { name: "q" } as blessed.Widgets.Events.IKeyEventArg);
+
+    expect(controller.dispatch).toHaveBeenCalledWith({ type: "confirm_quit" });
+    expect(controller.dispose).toHaveBeenCalledTimes(1);
   });
 
   it("routes z and bracket keys to detail layout controls", async () => {
@@ -325,7 +386,7 @@ describe("BlessedTuiRenderer", () => {
     expect(controller.dispatch).not.toHaveBeenCalled();
   });
 
-  it("still quits when q is pressed while help overlay is open", async () => {
+  it("routes q to confirm_quit when help overlay is open", async () => {
     const controller = createControllerStub();
     controller.getRenderModel.mockReturnValue({
       ...renderModel,
@@ -341,7 +402,8 @@ describe("BlessedTuiRenderer", () => {
 
     await harness.handleKeypress("q", { name: "q" } as blessed.Widgets.Events.IKeyEventArg);
 
-    expect(controller.dispose).toHaveBeenCalledTimes(1);
+    expect(controller.dispatch).toHaveBeenCalledWith({ type: "confirm_quit" });
+    expect(controller.dispose).not.toHaveBeenCalled();
   });
 
   it("cleans up the screen when initialize fails", async () => {

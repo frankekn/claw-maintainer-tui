@@ -17,9 +17,9 @@ export function createInitialSessionState(resultLimit: number): TuiSessionState 
     activeUrl: null,
     query: "",
     queryState: {
-      "cross-search": { value: "", history: [], historyIndex: null },
-      "pr-search": { value: "", history: [], historyIndex: null },
-      "issue-search": { value: "", history: [], historyIndex: null },
+      "cross-search": { value: "", history: [], historyIndex: null, cursorIndex: 0 },
+      "pr-search": { value: "", history: [], historyIndex: null, cursorIndex: 0 },
+      "issue-search": { value: "", history: [], historyIndex: null, cursorIndex: 0 },
     },
     context: null,
     resultTitle: "Inbox",

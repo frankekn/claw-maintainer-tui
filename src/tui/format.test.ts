@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildStatusRows,
   defaultSecondaryHintText,
+  formatActionBar,
   formatHeader,
   formatInboxLandingDetail,
   formatListSummary,
@@ -17,6 +18,7 @@ import type {
   StatusSnapshot,
 } from "../types.js";
 import type { TuiHeaderModel } from "./types.js";
+import { selectedLine } from "./theme.js";
 
 const status: StatusSnapshot = {
   repo: "openclaw/openclaw",
@@ -310,6 +312,25 @@ describe("tui formatting", () => {
     expect(tabs).toContain("Inbox");
     expect(tabs).toContain("Watchlist");
     expect(tabs).toContain("Explore");
+  });
+
+  it("includes disabled actions in the action bar dimmed", () => {
+    const bar = formatActionBar([
+      { id: "detail", label: "Detail", shortcut: "Enter", enabled: true },
+      { id: "refresh", label: "Refresh", shortcut: "r", enabled: false },
+      { id: "back", label: "Back", shortcut: "b", enabled: true },
+    ]);
+    expect(bar).toContain("Detail");
+    expect(bar).toContain("Refresh");
+    expect(bar).toContain("Back");
+  });
+
+  it("produces distinct selected line markup for active and inactive focus", () => {
+    const active = selectedLine("> row text", true);
+    const inactive = selectedLine("> row text", false);
+    expect(active).not.toEqual(inactive);
+    expect(active).toContain("-bg");
+    expect(inactive).toContain("-bg");
   });
 
   it("formats status detail, status rows, summaries, and hints", () => {

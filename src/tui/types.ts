@@ -150,6 +150,7 @@ export type TuiQueryState = {
   value: string;
   history: string[];
   historyIndex: number | null;
+  cursorIndex: number;
 };
 
 export type TuiListSummary = {
@@ -309,10 +310,18 @@ export type TuiCommand =
   | { type: "stop_query" }
   | { type: "append_query"; value: string }
   | { type: "backspace_query" }
+  | { type: "clear_query" }
+  | { type: "delete_query_word" }
+  | { type: "move_query_cursor_left" }
+  | { type: "move_query_cursor_right" }
+  | { type: "move_query_cursor_home" }
+  | { type: "move_query_cursor_end" }
   | { type: "query_history_prev" }
   | { type: "query_history_next" }
   | { type: "submit_query" }
   | { type: "go_back" }
+  | { type: "escape" }
+  | { type: "confirm_quit" }
   | { type: "mark_seen" }
   | { type: "mark_visible_seen" }
   | { type: "toggle_watch" }
@@ -344,6 +353,7 @@ export type TuiFooterModel = {
   banner: TuiBanner | null;
   queryPrompt: string;
   queryValue: string;
+  queryCursorIndex: number;
   queryPlaceholder: string;
   queryHelpText: string;
   actions: TuiAction[];
