@@ -182,4 +182,19 @@ describe("resolveKeyAction", () => {
     } as unknown as blessed.Widgets.Events.IKeyEventArg);
     expect(action).toEqual({ kind: "command", command: { type: "delete_query_word" } });
   });
+
+  it("maps lowercase s to PR sync", () => {
+    const action = resolveKeyAction(makeModel(), "s", key("s", "s"));
+    expect(action).toEqual({ kind: "command", command: { type: "sync_prs" } });
+  });
+
+  it("maps uppercase S to issue sync", () => {
+    const action = resolveKeyAction(makeModel(), "S", key("S", "S"));
+    expect(action).toEqual({ kind: "command", command: { type: "sync_issues" } });
+  });
+
+  it("maps shifted lowercase s key events to issue sync", () => {
+    const action = resolveKeyAction(makeModel(), "s", key("s", "s", true));
+    expect(action).toEqual({ kind: "command", command: { type: "sync_issues" } });
+  });
 });

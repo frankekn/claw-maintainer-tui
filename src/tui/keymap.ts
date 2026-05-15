@@ -18,6 +18,14 @@ function isSlashKey(ch: string, key: blessed.Widgets.Events.IKeyEventArg): boole
   return ch === "/" || key.full === "/" || key.name === "slash";
 }
 
+function isKeyChar(
+  expected: string,
+  ch: string,
+  key: blessed.Widgets.Events.IKeyEventArg,
+): boolean {
+  return ch === expected || key.full === expected || key.name === expected;
+}
+
 export function resolveKeyAction(
   model: TuiRenderModel,
   ch: string,
@@ -214,10 +222,10 @@ export function resolveKeyAction(
     }
     return { kind: "command", command: { type: "clear_attention_state" } };
   }
-  if (key.name === "s" && key.shift) {
+  if (isKeyChar("S", ch, key) || (isKeyChar("s", ch, key) && key.shift)) {
     return { kind: "command", command: { type: "sync_issues" } };
   }
-  if (key.name === "s") {
+  if (isKeyChar("s", ch, key)) {
     return { kind: "command", command: { type: "sync_prs" } };
   }
   if (key.name === "r") {
