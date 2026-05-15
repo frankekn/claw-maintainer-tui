@@ -31,6 +31,10 @@ class FakePullRequestDataSource implements PullRequestDataSource {
   summaryCalls: number[] = [];
   factCalls: number[] = [];
   searchCalls: Array<{ query: string; state: "open" | "closed"; limit: number }> = [];
+  searchDelayMs = 0;
+  searchError: Error | null = null;
+  activeSearchCalls = 0;
+  maxConcurrentSearchCalls = 0;
   rateLimitCalls = 0;
   rateLimitError: Error | null = null;
   rateLimitStatus: { limit: number; remaining: number; resetAt: string } | null = {
@@ -116,7 +120,16 @@ class FakePullRequestDataSource implements PullRequestDataSource {
     query: string,
     options: { state: "open" | "closed"; limit: number },
   ): Promise<number[]> {
+    if (this.searchError) {
+      throw this.searchError;
+    }
     this.searchCalls.push({ query, state: options.state, limit: options.limit });
+    this.activeSearchCalls += 1;
+    this.maxConcurrentSearchCalls = Math.max(this.maxConcurrentSearchCalls, this.activeSearchCalls);
+    if (this.searchDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.searchDelayMs));
+    }
+    this.activeSearchCalls -= 1;
     return [...(this.searchResults.get(`${options.state}:${query}`) ?? [])].slice(0, options.limit);
   }
 }
@@ -816,6 +829,62 @@ describe("PrIndexStore", () => {
     expect(status.issueLabelCount).toBe(2);
   });
 
+  it("ranks exact issue and pull request links before fuzzy cross-reference matches", async () => {
+    const store = await createStore();
+    const exactClosing = makePullRequest(61010, {
+      title: "fix: settings crash recovery config",
+      body: "Fixes #42011\nRecover settings crash handling while refreshing config defaults.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const exactBody = makePullRequest(61011, {
+      title: "chore: adjust quiet unrelated setup",
+      body: "Fixes #42010\nAdjust quiet setup defaults.",
+      updatedAt: "2026-03-11T00:00:00.000Z",
+    });
+    const fuzzyPr = makePullRequest(61012, {
+      title: "fix: settings crash recovery",
+      body: "Saving settings can crash and lose edits during save.",
+      updatedAt: "2026-03-12T00:00:00.000Z",
+    });
+    const exactIssue = makeIssue(42010, {
+      title: "Settings crash during save",
+      body: "Saving settings can crash and lose edits.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const bodyLinkedIssue = makeIssue(42011, {
+      title: "Config default cleanup",
+      body: "Track a secondary config default cleanup.",
+      updatedAt: "2026-03-11T00:00:00.000Z",
+    });
+    const fuzzyIssue = makeIssue(42012, {
+      title: "Settings crash recovery config follow-up",
+      body: "Recover config handling when settings crash during save.",
+      updatedAt: "2026-03-12T00:00:00.000Z",
+    });
+
+    await store.sync({
+      repo,
+      source: new FakePullRequestDataSource([exactClosing, exactBody, fuzzyPr]),
+      full: true,
+    });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(61010, {
+        linkedIssues: [{ issueNumber: 42010, linkSource: "closing_reference" }],
+      }),
+    );
+    await store.syncIssues({
+      repo,
+      source: new FakeIssueDataSource([exactIssue, bodyLinkedIssue, fuzzyIssue]),
+      full: true,
+    });
+
+    const xrefIssue = await store.crossReferenceIssueToPullRequests(42010, 3);
+    expect(xrefIssue.pullRequests.map((pr) => pr.prNumber)).toEqual([61010, 61011, 61012]);
+
+    const xrefPr = await store.crossReferencePullRequestToIssues(61010, 3);
+    expect(xrefPr.issues.map((issue) => issue.issueNumber)).toEqual([42010, 42011, 42012]);
+  });
+
   it("refreshes changed issues incrementally without refetching each issue", async () => {
     const store = await createStore();
     const source = new FakeIssueDataSource([
@@ -1350,6 +1419,79 @@ describe("PrIndexStore", () => {
     });
   });
 
+  it("runs live issue searches concurrently and hydrates duplicate candidates once", async () => {
+    const store = await createStore();
+    const seed = makePullRequest(39700, {
+      title: "fix: stabilize live issue search seed",
+      body: "Closes #39710\nStabilize live issue search seed.",
+      updatedAt: "2026-03-09T00:00:00.000Z",
+    });
+    const sibling = makePullRequest(39701, {
+      title: "fix: stabilize live issue search sibling",
+      body: "Closes #39710\nStabilize live issue search sibling.",
+      updatedAt: "2026-03-10T00:00:00.000Z",
+    });
+    const source = new FakePullRequestDataSource([seed, sibling]);
+    source.searchDelayMs = 5;
+    source.setSearchResults("39710", "open", [39701, 39701]);
+    source.setSearchResults("39710", "closed", [39701]);
+    source.setFacts(
+      makePullRequestFacts(39701, {
+        linkedIssues: [{ issueNumber: 39710, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/live/search.ts", kind: "prod" }],
+      }),
+    );
+
+    await store.sync({ repo, source: new FakePullRequestDataSource([seed]), full: true });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39700, {
+        linkedIssues: [{ issueNumber: 39710, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/live/search.ts", kind: "prod" }],
+      }),
+    );
+
+    const analysis = await store.clusterPullRequest({
+      prNumber: 39700,
+      limit: 10,
+      ftsOnly: true,
+      repo,
+      source,
+    });
+
+    expect(source.maxConcurrentSearchCalls).toBeGreaterThan(1);
+    expect(source.summaryCalls.filter((prNumber) => prNumber === 39701)).toHaveLength(1);
+    expect(source.factCalls.filter((prNumber) => prNumber === 39701)).toHaveLength(1);
+    expect(analysis?.sameClusterCandidates.map((candidate) => candidate.prNumber)).toContain(39701);
+  });
+
+  it("fails the cluster operation when a live search fails", async () => {
+    const store = await createStore();
+    const seed = makePullRequest(39702, {
+      title: "fix: fail live issue search seed",
+      body: "Closes #39712\nFail live issue search seed.",
+    });
+    const source = new FakePullRequestDataSource([seed]);
+    source.searchError = new Error("live search failed");
+
+    await store.sync({ repo, source: new FakePullRequestDataSource([seed]), full: true });
+    await store.recordPullRequestFacts(
+      makePullRequestFacts(39702, {
+        linkedIssues: [{ issueNumber: 39712, linkSource: "closing_reference" }],
+        changedFiles: [{ path: "src/live/error.ts", kind: "prod" }],
+      }),
+    );
+
+    await expect(
+      store.clusterPullRequest({
+        prNumber: 39702,
+        limit: 10,
+        ftsOnly: true,
+        repo,
+        source,
+      }),
+    ).rejects.toThrow("live search failed");
+  });
+
   it("recovers semantic-only candidates via live search when local recall is empty", async () => {
     const store = await createStore();
     const seed = makePullRequest(39670, {
@@ -1371,6 +1513,11 @@ describe("PrIndexStore", () => {
     source.setSearchResults(
       "auto-show context usage warning when nearing token limit",
       "open",
+      [39671],
+    );
+    source.setSearchResults(
+      "auto-show context usage warning when nearing token limit",
+      "closed",
       [39671],
     );
 
@@ -1403,6 +1550,8 @@ describe("PrIndexStore", () => {
         }),
       ]),
     );
+    expect(source.summaryCalls.filter((prNumber) => prNumber === 39671)).toHaveLength(1);
+    expect(source.factCalls.filter((prNumber) => prNumber === 39671)).toHaveLength(1);
   });
 
   it("recovers semantic-only candidates from local path overlap and embedding rerank", async () => {
@@ -1460,6 +1609,82 @@ describe("PrIndexStore", () => {
           }),
         ]),
       );
+    } finally {
+      createProvider.mockRestore();
+    }
+  });
+
+  it("caches semantic-only cluster decisions until inputs or options change", async () => {
+    const embedBatch = vi.fn(async (texts: string[]) => texts.map(() => [1, 0]));
+    const createProvider = vi
+      .spyOn(embeddingModule, "createLocalEmbeddingProvider")
+      .mockResolvedValue({
+        id: "local",
+        model: "mock-cluster",
+        embedQuery: async () => [1, 0],
+        embedBatch,
+      });
+    try {
+      const store = await createStore();
+      const seed = makePullRequest(39720, {
+        title: "fix: stabilize semantic cache budget drift",
+        body: "Stabilize semantic cache budget drift in long-lived runs.",
+        updatedAt: "2026-03-08T00:00:00.000Z",
+      });
+      const neighbor = makePullRequest(39721, {
+        title: "fix: stabilize semantic cache budget drift follow-up",
+        body: "Stabilize semantic cache budget drift in a nearby runtime path.",
+        updatedAt: "2026-03-09T00:00:00.000Z",
+      });
+
+      await store.sync({
+        repo,
+        source: new FakePullRequestDataSource([seed, neighbor]),
+        full: true,
+      });
+      await store.recordPullRequestFacts(
+        makePullRequestFacts(39720, {
+          headSha: "head-39720-a",
+          changedFiles: [{ path: "src/cache/budget.ts", kind: "prod" }],
+        }),
+      );
+      await store.recordPullRequestFacts(
+        makePullRequestFacts(39721, {
+          headSha: "head-39721-a",
+          changedFiles: [{ path: "src/cache/budget.ts", kind: "prod" }],
+        }),
+      );
+
+      await store.clusterPullRequest({ prNumber: 39720, limit: 10, ftsOnly: true });
+      const firstRerankCalls = embedBatch.mock.calls.length;
+
+      await store.clusterPullRequest({ prNumber: 39720, limit: 10, ftsOnly: true });
+      expect(embedBatch.mock.calls.length).toBe(firstRerankCalls);
+
+      const limitedAnalysis = await store.clusterPullRequest({
+        prNumber: 39720,
+        limit: 1,
+        ftsOnly: true,
+      });
+      expect(limitedAnalysis?.sameClusterCandidates).toHaveLength(1);
+
+      const hybridAnalysis = await store.clusterPullRequest({
+        prNumber: 39720,
+        limit: 10,
+        ftsOnly: false,
+      });
+      expect(hybridAnalysis?.clusterBasis).toBe("semantic_only");
+
+      await store.recordPullRequestFacts(
+        makePullRequestFacts(39721, {
+          headSha: "head-39721-b",
+          changedFiles: [{ path: "src/cache/budget-follow-up.ts", kind: "prod" }],
+        }),
+      );
+      await store.clusterPullRequest({ prNumber: 39720, limit: 10, ftsOnly: true });
+
+      expect(embedBatch.mock.calls.length).toBeGreaterThan(firstRerankCalls);
+      expect(createProvider).toHaveBeenCalled();
     } finally {
       createProvider.mockRestore();
     }

@@ -116,6 +116,7 @@ type RestRateLimit = {
 
 type GhApiRunner = (path: string) => Promise<string>;
 type GhCommandRunner = (args: string[]) => Promise<string>;
+export type GhJsonFetcher = <T>(path: string) => Promise<T>;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -334,6 +335,8 @@ export function isRetryableGhApiError(error: unknown): boolean {
     error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
   return [
     "connection reset by peer",
+    "can't assign requested address",
+    "cannot assign requested address",
     "timed out",
     "timeout",
     "tls handshake timeout",
@@ -402,6 +405,13 @@ export async function ghCommandJsonWithRetry<T>(
   throw lastError;
 }
 
+function hasPullRequestMarker(value: unknown): boolean {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  return Boolean((value as { pull_request?: unknown }).pull_request);
+}
+
 async function collectPaginated<T>(pathBuilder: (page: number) => string): Promise<T[]> {
   const out: T[] = [];
   for (let page = 1; ; page += 1) {
@@ -418,6 +428,12 @@ async function collectPaginated<T>(pathBuilder: (page: number) => string): Promi
 }
 
 export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueDataSource {
+  private readonly fetchJson: GhJsonFetcher;
+
+  constructor(params: { fetchJson?: GhJsonFetcher } = {}) {
+    this.fetchJson = params.fetchJson ?? ghApiJsonWithRetry;
+  }
+
   async getRateLimitStatus(): Promise<{
     limit: number;
     remaining: number;
@@ -443,16 +459,28 @@ export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueD
     };
   }
 
-  async *listAllPullRequests(repo: RepoRef): AsyncGenerator<PullRequestRecord> {
+  async *listAllPullRequests(
+    repo: RepoRef,
+    options: { limit?: number; newestFirst?: boolean } = {},
+  ): AsyncGenerator<PullRequestRecord> {
+    if (options.limit !== undefined && options.limit <= 0) {
+      return;
+    }
+    const direction = options.newestFirst ? "desc" : "asc";
+    let yielded = 0;
     for (let page = 1; ; page += 1) {
-      const items = await ghApiJsonWithRetry<RestPullRequest[]>(
-        `repos/${repo.owner}/${repo.name}/pulls?state=all&sort=created&direction=asc&per_page=${PAGE_SIZE}&page=${page}`,
+      const items = await this.fetchJson<RestPullRequest[]>(
+        `repos/${repo.owner}/${repo.name}/pulls?state=all&sort=created&direction=${direction}&per_page=${PAGE_SIZE}&page=${page}`,
       );
       if (items.length === 0) {
         break;
       }
       for (const item of items) {
         yield toPullRequestRecord(item);
+        yielded += 1;
+        if (options.limit !== undefined && yielded >= options.limit) {
+          return;
+        }
       }
       if (items.length < PAGE_SIZE) {
         break;
@@ -498,19 +526,31 @@ export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueD
     return out.sort((a, b) => a.number - b.number);
   }
 
-  async *listAllIssues(repo: RepoRef): AsyncGenerator<IssueRecord> {
+  async *listAllIssues(
+    repo: RepoRef,
+    options: { limit?: number; newestFirst?: boolean } = {},
+  ): AsyncGenerator<IssueRecord> {
+    if (options.limit !== undefined && options.limit <= 0) {
+      return;
+    }
+    const direction = options.newestFirst ? "desc" : "asc";
+    let yielded = 0;
     for (let page = 1; ; page += 1) {
-      const items = await ghApiJsonWithRetry<RestIssue[]>(
-        `repos/${repo.owner}/${repo.name}/issues?state=all&sort=created&direction=asc&per_page=${PAGE_SIZE}&page=${page}`,
+      const items = await this.fetchJson<RestIssue[]>(
+        `repos/${repo.owner}/${repo.name}/issues?state=all&sort=created&direction=${direction}&per_page=${PAGE_SIZE}&page=${page}`,
       );
       if (items.length === 0) {
         break;
       }
       for (const item of items) {
-        if (item.pull_request) {
+        if (hasPullRequestMarker(item)) {
           continue;
         }
         yield toIssueRecord(item);
+        yielded += 1;
+        if (options.limit !== undefined && yielded >= options.limit) {
+          return;
+        }
       }
       if (items.length < PAGE_SIZE) {
         break;

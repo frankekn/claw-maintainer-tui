@@ -22,6 +22,7 @@ export async function syncPullRequestsWorkflow(params: {
   source: PullRequestDataSource;
   full?: boolean;
   hydrateAll?: boolean;
+  maxFullSyncItems?: number;
   onProgress?: (event: SyncProgressEvent) => void;
   syncConcurrency: number;
   lastSyncWatermark: string | null;
@@ -68,7 +69,10 @@ export async function syncPullRequestsWorkflow(params: {
   };
 
   if (mode === "full") {
-    for await (const pr of params.source.listAllPullRequests(params.repo)) {
+    for await (const pr of params.source.listAllPullRequests(params.repo, {
+      limit: params.maxFullSyncItems,
+      newestFirst: params.maxFullSyncItems !== undefined,
+    })) {
       emitProgress("discovering", pr.number, pr.title);
       const existingUpdatedAt = params.getStoredUpdatedAt(pr.number);
       if (existingUpdatedAt === pr.updatedAt) {
@@ -172,6 +176,7 @@ export async function syncIssuesWorkflow(params: {
   repo: RepoRef;
   source: IssueDataSource;
   full?: boolean;
+  maxFullSyncItems?: number;
   onProgress?: (event: SyncProgressEvent) => void;
   syncConcurrency: number;
   lastSyncWatermark: string | null;
@@ -213,7 +218,10 @@ export async function syncIssuesWorkflow(params: {
   };
 
   if (mode === "full") {
-    for await (const issue of params.source.listAllIssues(params.repo)) {
+    for await (const issue of params.source.listAllIssues(params.repo, {
+      limit: params.maxFullSyncItems,
+      newestFirst: params.maxFullSyncItems !== undefined,
+    })) {
       emitProgress("discovering", issue.number, issue.title);
       const existingUpdatedAt = params.getStoredIssueUpdatedAt(issue.number);
       if (existingUpdatedAt === issue.updatedAt) {

@@ -515,7 +515,10 @@ export type PrContextBundle = {
 };
 
 export interface PullRequestDataSource {
-  listAllPullRequests(repo: RepoRef): AsyncGenerator<PullRequestRecord>;
+  listAllPullRequests(
+    repo: RepoRef,
+    options?: { limit?: number; newestFirst?: boolean },
+  ): AsyncGenerator<PullRequestRecord>;
   listChangedPullRequestNumbersSince(repo: RepoRef, since: string): Promise<number[]>;
   listChangedPullRequestsSince?(repo: RepoRef, since: string): Promise<PullRequestRecord[]>;
   getPullRequestSummary?(repo: RepoRef, prNumber: number): Promise<PullRequestRecord>;
@@ -534,7 +537,10 @@ export interface PullRequestDataSource {
 }
 
 export interface IssueDataSource {
-  listAllIssues(repo: RepoRef): AsyncGenerator<IssueRecord>;
+  listAllIssues(
+    repo: RepoRef,
+    options?: { limit?: number; newestFirst?: boolean },
+  ): AsyncGenerator<IssueRecord>;
   listChangedIssueNumbersSince(repo: RepoRef, since: string): Promise<number[]>;
   listChangedIssuesSince?(repo: RepoRef, since: string): Promise<IssueRecord[]>;
   getIssue(repo: RepoRef, issueNumber: number): Promise<IssueRecord>;
