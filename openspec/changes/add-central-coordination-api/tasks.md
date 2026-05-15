@@ -13,6 +13,7 @@
 - [ ] Add feature flags/config placeholders for future API mode without changing current defaults.
 
 ### Verification
+
 - [ ] The repo tree contains the new directories without breaking current local-first commands.
 - [ ] The OpenSpec artifacts are internally consistent.
 
@@ -51,6 +52,7 @@
   - [ ] job dedupe
 
 ### Verification
+
 - [ ] Fixture webhook payloads can be ingested into a temp SQLite DB.
 - [ ] Replaying the same webhook does not create duplicate rows or duplicate jobs.
 - [ ] The server starts and exposes a health endpoint.
@@ -75,6 +77,7 @@
 - [ ] Add integration tests for changed-feed watermarks and hydrated detail endpoints.
 
 ### Verification
+
 - [ ] A mocked device-flow login results in a server-issued access token.
 - [ ] A non-member login is rejected.
 - [ ] Changed-feed endpoints only return rows updated after the watermark.
@@ -106,6 +109,7 @@
   - [ ] dedupe by item/head/analyzer/schema
 
 ### Verification
+
 - [ ] A queued analyze job can dispatch to a mocked OpenClaw endpoint.
 - [ ] A valid analysis payload is accepted and queryable via latest-analysis lookup.
 - [ ] An invalid or duplicate analysis payload is rejected or safely ignored.
@@ -132,6 +136,7 @@
   - [ ] prioritization order
 
 ### Verification
+
 - [ ] A backfill run can stop and resume without losing progress.
 - [ ] Existing analyzed items are skipped unless force-recompute is set.
 - [ ] Open PRs and open issues are processed before historical closed items.
@@ -156,6 +161,7 @@
   - [ ] reviewer suggestion ordering
 
 ### Verification
+
 - [ ] The API returns candidate related-intent items before vector search is enabled.
 - [ ] Distinct solution variants for the same problem can coexist in one cluster.
 - [ ] Reviewer hints are returned as suggestions, not required assignees.
@@ -183,6 +189,7 @@
   - [ ] fallback to local-only mode when no API config is present
 
 ### Verification
+
 - [ ] The current TUI can run with API-backed sync without changing its main screens.
 - [ ] The existing local-only mode still works with no API config.
 - [ ] Attention-state updates in API mode are per-user and survive restart.
@@ -212,6 +219,7 @@
   - [ ] client sync
 
 ### Verification
+
 - [ ] CSV exports contain operator-friendly columns and do not mutate server data.
 - [ ] Dead-lettered dispatch jobs are inspectable.
 - [ ] Operators can run the full flow from a clean environment using the docs.

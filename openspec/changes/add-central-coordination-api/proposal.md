@@ -45,54 +45,69 @@ Adding the central coordination plane here avoids a rewrite, preserves the exist
 ## Key decisions
 
 ### 1. Central server language
+
 Use Go for the server under `/server`, but keep the current TypeScript CLI/TUI and local store.
 
 ### 2. Authoritative store
+
 Use SQLite in WAL mode as the authoritative coordination store in phases 1-6.
 Spreadsheet output is export-only.
 
 ### 3. Agent topology
+
 Use one reasoning contract for triage, not two different analysis prompts.
 Use:
+
 - one dedicated OpenClaw triage agent for real-time and backfill item analysis
 - one non-LLM backfill coordinator job in the server to enumerate history and enqueue work
 
 A separate backfill reasoning agent is not required.
 
 ### 4. Clustering strategy
+
 Cluster by `problem_intent`, not only by diff similarity.
 Store both:
+
 - `problem_intent`: the human problem being solved
 - `solution_shape`: what the current PR or issue proposal actually does
 
 ### 5. Migration shape
+
 Do not replace the local read model first.
 Add API-backed adapters that satisfy the existing interfaces, then let the current sync and TUI flows consume the server.
 
 ## Rollout phases
 
 ### Phase 0 — Planning and scaffolding
+
 Add OpenSpec, finalize contracts, and land the file layout.
 
 ### Phase 1 — Server skeleton and normalized storage
+
 Add the Go module, SQLite schema, GitHub App webhook ingest, normalization, and idempotent jobs.
 
 ### Phase 2 — Auth and API
+
 Add GitHub-backed user auth, org membership checks, server-issued sessions, change feeds, detail endpoints, and analysis ingest endpoints.
 
 ### Phase 3 — OpenClaw triage agent
+
 Add the dedicated hook agent, skill drafts, dispatch path, and structured maintainer-analysis payloads.
 
 ### Phase 4 — Historical backfill
+
 Add resumable backfill jobs for existing open PRs, open issues, and recent merged PRs.
 
 ### Phase 5 — Dedupe, cluster linking, and reviewer hints
+
 Add server-side candidate generation, agent-side cluster decisions, and related-intent endpoints.
 
 ### Phase 6 — Client integration
+
 Add API-backed data-source adapters and optional auth-enabled central sync in the current CLI/TUI.
 
 ### Phase 7 — Hardening and operator views
+
 Add export endpoints, CSV generation, observability, retries, rate-limit handling, and rollout docs.
 
 ## Success criteria
@@ -125,7 +140,9 @@ If the central mode is unstable:
 ## Open questions explicitly resolved here
 
 ### How should existing PRs and issues be handled?
+
 Use a server-managed backfill coordinator job plus the same triage analysis contract used for real-time items. Do not create a separate reasoning prompt unless later evidence shows backfill needs different policy.
 
 ### Spreadsheet or SQLite?
+
 SQLite is the authoritative store. CSV/spreadsheet exports are operator views only.
