@@ -437,7 +437,7 @@ export function formatSearchLandingDetail(
   const noun = mode === "pr-search" ? "PR" : "issue";
   const plural = mode === "pr-search" ? "PRs" : "issues";
   const count = status ? (mode === "pr-search" ? status.prCount : status.issueCount) : null;
-  const lines = [sectionLabel("Start Here"), `Showing cached open ${plural}`];
+  const lines = [sectionLabel("Start Here"), `Showing recent cached ${plural}`];
   if (status) {
     lines.push(accentMeta("repo", status.repo));
     lines.push(accentMeta("local_rows", String(count)));
@@ -453,7 +453,7 @@ export function formatSearchLandingDetail(
   lines.push(
     "",
     sectionLabel("Workflow"),
-    `1 Browse open ${plural.toLowerCase()} or press / to search.`,
+    `1 Browse recent cached ${plural.toLowerCase()} or press / to search.`,
     `2 Press Enter to inspect the selected ${noun.toLowerCase()}.`,
     "3 Press m to load 20 more rows.",
   );

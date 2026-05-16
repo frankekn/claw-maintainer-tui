@@ -9,6 +9,7 @@ import {
   formatModeTabs,
   formatPriorityPrDetail,
   formatResultRow,
+  formatSearchLandingDetail,
   formatStatusDetail,
 } from "./format.js";
 import type {
@@ -26,6 +27,12 @@ const status: StatusSnapshot = {
   lastSyncWatermark: "2026-03-11T07:28:13.832Z",
   issueLastSyncAt: "2026-03-11T07:43:23.912Z",
   issueLastSyncWatermark: "2026-03-11T07:43:23.912Z",
+  prHotSyncAt: null,
+  issueHotSyncAt: null,
+  prBackfillCursor: null,
+  prBackfillCompletedAt: null,
+  issueBackfillCursor: null,
+  issueBackfillCompletedAt: null,
   prCount: 23935,
   issueCount: 17535,
   labelCount: 61148,
@@ -66,8 +73,12 @@ const headerModel: TuiHeaderModel = {
       },
       errorMessage: null,
       pendingRerun: false,
+      pendingTrigger: null,
       nextAutoUpdateAt: null,
       lastCompletedAt: null,
+      lastMode: null,
+      lastReason: null,
+      nextBackfillCursor: null,
     },
   ],
   detailAutoRefreshInFlight: true,
@@ -298,6 +309,17 @@ describe("tui formatting", () => {
     expect(collapsed.lines.join("\n")).toContain("[collapsed]");
     expect(collapsed.lines.join("\n")).not.toContain("recent_comments");
     expect(collapsed.lines.join("\n")).not.toContain("Issue 41789");
+  });
+
+  it("uses recent cached copy on PR and issue search landings", () => {
+    const now = new Date("2026-03-11T08:28:13.832Z");
+    const prLanding = formatSearchLandingDetail("pr-search", status, now);
+    expect(prLanding.join("\n")).toContain("recent cached");
+    expect(prLanding.join("\n")).toContain("PRs");
+
+    const issueLanding = formatSearchLandingDetail("issue-search", status, now);
+    expect(issueLanding.join("\n")).toContain("recent cached");
+    expect(issueLanding.join("\n")).toContain("issues");
   });
 
   it("formats Inbox landing copy and mode tabs", () => {

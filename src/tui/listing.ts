@@ -214,7 +214,7 @@ export async function resolveListRows(params: {
   }
 
   if (mode === "cross-search") {
-    const searchQuery = query || "state:open";
+    const searchQuery = query || "state:all";
     const limits = crossSearchLimits(browseLimit);
     const [pullRequests, issues] = await Promise.all([
       search(searchQuery, limits.pr),
@@ -240,7 +240,7 @@ export async function resolveListRows(params: {
   }
 
   if (mode === "pr-search") {
-    const searchQuery = query || "state:open";
+    const searchQuery = query || "state:all";
     const results = await search(searchQuery, browseLimit);
     const rows = results.map((pr) => toPrRow(pr));
     return {
@@ -249,16 +249,16 @@ export async function resolveListRows(params: {
       resultTitle: query ? `PRs · ${query}` : "PRs",
       message:
         rows.length > 0
-          ? `Loaded ${rows.length} ${query ? "PR result" : "open PR"}(s).`
+          ? `Loaded ${rows.length} ${query ? "PR result" : "recent cached PR"}(s).`
           : query
             ? "No PR results."
-            : "No open PRs found.",
+            : "No recent cached PRs found.",
       activeUrl: rowUrl(rows[0]),
       isLandingView: !query,
     };
   }
 
-  const searchQuery = query || "state:open";
+  const searchQuery = query || "state:all";
   const issues = await searchIssues(searchQuery, browseLimit);
   const rows = issues.map((issue) => toIssueRow(issue));
   return {
@@ -267,10 +267,10 @@ export async function resolveListRows(params: {
     resultTitle: query ? `Issues · ${query}` : "Issues",
     message:
       rows.length > 0
-        ? `Loaded ${rows.length} ${query ? "issue result" : "open issue"}(s).`
+        ? `Loaded ${rows.length} ${query ? "issue result" : "recent cached issue"}(s).`
         : query
           ? "No issue results."
-          : "No open issues found.",
+          : "No recent cached issues found.",
     activeUrl: rowUrl(rows[0]),
     isLandingView: !query,
   };

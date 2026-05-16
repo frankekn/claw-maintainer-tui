@@ -52,6 +52,23 @@ function formatSyncJobBadge(job: TuiSyncJobSnapshot): string | null {
   if (job.state === "error") {
     return badge(`${prefix} ERROR`, "error");
   }
+  if (job.state === "cooldown") {
+    if (job.lastMode === "skipped" && job.lastReason === "rate_limit_reserve") {
+      return badge(`${prefix} SKIPPED RESERVE`, "error");
+    }
+    if (job.lastMode === "skipped") {
+      return badge(`${prefix} SKIPPED`, "warn");
+    }
+    if (job.lastMode === "hot") {
+      return badge(`${prefix} HOT`, "ok");
+    }
+    if (job.lastMode === "backfill") {
+      const cursor = job.nextBackfillCursor;
+      const label = cursor !== null && cursor !== undefined ? `BACKFILL ${cursor}` : "BACKFILL";
+      return badge(`${prefix} ${label}`, "ok");
+    }
+    return null;
+  }
   if (job.state !== "running" || !job.progress) {
     return null;
   }

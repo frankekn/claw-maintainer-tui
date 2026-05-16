@@ -6,10 +6,13 @@ import * as embeddingModule from "./embedding.js";
 import * as timeModule from "./lib/time.js";
 import { PrIndexStore } from "./store.js";
 import { resolveMergeReadiness } from "./store/merge-readiness.js";
+import { HOT_ISSUE_LIMIT, HOT_ISSUE_SCAN_PAGE_BUDGET, PAGE_SIZE } from "./store/sync-workflow.js";
 import type {
   HydratedPullRequest,
   IssueDataSource,
+  IssuePage,
   IssueRecord,
+  PullRequestPage,
   PullRequestCommentRecord,
   PullRequestDataSource,
   PullRequestFactRecord,
@@ -21,6 +24,46 @@ import type {
 const repo: RepoRef = { owner: "openclaw", name: "openclaw" };
 const MISSING_MODEL = "/tmp/clawlens-missing-model.gguf";
 
+type ListAllPrCallOptions = {
+  limit?: number;
+  newestFirst?: boolean;
+  sort?: "created" | "updated";
+  direction?: "asc" | "desc";
+  startPage?: number;
+};
+
+type ListAllIssueCallOptions = {
+  limit?: number;
+  newestFirst?: boolean;
+  sort?: "created" | "updated";
+  direction?: "asc" | "desc";
+  startPage?: number;
+};
+
+type ListPullRequestPageCallOptions = {
+  sort?: "created" | "updated";
+  direction?: "asc" | "desc";
+  startPage?: number;
+  pageLimit?: number;
+};
+
+type ListIssuePageCallOptions = {
+  sort?: "created" | "updated";
+  direction?: "asc" | "desc";
+  startPage?: number;
+  pageLimit?: number;
+};
+
+type FakeIssuePage = {
+  issues: IssueRecord[];
+  fetchedItemCount: number;
+};
+
+type FakePullRequestPage = {
+  pullRequests: PullRequestRecord[];
+  fetchedItemCount: number;
+};
+
 class FakePullRequestDataSource implements PullRequestDataSource {
   private readonly hydrated = new Map<number, HydratedPullRequest>();
   private readonly facts = new Map<number, PullRequestFactRecord>();
@@ -31,6 +74,12 @@ class FakePullRequestDataSource implements PullRequestDataSource {
   summaryCalls: number[] = [];
   factCalls: number[] = [];
   searchCalls: Array<{ query: string; state: "open" | "closed"; limit: number }> = [];
+  listAllPrCalls: ListAllPrCallOptions[] = [];
+  listPullRequestPageCalls: ListPullRequestPageCallOptions[] = [];
+  fetchedPullRequestPageNumbers: number[] = [];
+  pullRequestPages: FakePullRequestPage[] | null = null;
+  pageSize = 100;
+  failAfterYielding: number | null = null;
   searchDelayMs = 0;
   searchError: Error | null = null;
   activeSearchCalls = 0;
@@ -61,10 +110,93 @@ class FakePullRequestDataSource implements PullRequestDataSource {
     this.searchResults.set(`${state}:${query}`, [...prNumbers]);
   }
 
-  async *listAllPullRequests(_repo: RepoRef): AsyncGenerator<PullRequestRecord> {
-    const items = Array.from(this.hydrated.values()).sort((a, b) => a.pr.number - b.pr.number);
-    for (const item of items) {
-      yield item.pr;
+  private sortedPullRequests(
+    options: {
+      newestFirst?: boolean;
+      sort?: "created" | "updated";
+      direction?: "asc" | "desc";
+    } = {},
+  ): PullRequestRecord[] {
+    const sort = options.sort ?? "created";
+    const direction = options.direction ?? (options.newestFirst ? "desc" : "asc");
+    return Array.from(this.hydrated.values())
+      .map((item) => item.pr)
+      .sort((a, b) => {
+        const cmpField = sort === "updated" ? "updatedAt" : "createdAt";
+        const left = a[cmpField];
+        const right = b[cmpField];
+        if (left === right) {
+          return a.number - b.number;
+        }
+        return direction === "desc" ? right.localeCompare(left) : left.localeCompare(right);
+      });
+  }
+
+  private defaultPullRequestPages(options: ListPullRequestPageCallOptions): FakePullRequestPage[] {
+    const sorted = this.sortedPullRequests(options);
+    const pages: FakePullRequestPage[] = [];
+    for (let index = 0; index < sorted.length; index += this.pageSize) {
+      const pullRequests = sorted.slice(index, index + this.pageSize);
+      pages.push({ pullRequests, fetchedItemCount: pullRequests.length });
+    }
+    return pages;
+  }
+
+  async *listAllPullRequests(
+    _repo: RepoRef,
+    options: ListAllPrCallOptions = {},
+  ): AsyncGenerator<PullRequestRecord> {
+    this.listAllPrCalls.push({ ...options });
+    const sorted = this.sortedPullRequests(options);
+    const startPage = Math.max(1, options.startPage ?? 1);
+    const skip = (startPage - 1) * this.pageSize;
+    const limit = options.limit;
+    let yielded = 0;
+    for (let index = skip; index < sorted.length; index += 1) {
+      const item = sorted[index]!;
+      yield item;
+      yielded += 1;
+      if (this.failAfterYielding !== null && yielded >= this.failAfterYielding) {
+        throw new Error("simulated listAllPullRequests failure");
+      }
+      if (limit !== undefined && yielded >= limit) {
+        return;
+      }
+    }
+  }
+
+  async *listPullRequestPages(
+    _repo: RepoRef,
+    options: ListPullRequestPageCallOptions = {},
+  ): AsyncGenerator<PullRequestPage> {
+    this.listPullRequestPageCalls.push({ ...options });
+    const startPage = Math.max(1, options.startPage ?? 1);
+    const pageLimit = options.pageLimit === undefined ? undefined : Math.max(0, options.pageLimit);
+    if (pageLimit !== undefined && pageLimit <= 0) {
+      return;
+    }
+    const pages = this.pullRequestPages ?? this.defaultPullRequestPages(options);
+    let yieldedPages = 0;
+    let yieldedItems = 0;
+    for (let pageIndex = startPage - 1; pageIndex < pages.length; pageIndex += 1) {
+      if (pageLimit !== undefined && yieldedPages >= pageLimit) {
+        return;
+      }
+      const page = pages[pageIndex]!;
+      yieldedItems += page.pullRequests.length;
+      if (this.failAfterYielding !== null && yieldedItems >= this.failAfterYielding) {
+        throw new Error("simulated listAllPullRequests failure");
+      }
+      this.fetchedPullRequestPageNumbers.push(pageIndex + 1);
+      yield {
+        page: pageIndex + 1,
+        pullRequests: [...page.pullRequests],
+        fetchedItemCount: page.fetchedItemCount,
+      };
+      yieldedPages += 1;
+      if (page.fetchedItemCount < this.pageSize) {
+        return;
+      }
     }
   }
 
@@ -139,6 +271,12 @@ class FakeIssueDataSource implements IssueDataSource {
   changedIssueNumbers: number[] = [];
   changedIssues: IssueRecord[] = [];
   getIssueCalls: number[] = [];
+  listAllIssueCalls: ListAllIssueCallOptions[] = [];
+  listIssuePageCalls: ListIssuePageCallOptions[] = [];
+  fetchedIssuePageNumbers: number[] = [];
+  issuePages: FakeIssuePage[] | null = null;
+  pageSize = 100;
+  failAfterYielding: number | null = null;
 
   constructor(items: IssueRecord[]) {
     for (const item of items) {
@@ -150,10 +288,86 @@ class FakeIssueDataSource implements IssueDataSource {
     this.issues.set(item.number, item);
   }
 
-  async *listAllIssues(_repo: RepoRef): AsyncGenerator<IssueRecord> {
-    const items = Array.from(this.issues.values()).sort((a, b) => a.number - b.number);
-    for (const item of items) {
+  private sortedIssues(
+    options: {
+      newestFirst?: boolean;
+      sort?: "created" | "updated";
+      direction?: "asc" | "desc";
+    } = {},
+  ): IssueRecord[] {
+    const sort = options.sort ?? "created";
+    const direction = options.direction ?? (options.newestFirst ? "desc" : "asc");
+    return Array.from(this.issues.values()).sort((a, b) => {
+      const cmpField = sort === "updated" ? "updatedAt" : "createdAt";
+      const left = a[cmpField];
+      const right = b[cmpField];
+      if (left === right) {
+        return a.number - b.number;
+      }
+      return direction === "desc" ? right.localeCompare(left) : left.localeCompare(right);
+    });
+  }
+
+  private defaultIssuePages(options: ListIssuePageCallOptions): FakeIssuePage[] {
+    const sorted = this.sortedIssues(options);
+    const pages: FakeIssuePage[] = [];
+    for (let index = 0; index < sorted.length; index += this.pageSize) {
+      const issues = sorted.slice(index, index + this.pageSize);
+      pages.push({ issues, fetchedItemCount: issues.length });
+    }
+    return pages;
+  }
+
+  async *listAllIssues(
+    _repo: RepoRef,
+    options: ListAllIssueCallOptions = {},
+  ): AsyncGenerator<IssueRecord> {
+    this.listAllIssueCalls.push({ ...options });
+    const sorted = this.sortedIssues(options);
+    const startPage = Math.max(1, options.startPage ?? 1);
+    const skip = (startPage - 1) * this.pageSize;
+    const limit = options.limit;
+    let yielded = 0;
+    for (let index = skip; index < sorted.length; index += 1) {
+      const item = sorted[index]!;
       yield item;
+      yielded += 1;
+      if (this.failAfterYielding !== null && yielded >= this.failAfterYielding) {
+        throw new Error("simulated listAllIssues failure");
+      }
+      if (limit !== undefined && yielded >= limit) {
+        return;
+      }
+    }
+  }
+
+  async *listIssuePages(
+    _repo: RepoRef,
+    options: ListIssuePageCallOptions = {},
+  ): AsyncGenerator<IssuePage> {
+    this.listIssuePageCalls.push({ ...options });
+    const startPage = Math.max(1, options.startPage ?? 1);
+    const pageLimit = options.pageLimit === undefined ? undefined : Math.max(0, options.pageLimit);
+    if (pageLimit !== undefined && pageLimit <= 0) {
+      return;
+    }
+    const pages = this.issuePages ?? this.defaultIssuePages(options);
+    let yieldedPages = 0;
+    for (let pageIndex = startPage - 1; pageIndex < pages.length; pageIndex += 1) {
+      if (pageLimit !== undefined && yieldedPages >= pageLimit) {
+        return;
+      }
+      const page = pages[pageIndex]!;
+      this.fetchedIssuePageNumbers.push(pageIndex + 1);
+      yield {
+        page: pageIndex + 1,
+        issues: [...page.issues],
+        fetchedItemCount: page.fetchedItemCount,
+      };
+      yieldedPages += 1;
+      if (page.fetchedItemCount < this.pageSize) {
+        return;
+      }
     }
   }
 
@@ -2396,6 +2610,422 @@ describe("PrIndexStore", () => {
     expect(bundle?.mergeReadiness).toMatchObject({
       source: "review_fact",
       summary: "Repo A review fact should win.",
+    });
+  });
+
+  describe("hot metadata sync", () => {
+    it("requests updated-desc ordering and updates hot and planner timestamps without advancing the watermark", async () => {
+      const store = await createStore();
+      const prA = makePullRequest(70001, {
+        title: "hot pr a",
+        body: "Hot sync candidate.",
+        updatedAt: "2026-03-10T00:00:00.000Z",
+        createdAt: "2026-03-09T00:00:00.000Z",
+      });
+      const prB = makePullRequest(70002, {
+        title: "hot pr b",
+        body: "Hot sync candidate.",
+        updatedAt: "2026-03-12T00:00:00.000Z",
+        createdAt: "2026-03-08T00:00:00.000Z",
+      });
+      const source = new FakePullRequestDataSource([prA, prB]);
+
+      await store.sync({ repo, source, full: true, hydrateAll: false });
+      const statusBefore = await store.status();
+      const watermarkBefore = statusBefore.lastSyncWatermark;
+      source.hydrateCalls = [];
+      source.factCalls = [];
+      source.listAllPrCalls = [];
+
+      const hotSyncAt = "2026-03-13T00:00:00.000Z";
+      const isoNowSpy = vi.spyOn(timeModule, "isoNow").mockImplementation(() => hotSyncAt);
+      const summary = await store.syncHotPullRequests({ repo, source });
+      isoNowSpy.mockRestore();
+
+      expect(summary.mode).toBe("hot");
+      expect(summary.processedPrs).toBe(2);
+      expect(summary.entity).toBe("prs");
+      expect(source.listAllPrCalls).toHaveLength(1);
+      expect(source.listAllPrCalls[0]).toMatchObject({
+        sort: "updated",
+        direction: "desc",
+        limit: 500,
+      });
+      expect(source.hydrateCalls).toEqual([]);
+      expect(source.factCalls).toEqual([]);
+
+      const statusAfter = await store.status();
+      expect(statusAfter.prHotSyncAt).toBe(hotSyncAt);
+      expect(statusAfter.lastSyncAt).toBe(hotSyncAt);
+      expect(statusAfter.lastSyncWatermark).toBe(watermarkBefore);
+      expect(summary.lastSyncAt).toBe(hotSyncAt);
+      expect(summary.lastSyncWatermark).toBe(watermarkBefore);
+    });
+
+    it("does not hydrate PRs or call comment fetchers during hot sync", async () => {
+      const store = await createStore();
+      const pr = makePullRequest(70010);
+      const source = new FakePullRequestDataSource([pr]);
+
+      await store.syncHotPullRequests({ repo, source });
+
+      expect(source.hydrateCalls).toEqual([]);
+      expect(source.factCalls).toEqual([]);
+      expect(source.summaryCalls).toEqual([]);
+    });
+
+    it("syncHotIssues updates issue hot and planner timestamps without advancing the watermark", async () => {
+      const store = await createStore();
+      const issueA = makeIssue(80001, {
+        updatedAt: "2026-03-10T00:00:00.000Z",
+        createdAt: "2026-03-09T00:00:00.000Z",
+      });
+      const issueB = makeIssue(80002, {
+        updatedAt: "2026-03-12T00:00:00.000Z",
+        createdAt: "2026-03-08T00:00:00.000Z",
+      });
+      const issueSource = new FakeIssueDataSource([issueA, issueB]);
+
+      await store.syncIssues({ repo, source: issueSource, full: true });
+      const statusBefore = await store.status();
+      const issueWatermarkBefore = statusBefore.issueLastSyncWatermark;
+      issueSource.listAllIssueCalls = [];
+      issueSource.listIssuePageCalls = [];
+
+      const hotSyncAt = "2026-03-13T01:00:00.000Z";
+      const isoNowSpy = vi.spyOn(timeModule, "isoNow").mockImplementation(() => hotSyncAt);
+      const summary = await store.syncHotIssues({ repo, source: issueSource });
+      isoNowSpy.mockRestore();
+
+      expect(summary.mode).toBe("hot");
+      expect(summary.processedIssues).toBe(2);
+      expect(summary.entity).toBe("issues");
+      expect(issueSource.listAllIssueCalls).toEqual([]);
+      expect(issueSource.listIssuePageCalls[0]).toMatchObject({
+        sort: "updated",
+        direction: "desc",
+        pageLimit: HOT_ISSUE_SCAN_PAGE_BUDGET,
+      });
+
+      const statusAfter = await store.status();
+      expect(statusAfter.issueHotSyncAt).toBe(hotSyncAt);
+      expect(statusAfter.issueLastSyncAt).toBe(hotSyncAt);
+      expect(statusAfter.issueLastSyncWatermark).toBe(issueWatermarkBefore);
+      expect(summary.lastSyncAt).toBe(hotSyncAt);
+      expect(summary.lastSyncWatermark).toBe(issueWatermarkBefore);
+    });
+
+    it("syncHotIssues does not mark issue metadata fresh when no issues are touched", async () => {
+      const store = await createStore();
+      const seedIssue = makeIssue(80003, {
+        updatedAt: "2026-03-10T00:00:00.000Z",
+        createdAt: "2026-03-09T00:00:00.000Z",
+      });
+      const issueSource = new FakeIssueDataSource([seedIssue]);
+
+      await store.syncIssues({ repo, source: issueSource, full: true });
+      const statusBefore = await store.status();
+      issueSource.listAllIssueCalls = [];
+      issueSource.listIssuePageCalls = [];
+      issueSource.issuePages = Array.from({ length: HOT_ISSUE_SCAN_PAGE_BUDGET }, () => ({
+        issues: [],
+        fetchedItemCount: PAGE_SIZE,
+      }));
+
+      const hotSyncAt = "2026-03-13T01:30:00.000Z";
+      const isoNowSpy = vi.spyOn(timeModule, "isoNow").mockImplementation(() => hotSyncAt);
+      const summary = await store.syncHotIssues({ repo, source: issueSource });
+      isoNowSpy.mockRestore();
+
+      expect(summary.mode).toBe("hot");
+      expect(summary.processedIssues).toBe(0);
+      expect(issueSource.listAllIssueCalls).toEqual([]);
+      expect(issueSource.fetchedIssuePageNumbers).toEqual(
+        Array.from({ length: HOT_ISSUE_SCAN_PAGE_BUDGET }, (_, index) => index + 1),
+      );
+
+      const statusAfter = await store.status();
+      expect(statusAfter.issueHotSyncAt).toBe(statusBefore.issueHotSyncAt);
+      expect(statusAfter.issueLastSyncAt).toBe(statusBefore.issueLastSyncAt);
+      expect(summary.lastSyncAt).toBe(statusBefore.issueLastSyncAt);
+    });
+
+    it("bounds hot issue sync by fetched core issue pages", async () => {
+      const store = await createStore();
+      const issues = Array.from({ length: HOT_ISSUE_LIMIT + PAGE_SIZE }, (_, index) =>
+        makeIssue(81000 + index),
+      );
+      const issueSource = new FakeIssueDataSource(issues);
+      const pages: FakeIssuePage[] = [];
+      for (let index = 0; index < issues.length; index += PAGE_SIZE) {
+        pages.push({
+          issues: issues.slice(index, index + PAGE_SIZE),
+          fetchedItemCount: PAGE_SIZE,
+        });
+      }
+      issueSource.issuePages = pages;
+
+      const summary = await store.syncHotIssues({ repo, source: issueSource });
+
+      expect(summary.mode).toBe("hot");
+      expect(summary.processedIssues).toBe(HOT_ISSUE_LIMIT);
+      expect(issueSource.listAllIssueCalls).toEqual([]);
+      expect(issueSource.listIssuePageCalls).toHaveLength(1);
+      expect(issueSource.listIssuePageCalls[0]).toMatchObject({
+        sort: "updated",
+        direction: "desc",
+        pageLimit: HOT_ISSUE_SCAN_PAGE_BUDGET,
+      });
+      expect(issueSource.fetchedIssuePageNumbers).toEqual(
+        Array.from({ length: HOT_ISSUE_SCAN_PAGE_BUDGET }, (_, index) => index + 1),
+      );
+    });
+
+    it("returns processedPrs > 0 and mode 'hot' for the SyncSummary contract", async () => {
+      const store = await createStore();
+      const source = new FakePullRequestDataSource([
+        makePullRequest(70100),
+        makePullRequest(70101),
+      ]);
+
+      const summary = await store.syncHotPullRequests({ repo, source });
+
+      expect(summary.mode).toBe("hot");
+      expect(summary.processedPrs).toBeGreaterThan(0);
+      expect(summary.processedIssues).toBe(0);
+    });
+  });
+
+  describe("resumable backfill", () => {
+    function makeManyPrs(count: number, startNumber = 90000): HydratedPullRequest[] {
+      const out: HydratedPullRequest[] = [];
+      for (let index = 0; index < count; index += 1) {
+        const dayIndex = String(index + 1).padStart(2, "0");
+        out.push(
+          makePullRequest(startNumber + index, {
+            createdAt: `2025-01-${dayIndex}T00:00:00.000Z`,
+            updatedAt: `2025-01-${dayIndex}T00:00:00.000Z`,
+          }),
+        );
+      }
+      return out;
+    }
+
+    function makeManyIssues(count: number, startNumber = 90000): IssueRecord[] {
+      const out: IssueRecord[] = [];
+      for (let index = 0; index < count; index += 1) {
+        const dayIndex = String(index + 1).padStart(2, "0");
+        out.push(
+          makeIssue(startNumber + index, {
+            createdAt: `2025-01-${dayIndex}T00:00:00.000Z`,
+            updatedAt: `2025-01-${dayIndex}T00:00:00.000Z`,
+          }),
+        );
+      }
+      return out;
+    }
+
+    it("advances the cursor after each fully processed page", async () => {
+      const store = await createStore();
+      // 250 PRs => 3 pages (100, 100, 50). One slice = 2 pages = 200 items.
+      const source = new FakePullRequestDataSource(makeManyPrs(250));
+
+      const summary = await store.runBackfillSlice({ entity: "prs", repo, source });
+
+      expect(summary.mode).toBe("backfill");
+      expect(summary.processedPrs).toBe(200);
+      // Start was page 1; after two complete pages cursor advances to 3.
+      expect(summary.nextBackfillCursor).toBe(3);
+      expect(source.listPullRequestPageCalls[0]).toMatchObject({
+        sort: "created",
+        direction: "asc",
+        startPage: 1,
+        pageLimit: 2,
+      });
+      const status = await store.status();
+      expect(status.prBackfillCursor).toBe(3);
+      expect(status.prBackfillCompletedAt).toBeNull();
+    });
+
+    it("sets the completion sentinel when the final page is partial", async () => {
+      const store = await createStore();
+      // 150 PRs total => one full page of 100, then partial page of 50.
+      const source = new FakePullRequestDataSource(makeManyPrs(150));
+
+      const summary = await store.runBackfillSlice({ entity: "prs", repo, source });
+
+      expect(summary.mode).toBe("backfill");
+      expect(summary.processedPrs).toBe(150);
+      expect(summary.nextBackfillCursor).toBeNull();
+      const status = await store.status();
+      expect(status.prBackfillCompletedAt).not.toBeNull();
+      expect(summary.lastSyncWatermark).toBeNull();
+      expect(summary.lastSyncAt).toBeNull();
+    });
+
+    it("uses fetched page size, not yielded PR count, for PR backfill completion", async () => {
+      const store = await createStore();
+      const hydrated = makeManyPrs(100);
+      const source = new FakePullRequestDataSource(hydrated);
+      source.pullRequestPages = [
+        {
+          pullRequests: hydrated.slice(0, 50).map((item) => item.pr),
+          fetchedItemCount: 100,
+        },
+        {
+          pullRequests: hydrated.slice(50, 100).map((item) => item.pr),
+          fetchedItemCount: 100,
+        },
+      ];
+
+      const summary = await store.runBackfillSlice({ entity: "prs", repo, source });
+
+      expect(summary.mode).toBe("backfill");
+      expect(summary.processedPrs).toBe(100);
+      expect(summary.nextBackfillCursor).toBe(3);
+      const status = await store.status();
+      expect(status.prBackfillCursor).toBe(3);
+      expect(status.prBackfillCompletedAt).toBeNull();
+    });
+
+    it("returns backfill_complete without fetching once completion sentinel is set", async () => {
+      const store = await createStore();
+      const source = new FakePullRequestDataSource(makeManyPrs(50));
+
+      const first = await store.runBackfillSlice({ entity: "prs", repo, source });
+      expect(first.nextBackfillCursor).toBeNull();
+      source.listPullRequestPageCalls = [];
+
+      const second = await store.runBackfillSlice({ entity: "prs", repo, source });
+      expect(second.mode).toBe("backfill");
+      expect(second.reason).toBe("backfill_complete");
+      expect(second.nextBackfillCursor).toBeNull();
+      expect(source.listPullRequestPageCalls).toEqual([]);
+    });
+
+    it("is idempotent on retry after a thrown error mid-page", async () => {
+      const store = await createStore();
+      const source = new FakePullRequestDataSource(makeManyPrs(300));
+      // Fail after 50 items so the first slice never completes its first page.
+      source.failAfterYielding = 50;
+
+      await expect(store.runBackfillSlice({ entity: "prs", repo, source })).rejects.toThrow(
+        /simulated listAllPullRequests failure/,
+      );
+
+      const statusAfterError = await store.status();
+      expect(statusAfterError.prBackfillCursor).toBeNull();
+      expect(statusAfterError.prBackfillCompletedAt).toBeNull();
+
+      // Retry without the failure injection should start over from cursor 1
+      // and successfully advance through 2 pages.
+      source.failAfterYielding = null;
+      source.listPullRequestPageCalls = [];
+      const retry = await store.runBackfillSlice({ entity: "prs", repo, source });
+
+      expect(retry.processedPrs).toBe(200);
+      expect(retry.nextBackfillCursor).toBe(3);
+      expect(source.listPullRequestPageCalls[0]).toMatchObject({
+        sort: "created",
+        direction: "asc",
+        startPage: 1,
+        pageLimit: 2,
+      });
+
+      const finalStatus = await store.status();
+      expect(finalStatus.prBackfillCursor).toBe(3);
+    });
+
+    it("nextBackfillCursor matches the persisted meta key", async () => {
+      const store = await createStore();
+      const source = new FakePullRequestDataSource(makeManyPrs(250));
+
+      const summary = await store.runBackfillSlice({ entity: "prs", repo, source });
+
+      const status = await store.status();
+      expect(summary.nextBackfillCursor).toBe(status.prBackfillCursor);
+    });
+
+    it("advances issue backfill cursor by fetched pages when issue pages contain pull requests", async () => {
+      const store = await createStore();
+      const issues = makeManyIssues(100);
+      const source = new FakeIssueDataSource(issues);
+      source.issuePages = [
+        { issues: issues.slice(0, 50), fetchedItemCount: 100 },
+        { issues: issues.slice(50, 100), fetchedItemCount: 100 },
+      ];
+
+      const summary = await store.runBackfillSlice({ entity: "issues", repo, source });
+
+      expect(summary.mode).toBe("backfill");
+      expect(summary.processedIssues).toBe(100);
+      expect(summary.nextBackfillCursor).toBe(3);
+      const status = await store.status();
+      expect(status.issueBackfillCursor).toBe(3);
+      expect(status.issueBackfillCompletedAt).toBeNull();
+      expect(source.listIssuePageCalls[0]).toMatchObject({
+        sort: "created",
+        direction: "asc",
+        startPage: 1,
+        pageLimit: 2,
+      });
+    });
+
+    it("sets the issue completion sentinel when fetched pages end on a full page boundary", async () => {
+      const store = await createStore();
+      const source = new FakeIssueDataSource(makeManyIssues(100));
+
+      const summary = await store.runBackfillSlice({ entity: "issues", repo, source });
+
+      expect(summary.mode).toBe("backfill");
+      expect(summary.processedIssues).toBe(100);
+      expect(summary.nextBackfillCursor).toBeNull();
+      const status = await store.status();
+      expect(status.issueBackfillCursor).toBe(2);
+      expect(status.issueBackfillCompletedAt).not.toBeNull();
+    });
+
+    it("does not infer fallback issue backfill completion from yielded issue count", async () => {
+      const store = await createStore();
+      const source = new FakeIssueDataSource(makeManyIssues(50));
+      Object.defineProperty(source, "listIssuePages", { value: undefined });
+
+      const first = await store.runBackfillSlice({ entity: "issues", repo, source });
+
+      expect(first.mode).toBe("backfill");
+      expect(first.processedIssues).toBe(50);
+      expect(first.nextBackfillCursor).toBe(2);
+      let status = await store.status();
+      expect(status.issueBackfillCursor).toBe(2);
+      expect(status.issueBackfillCompletedAt).toBeNull();
+
+      const second = await store.runBackfillSlice({ entity: "issues", repo, source });
+
+      expect(second.mode).toBe("backfill");
+      expect(second.processedIssues).toBe(0);
+      expect(second.nextBackfillCursor).toBeNull();
+      status = await store.status();
+      expect(status.issueBackfillCursor).toBe(2);
+      expect(status.issueBackfillCompletedAt).not.toBeNull();
+    });
+
+    it("backfills issues with the same cursor semantics", async () => {
+      const store = await createStore();
+      const source = new FakeIssueDataSource(makeManyIssues(150));
+
+      const summary = await store.runBackfillSlice({ entity: "issues", repo, source });
+
+      expect(summary.mode).toBe("backfill");
+      expect(summary.processedIssues).toBe(150);
+      expect(summary.nextBackfillCursor).toBeNull();
+      const status = await store.status();
+      expect(status.issueBackfillCompletedAt).not.toBeNull();
+      expect(source.listIssuePageCalls[0]).toMatchObject({
+        sort: "created",
+        direction: "asc",
+        startPage: 1,
+        pageLimit: 2,
+      });
     });
   });
 });

@@ -1,6 +1,8 @@
 import { GhCliPullRequestDataSource } from "../github.js";
 import { PrIndexStore } from "../store.js";
-import type { AttentionState, RepoRef } from "../types.js";
+import { selectSyncDecision } from "../sync-planner.js";
+import type { PlannerActiveTuiMode, PlannerEntity, PlannerSnapshot } from "../sync-planner.js";
+import type { AttentionState, RepoRef, StatusSnapshot, SyncSummary } from "../types.js";
 import type {
   TuiClusterVerificationSummary,
   TuiDataService,
@@ -167,23 +169,206 @@ export class StoreBackedTuiDataService implements TuiDataService {
     };
   }
 
-  syncPrs(options?: { onProgress?: (event: SyncProgressEvent) => void }) {
-    return this.store.sync({
-      repo: this.repo,
-      source: this.source,
-      full: false,
-      hydrateAll: false,
-      onProgress: options?.onProgress,
-    });
+  async syncPrs(options?: {
+    onProgress?: (event: SyncProgressEvent) => void;
+    trigger?: "manual" | "auto";
+    activeTuiMode?: PlannerActiveTuiMode;
+  }): Promise<SyncSummary> {
+    if (isPlannerDisabled()) {
+      return this.runSyncWithRateLimitCacheInvalidation(() =>
+        this.store.sync({
+          repo: this.repo,
+          source: this.source,
+          full: false,
+          hydrateAll: false,
+          onProgress: options?.onProgress,
+        }),
+      );
+    }
+    const snapshot = await this.buildPlannerSnapshot(
+      "prs",
+      options?.trigger ?? "manual",
+      options?.activeTuiMode ?? null,
+    );
+    const decision = selectSyncDecision(snapshot);
+    if (decision.kind === "skip") {
+      return this.makeSkippedSummary("prs", decision.reason);
+    }
+    switch (decision.mode) {
+      case "full":
+        return this.runSyncWithRateLimitCacheInvalidation(() =>
+          this.store.sync({
+            repo: this.repo,
+            source: this.source,
+            full: true,
+            hydrateAll: false,
+            onProgress: options?.onProgress,
+          }),
+        );
+      case "incremental":
+        return this.runSyncWithRateLimitCacheInvalidation(() =>
+          this.store.sync({
+            repo: this.repo,
+            source: this.source,
+            full: false,
+            hydrateAll: false,
+            onProgress: options?.onProgress,
+          }),
+        );
+      case "hot":
+        return this.runSyncWithRateLimitCacheInvalidation(() =>
+          this.store.syncHotPullRequests({
+            repo: this.repo,
+            source: this.source,
+            onProgress: options?.onProgress,
+          }),
+        );
+      case "backfill":
+        return this.runSyncWithRateLimitCacheInvalidation(() =>
+          this.store.runBackfillSlice({
+            entity: "prs",
+            repo: this.repo,
+            source: this.source,
+            onProgress: options?.onProgress,
+          }),
+        );
+    }
   }
 
-  syncIssues(options?: { onProgress?: (event: SyncProgressEvent) => void }) {
-    return this.store.syncIssues({
-      repo: this.repo,
-      source: this.source,
-      full: false,
-      onProgress: options?.onProgress,
-    });
+  async syncIssues(options?: {
+    onProgress?: (event: SyncProgressEvent) => void;
+    trigger?: "manual" | "auto";
+    activeTuiMode?: PlannerActiveTuiMode;
+  }): Promise<SyncSummary> {
+    if (isPlannerDisabled()) {
+      return this.runSyncWithRateLimitCacheInvalidation(() =>
+        this.store.syncIssues({
+          repo: this.repo,
+          source: this.source,
+          full: false,
+          onProgress: options?.onProgress,
+        }),
+      );
+    }
+    const snapshot = await this.buildPlannerSnapshot(
+      "issues",
+      options?.trigger ?? "manual",
+      options?.activeTuiMode ?? null,
+    );
+    const decision = selectSyncDecision(snapshot);
+    if (decision.kind === "skip") {
+      return this.makeSkippedSummary("issues", decision.reason);
+    }
+    switch (decision.mode) {
+      case "full":
+        return this.runSyncWithRateLimitCacheInvalidation(() =>
+          this.store.syncIssues({
+            repo: this.repo,
+            source: this.source,
+            full: true,
+            onProgress: options?.onProgress,
+          }),
+        );
+      case "incremental":
+        return this.runSyncWithRateLimitCacheInvalidation(() =>
+          this.store.syncIssues({
+            repo: this.repo,
+            source: this.source,
+            full: false,
+            onProgress: options?.onProgress,
+          }),
+        );
+      case "hot":
+        return this.runSyncWithRateLimitCacheInvalidation(() =>
+          this.store.syncHotIssues({
+            repo: this.repo,
+            source: this.source,
+            onProgress: options?.onProgress,
+          }),
+        );
+      case "backfill":
+        return this.runSyncWithRateLimitCacheInvalidation(() =>
+          this.store.runBackfillSlice({
+            entity: "issues",
+            repo: this.repo,
+            source: this.source,
+            onProgress: options?.onProgress,
+          }),
+        );
+    }
+  }
+
+  private async buildPlannerSnapshot(
+    entity: PlannerEntity,
+    trigger: "manual" | "auto",
+    activeTuiMode: PlannerActiveTuiMode,
+  ): Promise<PlannerSnapshot> {
+    const status = await this.store.status();
+    const rateLimit = await this.safeFreshRateLimitForPlanner();
+    return {
+      entity,
+      trigger,
+      manualOverride: null,
+      rateLimit,
+      freshness: plannerFreshness(status, entity),
+      activeTuiMode,
+      now: Date.now(),
+    };
+  }
+
+  private async safeFreshRateLimitForPlanner() {
+    try {
+      return await this.freshRateLimitForPlanner();
+    } catch {
+      this.invalidateRateLimitCache();
+      return null;
+    }
+  }
+
+  private async freshRateLimitForPlanner() {
+    const value = await this.source.getRateLimitStatus();
+    this.cacheRateLimit(value);
+    return value;
+  }
+
+  private async runSyncWithRateLimitCacheInvalidation<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } finally {
+      this.invalidateRateLimitCache();
+    }
+  }
+
+  private cacheRateLimit(
+    value: Awaited<ReturnType<GhCliPullRequestDataSource["getRateLimitStatus"]>>,
+  ) {
+    this.rateLimitCache = { value, expiresAt: Date.now() + 60_000 };
+  }
+
+  private invalidateRateLimitCache() {
+    this.rateLimitCache = null;
+  }
+
+  private makeSkippedSummary(
+    entity: PlannerEntity,
+    reason: "rate_limit_reserve" | "already_fresh" | "backfill_complete",
+  ): SyncSummary {
+    return {
+      mode: "skipped",
+      entity,
+      repo: `${this.repo.owner}/${this.repo.name}`,
+      processedPrs: 0,
+      processedIssues: 0,
+      skippedPrs: 0,
+      skippedIssues: 0,
+      docCount: 0,
+      commentCount: 0,
+      labelCount: 0,
+      vectorAvailable: false,
+      lastSyncAt: null,
+      lastSyncWatermark: null,
+      reason,
+    };
   }
 
   async setPrAttentionState(prNumber: number, state: AttentionState | null) {
@@ -204,7 +389,7 @@ export class StoreBackedTuiDataService implements TuiDataService {
       return this.rateLimitCache.value;
     }
     const value = await this.source.getRateLimitStatus();
-    this.rateLimitCache = { value, expiresAt: now + 60_000 };
+    this.cacheRateLimit(value);
     return value;
   }
 }
@@ -212,4 +397,30 @@ export class StoreBackedTuiDataService implements TuiDataService {
 function isRateLimitError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /rate limit/i.test(message);
+}
+
+function isPlannerDisabled(): boolean {
+  return process.env.CLAWLENS_SYNC_PLANNER === "off";
+}
+
+function plannerFreshness(
+  status: StatusSnapshot,
+  entity: PlannerEntity,
+): PlannerSnapshot["freshness"] {
+  if (entity === "prs") {
+    return {
+      lastSyncAt: status.lastSyncAt,
+      lastSyncWatermark: status.lastSyncWatermark,
+      hotSyncAt: status.prHotSyncAt,
+      backfillCursor: status.prBackfillCursor,
+      backfillCompletedAt: status.prBackfillCompletedAt,
+    };
+  }
+  return {
+    lastSyncAt: status.issueLastSyncAt,
+    lastSyncWatermark: status.issueLastSyncWatermark,
+    hotSyncAt: status.issueHotSyncAt,
+    backfillCursor: status.issueBackfillCursor,
+    backfillCompletedAt: status.issueBackfillCompletedAt,
+  };
 }

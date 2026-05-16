@@ -6,6 +6,7 @@ import type {
   SyncProgressEvent,
   SyncSummary,
 } from "../types.js";
+import type { PlannerActiveTuiMode } from "../sync-planner.js";
 import type { TuiDataService } from "./types.js";
 
 export class TuiEffects {
@@ -59,12 +60,28 @@ export class TuiEffects {
     return this.service.setPrAttentionState(prNumber, state);
   }
 
-  syncPrs(options?: { onProgress?: (event: SyncProgressEvent) => void }): Promise<SyncSummary> {
-    return this.service.syncPrs(options);
+  syncPrs(options?: {
+    onProgress?: (event: SyncProgressEvent) => void;
+    trigger?: "manual" | "auto";
+    activeTuiMode?: PlannerActiveTuiMode;
+  }): Promise<SyncSummary> {
+    return this.service.syncPrs({
+      onProgress: options?.onProgress,
+      trigger: options?.trigger ?? "manual",
+      activeTuiMode: options?.activeTuiMode ?? null,
+    });
   }
 
-  syncIssues(options?: { onProgress?: (event: SyncProgressEvent) => void }): Promise<SyncSummary> {
-    return this.service.syncIssues(options);
+  syncIssues(options?: {
+    onProgress?: (event: SyncProgressEvent) => void;
+    trigger?: "manual" | "auto";
+    activeTuiMode?: PlannerActiveTuiMode;
+  }): Promise<SyncSummary> {
+    return this.service.syncIssues({
+      onProgress: options?.onProgress,
+      trigger: options?.trigger ?? "manual",
+      activeTuiMode: options?.activeTuiMode ?? null,
+    });
   }
 
   refreshPrDetail(prNumber: number): Promise<void> {

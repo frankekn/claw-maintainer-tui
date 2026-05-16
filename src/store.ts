@@ -58,7 +58,14 @@ import {
 import { buildIssueFilterClause, buildPrFilterClause } from "./store/search-sql.js";
 import { resolveMergeReadiness as resolveMergeReadinessModel } from "./store/merge-readiness.js";
 import { mergeSummaryPullRequestRecord } from "./store/pull-request-sync-contract.js";
-import { syncIssuesWorkflow, syncPullRequestsWorkflow } from "./store/sync-workflow.js";
+import {
+  backfillIssuesWorkflow,
+  backfillPullRequestsWorkflow,
+  syncHotIssuesWorkflow,
+  syncHotPullRequestsWorkflow,
+  syncIssuesWorkflow,
+  syncPullRequestsWorkflow,
+} from "./store/sync-workflow.js";
 import {
   buildCrossReferenceQuery,
   extractChangedFileTerms,
@@ -124,6 +131,12 @@ const META_LAST_SYNC_AT = "last_sync_at";
 const META_LAST_SYNC_WATERMARK = "last_sync_watermark";
 const META_ISSUE_LAST_SYNC_AT = "issue_last_sync_at";
 const META_ISSUE_LAST_SYNC_WATERMARK = "issue_last_sync_watermark";
+const META_PR_HOT_SYNC_AT = "pr_hot_sync_at";
+const META_ISSUE_HOT_SYNC_AT = "issue_hot_sync_at";
+const META_PR_BACKFILL_CURSOR = "pr_backfill_cursor";
+const META_PR_BACKFILL_COMPLETED_AT = "pr_backfill_completed_at";
+const META_ISSUE_BACKFILL_CURSOR = "issue_backfill_cursor";
+const META_ISSUE_BACKFILL_COMPLETED_AT = "issue_backfill_completed_at";
 const META_REPO = "repo";
 const META_EMBEDDING_MODEL = "embedding_model";
 const META_VECTOR_DIMS = "vector_dims";
@@ -1447,6 +1460,109 @@ export class PrIndexStore {
         repo: META_REPO,
         lastSyncAt: META_ISSUE_LAST_SYNC_AT,
         lastSyncWatermark: META_ISSUE_LAST_SYNC_WATERMARK,
+      },
+    });
+  }
+
+  async syncHotPullRequests(params: {
+    repo: RepoRef;
+    source: PullRequestDataSource;
+    onProgress?: (event: SyncProgressEvent) => void;
+  }): Promise<SyncSummary> {
+    await this.init();
+    const repoName = `${params.repo.owner}/${params.repo.name}`;
+    return syncHotPullRequestsWorkflow({
+      repo: params.repo,
+      source: params.source,
+      onProgress: params.onProgress,
+      repoName,
+      vectorAvailable: this.vectorAvailable,
+      existingLastSyncWatermark: this.getMeta(META_LAST_SYNC_WATERMARK),
+      upsertPullRequestSummary: (pr, authority) => this.upsertPullRequestSummary(pr, authority),
+      setMeta: (key, value) => this.setMeta(key, value),
+      countRows: (table) => this.countRows(table),
+      metaKeys: {
+        repo: META_REPO,
+        hotSyncAt: META_PR_HOT_SYNC_AT,
+        lastSyncAt: META_LAST_SYNC_AT,
+      },
+    });
+  }
+
+  async syncHotIssues(params: {
+    repo: RepoRef;
+    source: IssueDataSource;
+    onProgress?: (event: SyncProgressEvent) => void;
+  }): Promise<SyncSummary> {
+    await this.init();
+    const repoName = `${params.repo.owner}/${params.repo.name}`;
+    return syncHotIssuesWorkflow({
+      repo: params.repo,
+      source: params.source,
+      onProgress: params.onProgress,
+      repoName,
+      vectorAvailable: this.vectorAvailable,
+      existingLastSyncWatermark: this.getMeta(META_ISSUE_LAST_SYNC_WATERMARK),
+      existingLastSyncAt: this.getMeta(META_ISSUE_LAST_SYNC_AT),
+      upsertIssue: (issue) => this.upsertIssue(issue),
+      setMeta: (key, value) => this.setMeta(key, value),
+      countRows: (table) => this.countRows(table),
+      metaKeys: {
+        repo: META_REPO,
+        hotSyncAt: META_ISSUE_HOT_SYNC_AT,
+        lastSyncAt: META_ISSUE_LAST_SYNC_AT,
+      },
+    });
+  }
+
+  async runBackfillSlice(params: {
+    entity: "prs" | "issues";
+    repo: RepoRef;
+    source: PullRequestDataSource | IssueDataSource;
+    onProgress?: (event: SyncProgressEvent) => void;
+  }): Promise<SyncSummary> {
+    await this.init();
+    const repoName = `${params.repo.owner}/${params.repo.name}`;
+    if (params.entity === "prs") {
+      const cursorRaw = this.getMeta(META_PR_BACKFILL_CURSOR);
+      const cursor =
+        cursorRaw !== null && Number.isFinite(Number(cursorRaw)) ? Number(cursorRaw) : null;
+      return backfillPullRequestsWorkflow({
+        repo: params.repo,
+        source: params.source as PullRequestDataSource,
+        onProgress: params.onProgress,
+        repoName,
+        vectorAvailable: this.vectorAvailable,
+        upsertPullRequestSummary: (pr, authority) => this.upsertPullRequestSummary(pr, authority),
+        setMeta: (key, value) => this.setMeta(key, value),
+        countRows: (table) => this.countRows(table),
+        cursor,
+        completedAt: this.getMeta(META_PR_BACKFILL_COMPLETED_AT),
+        metaKeys: {
+          repo: META_REPO,
+          backfillCursor: META_PR_BACKFILL_CURSOR,
+          backfillCompletedAt: META_PR_BACKFILL_COMPLETED_AT,
+        },
+      });
+    }
+    const cursorRaw = this.getMeta(META_ISSUE_BACKFILL_CURSOR);
+    const cursor =
+      cursorRaw !== null && Number.isFinite(Number(cursorRaw)) ? Number(cursorRaw) : null;
+    return backfillIssuesWorkflow({
+      repo: params.repo,
+      source: params.source as IssueDataSource,
+      onProgress: params.onProgress,
+      repoName,
+      vectorAvailable: this.vectorAvailable,
+      upsertIssue: (issue) => this.upsertIssue(issue),
+      setMeta: (key, value) => this.setMeta(key, value),
+      countRows: (table) => this.countRows(table),
+      cursor,
+      completedAt: this.getMeta(META_ISSUE_BACKFILL_COMPLETED_AT),
+      metaKeys: {
+        repo: META_REPO,
+        backfillCursor: META_ISSUE_BACKFILL_CURSOR,
+        backfillCompletedAt: META_ISSUE_BACKFILL_COMPLETED_AT,
       },
     });
   }
@@ -3757,12 +3873,28 @@ export class PrIndexStore {
 
   async status(): Promise<StatusSnapshot> {
     await this.init();
+    const prBackfillCursorRaw = this.getMeta(META_PR_BACKFILL_CURSOR);
+    const issueBackfillCursorRaw = this.getMeta(META_ISSUE_BACKFILL_CURSOR);
+    const prBackfillCursor =
+      prBackfillCursorRaw !== null && Number.isFinite(Number(prBackfillCursorRaw))
+        ? Number(prBackfillCursorRaw)
+        : null;
+    const issueBackfillCursor =
+      issueBackfillCursorRaw !== null && Number.isFinite(Number(issueBackfillCursorRaw))
+        ? Number(issueBackfillCursorRaw)
+        : null;
     return {
       repo: this.getMeta(META_REPO) ?? "",
       lastSyncAt: this.getMeta(META_LAST_SYNC_AT),
       lastSyncWatermark: this.getMeta(META_LAST_SYNC_WATERMARK),
       issueLastSyncAt: this.getMeta(META_ISSUE_LAST_SYNC_AT),
       issueLastSyncWatermark: this.getMeta(META_ISSUE_LAST_SYNC_WATERMARK),
+      prHotSyncAt: this.getMeta(META_PR_HOT_SYNC_AT),
+      issueHotSyncAt: this.getMeta(META_ISSUE_HOT_SYNC_AT),
+      prBackfillCursor,
+      prBackfillCompletedAt: this.getMeta(META_PR_BACKFILL_COMPLETED_AT),
+      issueBackfillCursor,
+      issueBackfillCompletedAt: this.getMeta(META_ISSUE_BACKFILL_COMPLETED_AT),
       prCount: this.countRows("prs"),
       issueCount: this.countRows("issues"),
       labelCount: this.countRows("pr_labels"),

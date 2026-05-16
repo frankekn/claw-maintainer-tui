@@ -11,19 +11,28 @@ import {
   recordSemanticReview,
 } from "./semantic.js";
 import { PrIndexStore } from "./store.js";
+import {
+  selectSyncDecision,
+  type PlannerEntity,
+  type PlannerMode,
+  type PlannerSkipReason,
+  type PlannerSnapshot,
+} from "./sync-planner.js";
 import { runTui } from "./tui/index.js";
 import type {
   PullRequestReviewFact,
   PullRequestShowResult,
   ReviewFactDecision,
+  RepoRef,
   SearchResult,
   SemanticQuerySourceKind,
+  StatusSnapshot,
   SyncSummary,
 } from "./types.js";
 
 const COMMAND_USAGE = {
-  sync: "sync [--full] [--hydrate-all] [--fts-only] [--repo owner/name] [--db path]",
-  "sync-issues": "sync-issues [--full] [--repo owner/name] [--db path]",
+  sync: "sync [--full | --hot | --backfill] [--hydrate-all] [--fts-only] [--repo owner/name] [--db path]",
+  "sync-issues": "sync-issues [--full | --hot | --backfill] [--repo owner/name] [--db path]",
   search: "search <query> [--limit N] [--repo owner/name] [--db path]",
   "issue-search": "issue-search <query> [--limit N] [--repo owner/name] [--db path]",
   show: "show <pr-number> [--repo owner/name] [--db path]",
@@ -47,10 +56,12 @@ const COMMAND_USAGE = {
 
 type Command = keyof typeof COMMAND_USAGE;
 
-type ParsedArgs = {
+export type ParsedArgs = {
   command: Command;
   repo: string;
   full: boolean;
+  hot: boolean;
+  backfill: boolean;
   hydrateAll: boolean;
   ftsOnly: boolean;
   limit: number;
@@ -148,7 +159,7 @@ function parseCommand(commandRaw: string | undefined, rest: string[]): Command {
   throw new CliUsageError(usage(), 1, "stderr");
 }
 
-function parseArgs(argv: string[]): ParsedArgs {
+export function parseArgs(argv: string[]): ParsedArgs {
   if (argv.length === 0 || argv.includes("--help") || argv.includes("-h")) {
     throw new CliUsageError(usage(), 0, "stdout");
   }
@@ -160,6 +171,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     command,
     repo: "openclaw/openclaw",
     full: false,
+    hot: false,
+    backfill: false,
     hydrateAll: false,
     ftsOnly: false,
     limit: 20,
@@ -178,6 +191,14 @@ function parseArgs(argv: string[]): ParsedArgs {
     const arg = rest[index]!;
     if (arg === "--full") {
       args.full = true;
+      continue;
+    }
+    if (arg === "--hot") {
+      args.hot = true;
+      continue;
+    }
+    if (arg === "--backfill") {
+      args.backfill = true;
       continue;
     }
     if (arg === "--hydrate-all") {
@@ -308,6 +329,14 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
     args.reviewFactPath = positional[0];
   }
+  if (args.command === "sync" || args.command === "sync-issues") {
+    const modeFlags = [args.full, args.hot, args.backfill].filter(Boolean).length;
+    if (modeFlags > 1) {
+      throw new Error(`${args.command} flags --full, --hot, and --backfill are mutually exclusive`);
+    }
+  } else if (args.hot || args.backfill) {
+    throw new Error(`--hot and --backfill are only valid for sync and sync-issues`);
+  }
   if (args.command === "review-fact-record") {
     if (!Number.isInteger(args.prNumber)) {
       throw new Error("review-fact record requires --pr <number>");
@@ -375,11 +404,12 @@ function normalizeReviewFactRecord(
   };
 }
 
-function printSyncSummary(summary: SyncSummary, options: { includeDocs: boolean }): number {
+export function printSyncSummary(summary: SyncSummary, options: { includeDocs: boolean }): number {
   printLines([
     `repo: ${summary.repo}`,
     `entity: ${summary.entity}`,
     `mode: ${summary.mode}`,
+    ...(summary.reason ? [`reason: ${summary.reason}`] : []),
     `processed_prs: ${summary.processedPrs}`,
     `processed_issues: ${summary.processedIssues}`,
     `skipped_prs: ${summary.skippedPrs}`,
@@ -389,9 +419,140 @@ function printSyncSummary(summary: SyncSummary, options: { includeDocs: boolean 
       : []),
     `labels: ${summary.labelCount}`,
     ...(options.includeDocs ? [`vector_available: ${summary.vectorAvailable}`] : []),
-    `last_sync_at: ${summary.lastSyncAt}`,
+    `last_sync_at: ${summary.lastSyncAt ?? ""}`,
+    `last_sync_watermark: ${summary.lastSyncWatermark ?? ""}`,
+    ...(summary.mode === "backfill" ||
+    (summary.mode === "skipped" && summary.reason === "backfill_complete")
+      ? [`next_backfill_cursor: ${summary.nextBackfillCursor ?? ""}`]
+      : []),
   ]);
   return 0;
+}
+
+function isPlannerDisabled(): boolean {
+  return process.env.CLAWLENS_SYNC_PLANNER === "off";
+}
+
+function plannerFreshness(
+  status: StatusSnapshot,
+  entity: PlannerEntity,
+): PlannerSnapshot["freshness"] {
+  if (entity === "prs") {
+    return {
+      lastSyncAt: status.lastSyncAt,
+      lastSyncWatermark: status.lastSyncWatermark,
+      hotSyncAt: status.prHotSyncAt,
+      backfillCursor: status.prBackfillCursor,
+      backfillCompletedAt: status.prBackfillCompletedAt,
+    };
+  }
+  return {
+    lastSyncAt: status.issueLastSyncAt,
+    lastSyncWatermark: status.issueLastSyncWatermark,
+    hotSyncAt: status.issueHotSyncAt,
+    backfillCursor: status.issueBackfillCursor,
+    backfillCompletedAt: status.issueBackfillCompletedAt,
+  };
+}
+
+export function makeSkippedSummary(
+  entity: PlannerEntity,
+  repo: RepoRef,
+  reason: PlannerSkipReason,
+  nextBackfillCursor?: number | null,
+  status?: StatusSnapshot,
+): SyncSummary {
+  return {
+    mode: "skipped",
+    entity,
+    repo: `${repo.owner}/${repo.name}`,
+    processedPrs: 0,
+    processedIssues: 0,
+    skippedPrs: 0,
+    skippedIssues: 0,
+    docCount: status?.docCount ?? 0,
+    commentCount: status?.commentCount ?? 0,
+    labelCount: entity === "prs" ? (status?.labelCount ?? 0) : (status?.issueLabelCount ?? 0),
+    vectorAvailable: status?.vectorAvailable ?? false,
+    lastSyncAt: null,
+    lastSyncWatermark: null,
+    reason,
+    ...(nextBackfillCursor !== undefined ? { nextBackfillCursor } : {}),
+  };
+}
+
+async function buildCliPlannerSnapshot(
+  store: PrIndexStore,
+  source: GhCliPullRequestDataSource,
+  entity: PlannerEntity,
+  manualOverride: PlannerMode | null,
+): Promise<PlannerSnapshot> {
+  const status = await store.status();
+  let rateLimit: Awaited<ReturnType<GhCliPullRequestDataSource["getRateLimitStatus"]>> = null;
+  try {
+    rateLimit = await source.getRateLimitStatus();
+  } catch {
+    rateLimit = null;
+  }
+  return {
+    entity,
+    trigger: "manual",
+    manualOverride,
+    rateLimit,
+    freshness: plannerFreshness(status, entity),
+    activeTuiMode: null,
+    now: Date.now(),
+  };
+}
+
+async function runPullRequestPlannerMode({
+  hydrateAll,
+  mode,
+  repo,
+  source,
+  store,
+}: Pick<CommandContext, "repo" | "source" | "store"> & {
+  hydrateAll: boolean;
+  mode: PlannerMode;
+}): Promise<SyncSummary> {
+  if (mode === "hot") {
+    return store.syncHotPullRequests({ repo, source });
+  }
+  if (mode === "backfill") {
+    return store.runBackfillSlice({ entity: "prs", repo, source });
+  }
+  if (mode === "incremental") {
+    return store.sync({ repo, source, full: false, hydrateAll });
+  }
+  if (mode === "full") {
+    return store.sync({ repo, source, full: true, hydrateAll });
+  }
+  const exhaustiveMode: never = mode;
+  throw new Error(`unknown PR planner mode: ${exhaustiveMode}`);
+}
+
+async function runIssuePlannerMode({
+  mode,
+  repo,
+  source,
+  store,
+}: Pick<CommandContext, "repo" | "source" | "store"> & {
+  mode: PlannerMode;
+}): Promise<SyncSummary> {
+  if (mode === "hot") {
+    return store.syncHotIssues({ repo, source });
+  }
+  if (mode === "backfill") {
+    return store.runBackfillSlice({ entity: "issues", repo, source });
+  }
+  if (mode === "incremental") {
+    return store.syncIssues({ repo, source, full: false });
+  }
+  if (mode === "full") {
+    return store.syncIssues({ repo, source, full: true });
+  }
+  const exhaustiveMode: never = mode;
+  throw new Error(`unknown issue planner mode: ${exhaustiveMode}`);
 }
 
 function printPullRequestShow(payload: PullRequestShowResult): number {
@@ -440,8 +601,47 @@ function printSearchResults(results: SearchResult[]): number {
 }
 
 const commandHandlers: Record<Command, CommandHandler> = {
-  sync: async ({ args, repo, source, store }) =>
-    printSyncSummary(
+  sync: async ({ args, repo, source, store }) => {
+    if (isPlannerDisabled()) {
+      if (args.hot || args.backfill) {
+        console.warn(
+          "note: CLAWLENS_SYNC_PLANNER=off; ignoring --hot/--backfill and running legacy sync",
+        );
+      }
+      return printSyncSummary(
+        await store.sync({
+          repo,
+          source,
+          full: args.full,
+          hydrateAll: args.hydrateAll,
+        }),
+        { includeDocs: true },
+      );
+    }
+    if (args.hot || args.backfill) {
+      const manualOverride: PlannerMode = args.hot ? "hot" : "backfill";
+      const snapshot = await buildCliPlannerSnapshot(store, source, "prs", manualOverride);
+      const decision = selectSyncDecision(snapshot);
+      if (decision.kind === "skip") {
+        return printSyncSummary(
+          makeSkippedSummary("prs", repo, decision.reason, null, await store.status()),
+          {
+            includeDocs: true,
+          },
+        );
+      }
+      return printSyncSummary(
+        await runPullRequestPlannerMode({
+          hydrateAll: args.hydrateAll,
+          mode: decision.mode,
+          repo,
+          source,
+          store,
+        }),
+        { includeDocs: true },
+      );
+    }
+    return printSyncSummary(
       await store.sync({
         repo,
         source,
@@ -449,17 +649,51 @@ const commandHandlers: Record<Command, CommandHandler> = {
         hydrateAll: args.hydrateAll,
       }),
       { includeDocs: true },
-    ),
+    );
+  },
 
-  "sync-issues": async ({ args, repo, source, store }) =>
-    printSyncSummary(
+  "sync-issues": async ({ args, repo, source, store }) => {
+    if (isPlannerDisabled()) {
+      if (args.hot || args.backfill) {
+        console.warn(
+          "note: CLAWLENS_SYNC_PLANNER=off; ignoring --hot/--backfill and running legacy sync-issues",
+        );
+      }
+      return printSyncSummary(
+        await store.syncIssues({
+          repo,
+          source,
+          full: args.full,
+        }),
+        { includeDocs: false },
+      );
+    }
+    if (args.hot || args.backfill) {
+      const manualOverride: PlannerMode = args.hot ? "hot" : "backfill";
+      const snapshot = await buildCliPlannerSnapshot(store, source, "issues", manualOverride);
+      const decision = selectSyncDecision(snapshot);
+      if (decision.kind === "skip") {
+        return printSyncSummary(
+          makeSkippedSummary("issues", repo, decision.reason, null, await store.status()),
+          {
+            includeDocs: false,
+          },
+        );
+      }
+      return printSyncSummary(
+        await runIssuePlannerMode({ mode: decision.mode, repo, source, store }),
+        { includeDocs: false },
+      );
+    }
+    return printSyncSummary(
       await store.syncIssues({
         repo,
         source,
         full: args.full,
       }),
       { includeDocs: false },
-    ),
+    );
+  },
 
   status: async ({ args, store }) => {
     const status = await store.status();
@@ -470,6 +704,12 @@ const commandHandlers: Record<Command, CommandHandler> = {
       `last_sync_watermark: ${status.lastSyncWatermark ?? "(never)"}`,
       `issue_last_sync_at: ${status.issueLastSyncAt ?? "(never)"}`,
       `issue_last_sync_watermark: ${status.issueLastSyncWatermark ?? "(never)"}`,
+      `pr_hot_sync_at: ${status.prHotSyncAt ?? "(never)"}`,
+      `issue_hot_sync_at: ${status.issueHotSyncAt ?? "(never)"}`,
+      `pr_backfill_cursor: ${status.prBackfillCursor ?? "(none)"}`,
+      `pr_backfill_completed_at: ${status.prBackfillCompletedAt ?? "(none)"}`,
+      `issue_backfill_cursor: ${status.issueBackfillCursor ?? "(none)"}`,
+      `issue_backfill_completed_at: ${status.issueBackfillCompletedAt ?? "(none)"}`,
       `prs: ${status.prCount}`,
       `issues: ${status.issueCount}`,
       `labels: ${status.labelCount}`,

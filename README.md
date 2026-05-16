@@ -21,6 +21,59 @@ Issue sync limits count accepted issue rows, not raw GitHub `/issues` rows. Pull
 
 Cluster recovery keeps live GitHub work bounded. Independent search variants run with limited concurrency, duplicate candidate PR numbers are hydrated once, and semantic-only cluster decisions are cached in memory until the seed or candidate signatures change.
 
+## Rate-limit-aware sync
+
+The TUI and CLI route sync through a deterministic in-app planner (`selectSyncDecision`) that inspects the local watermark, the GitHub rate-limit snapshot, and the active TUI mode before picking a sync mode. This keeps recent work visible without exhausting GitHub quota on large repos, while still allowing the legacy `store.sync` path as a rollback.
+
+The planner picks between four modes:
+
+- `hot`: when there is no watermark yet, or the watermark is older than the staleness threshold. Fetches recent PRs/issues ordered by `updated desc` and upserts summaries only. Does not advance `last_sync_watermark` and does not trigger PR hydration or fact prewarm.
+- `incremental`: when the watermark is set and fresher than the staleness threshold. Existing delta sync behavior.
+- `backfill`: chosen opportunistically after the primary mode when quota is healthy, the backfill cursor is still open, and no completion sentinel is recorded. Walks older history in small page batches and persists a cursor.
+- `skipped`: when remaining quota is below the hard reserve, regardless of manual override. The CLI exits `0` and the TUI surfaces `SKIPPED RESERVE` so auto-sync retries when quota recovers.
+
+### CLI flags
+
+Default `pnpm clawlens sync` and `pnpm clawlens sync-issues` behavior is unchanged. Two new flags drive the planner directly:
+
+```bash
+pnpm clawlens sync --hot --repo openclaw/openclaw
+pnpm clawlens sync --backfill --repo openclaw/openclaw
+pnpm clawlens sync-issues --hot --repo openclaw/openclaw
+pnpm clawlens sync-issues --backfill --repo openclaw/openclaw
+```
+
+`--full`, `--hot`, and `--backfill` are mutually exclusive. The TUI runs the planner automatically; manual `s` and `S` keys still trigger it.
+
+### Status output
+
+`pnpm clawlens status` now prints the new meta keys alongside the existing watermarks:
+
+```
+pr_hot_sync_at: 2026-05-16T00:18:23.000Z
+issue_hot_sync_at: 2026-05-16T00:18:24.000Z
+pr_backfill_cursor: 7
+pr_backfill_completed_at: (none)
+issue_backfill_cursor: (none)
+issue_backfill_completed_at: 2026-05-15T18:02:11.000Z
+```
+
+### Tunables
+
+The planner exposes a few constants in `src/sync-planner.ts`:
+
+- `STALE_WATERMARK_MS = 15 * 60 * 1000` (15 minutes): watermarks within this window stay on `incremental`; older ones flip to `hot` on the next tick.
+- `RATE_LIMIT_RESERVE = 100`: hard floor of remaining GitHub requests. Any decision below this becomes `skipped` with `reason: "rate_limit_reserve"`.
+- `RATE_LIMIT_BACKFILL_FLOOR = 500`: minimum remaining quota required before `backfill` is eligible.
+
+### Rollback
+
+Set `CLAWLENS_SYNC_PLANNER=off` in the environment to bypass the planner entirely. Both the CLI and the TUI short-circuit to the legacy `store.sync({ full: false })` / `store.syncIssues({ full: false })` paths, ignore `--hot`/`--backfill`, and do not write the new hot/backfill meta keys.
+
+```bash
+CLAWLENS_SYNC_PLANNER=off pnpm clawlens tui --repo openclaw/openclaw
+```
+
 ## Requirements
 
 - Node `>=22`

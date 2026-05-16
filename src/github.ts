@@ -6,7 +6,9 @@ import { isoNow } from "./lib/time.js";
 import type {
   HydratedPullRequest,
   IssueDataSource,
+  IssuePage,
   IssueRecord,
+  PullRequestPage,
   PullRequestChangedFile,
   PullRequestChangedFileKind,
   PullRequestCommentRecord,
@@ -461,28 +463,70 @@ export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueD
 
   async *listAllPullRequests(
     repo: RepoRef,
-    options: { limit?: number; newestFirst?: boolean } = {},
+    options: {
+      limit?: number;
+      newestFirst?: boolean;
+      sort?: "created" | "updated";
+      direction?: "asc" | "desc";
+      startPage?: number;
+    } = {},
   ): AsyncGenerator<PullRequestRecord> {
     if (options.limit !== undefined && options.limit <= 0) {
       return;
     }
-    const direction = options.newestFirst ? "desc" : "asc";
+    const sort = options.sort ?? "created";
+    const direction = options.direction ?? (options.newestFirst ? "desc" : "asc");
+    const startPage = Math.max(1, options.startPage ?? 1);
     let yielded = 0;
-    for (let page = 1; ; page += 1) {
-      const items = await this.fetchJson<RestPullRequest[]>(
-        `repos/${repo.owner}/${repo.name}/pulls?state=all&sort=created&direction=${direction}&per_page=${PAGE_SIZE}&page=${page}`,
-      );
-      if (items.length === 0) {
-        break;
-      }
-      for (const item of items) {
-        yield toPullRequestRecord(item);
+    for await (const page of this.listPullRequestPages(repo, {
+      sort,
+      direction,
+      startPage,
+    })) {
+      for (const item of page.pullRequests) {
+        yield item;
         yielded += 1;
         if (options.limit !== undefined && yielded >= options.limit) {
           return;
         }
       }
+    }
+  }
+
+  async *listPullRequestPages(
+    repo: RepoRef,
+    options: {
+      sort?: "created" | "updated";
+      direction?: "asc" | "desc";
+      startPage?: number;
+      pageLimit?: number;
+    } = {},
+  ): AsyncGenerator<PullRequestPage> {
+    const sort = options.sort ?? "created";
+    const direction = options.direction ?? "asc";
+    const startPage = Math.max(1, options.startPage ?? 1);
+    const pageLimit = options.pageLimit === undefined ? undefined : Math.max(0, options.pageLimit);
+    if (pageLimit !== undefined && pageLimit <= 0) {
+      return;
+    }
+    let fetchedPages = 0;
+    for (let page = startPage; ; page += 1) {
+      const items = await this.fetchJson<RestPullRequest[]>(
+        `repos/${repo.owner}/${repo.name}/pulls?state=all&sort=${sort}&direction=${direction}&per_page=${PAGE_SIZE}&page=${page}`,
+      );
+      if (items.length === 0) {
+        break;
+      }
+      fetchedPages += 1;
+      yield {
+        page,
+        fetchedItemCount: items.length,
+        pullRequests: items.map((item) => toPullRequestRecord(item)),
+      };
       if (items.length < PAGE_SIZE) {
+        break;
+      }
+      if (pageLimit !== undefined && fetchedPages >= pageLimit) {
         break;
       }
     }
@@ -528,31 +572,72 @@ export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueD
 
   async *listAllIssues(
     repo: RepoRef,
-    options: { limit?: number; newestFirst?: boolean } = {},
+    options: {
+      limit?: number;
+      newestFirst?: boolean;
+      sort?: "created" | "updated";
+      direction?: "asc" | "desc";
+      startPage?: number;
+    } = {},
   ): AsyncGenerator<IssueRecord> {
     if (options.limit !== undefined && options.limit <= 0) {
       return;
     }
-    const direction = options.newestFirst ? "desc" : "asc";
+    const sort = options.sort ?? "created";
+    const direction = options.direction ?? (options.newestFirst ? "desc" : "asc");
+    const startPage = Math.max(1, options.startPage ?? 1);
     let yielded = 0;
-    for (let page = 1; ; page += 1) {
-      const items = await this.fetchJson<RestIssue[]>(
-        `repos/${repo.owner}/${repo.name}/issues?state=all&sort=created&direction=${direction}&per_page=${PAGE_SIZE}&page=${page}`,
-      );
-      if (items.length === 0) {
-        break;
-      }
-      for (const item of items) {
-        if (hasPullRequestMarker(item)) {
-          continue;
-        }
-        yield toIssueRecord(item);
+    for await (const page of this.listIssuePages(repo, {
+      sort,
+      direction,
+      startPage,
+    })) {
+      for (const issue of page.issues) {
+        yield issue;
         yielded += 1;
         if (options.limit !== undefined && yielded >= options.limit) {
           return;
         }
       }
+    }
+  }
+
+  async *listIssuePages(
+    repo: RepoRef,
+    options: {
+      sort?: "created" | "updated";
+      direction?: "asc" | "desc";
+      startPage?: number;
+      pageLimit?: number;
+    } = {},
+  ): AsyncGenerator<IssuePage> {
+    const sort = options.sort ?? "created";
+    const direction = options.direction ?? "asc";
+    const startPage = Math.max(1, options.startPage ?? 1);
+    const pageLimit = options.pageLimit === undefined ? undefined : Math.max(0, options.pageLimit);
+    if (pageLimit !== undefined && pageLimit <= 0) {
+      return;
+    }
+    let fetchedPages = 0;
+    for (let page = startPage; ; page += 1) {
+      const items = await this.fetchJson<RestIssue[]>(
+        `repos/${repo.owner}/${repo.name}/issues?state=all&sort=${sort}&direction=${direction}&per_page=${PAGE_SIZE}&page=${page}`,
+      );
+      if (items.length === 0) {
+        break;
+      }
+      fetchedPages += 1;
+      yield {
+        page,
+        fetchedItemCount: items.length,
+        issues: items
+          .filter((item) => !hasPullRequestMarker(item))
+          .map((item) => toIssueRecord(item)),
+      };
       if (items.length < PAGE_SIZE) {
+        break;
+      }
+      if (pageLimit !== undefined && fetchedPages >= pageLimit) {
         break;
       }
     }

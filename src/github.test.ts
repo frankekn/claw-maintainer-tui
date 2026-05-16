@@ -8,7 +8,7 @@ import {
   type GhJsonFetcher,
 } from "./github.js";
 import { collectLinkedIssuesFromPrText } from "./lib/pull-request-facts.js";
-import type { IssueRecord, RepoRef } from "./types.js";
+import type { IssuePage, IssueRecord, RepoRef } from "./types.js";
 
 const repo: RepoRef = { owner: "openclaw", name: "openclaw" };
 
@@ -142,6 +142,83 @@ describe("clawlens github retry", () => {
     expect(paths).toHaveLength(2);
     expect(paths[0]).toContain("direction=desc");
     expect(paths[1]).toContain("page=2");
+  });
+
+  it("keeps updated-desc issue pagination on the repository issues endpoint", async () => {
+    const paths: string[] = [];
+    const fetchJson: GhJsonFetcher = async <T>(path: string): Promise<T> => {
+      paths.push(path);
+      return [
+        {
+          number: 42,
+          title: "Hot issue",
+          body: "Recent issue body",
+          user: { login: "alice" },
+          html_url: "https://github.com/openclaw/openclaw/issues/42",
+          created_at: "2026-03-10T00:00:00.000Z",
+          updated_at: "2026-03-12T00:00:00.000Z",
+          labels: [{ name: "bug" }],
+        },
+      ] as T;
+    };
+    const source = new GhCliPullRequestDataSource({ fetchJson });
+
+    const pages: IssuePage[] = [];
+    for await (const page of source.listIssuePages(repo, {
+      sort: "updated",
+      direction: "desc",
+      pageLimit: 5,
+    })) {
+      pages.push(page);
+    }
+
+    expect(paths).toHaveLength(1);
+    const url = new URL(`https://api.github.test/${paths[0]}`);
+    expect(url.pathname).toBe("/repos/openclaw/openclaw/issues");
+    expect(url.searchParams.get("state")).toBe("all");
+    expect(url.searchParams.get("sort")).toBe("updated");
+    expect(url.searchParams.get("direction")).toBe("desc");
+    expect(url.searchParams.get("per_page")).toBe("100");
+    expect(url.searchParams.get("page")).toBe("1");
+    expect(pages).toHaveLength(1);
+    expect(pages[0]?.fetchedItemCount).toBe(1);
+    expect(pages[0]?.issues.map((issue) => issue.number)).toEqual([42]);
+  });
+
+  it("keeps created issue pagination on the repository issues endpoint", async () => {
+    const paths: string[] = [];
+    const fetchJson: GhJsonFetcher = async <T>(path: string): Promise<T> => {
+      paths.push(path);
+      return [
+        {
+          number: 84,
+          title: "Backfill issue",
+          created_at: "2026-03-01T00:00:00.000Z",
+          updated_at: "2026-03-02T00:00:00.000Z",
+        },
+      ] as T;
+    };
+    const source = new GhCliPullRequestDataSource({ fetchJson });
+
+    const pages: IssuePage[] = [];
+    for await (const page of source.listIssuePages(repo, {
+      sort: "created",
+      direction: "asc",
+      startPage: 2,
+      pageLimit: 1,
+    })) {
+      pages.push(page);
+    }
+
+    expect(paths).toHaveLength(1);
+    const url = new URL(`https://api.github.test/${paths[0]}`);
+    expect(url.pathname).toBe("/repos/openclaw/openclaw/issues");
+    expect(url.searchParams.get("state")).toBe("all");
+    expect(url.searchParams.get("sort")).toBe("created");
+    expect(url.searchParams.get("direction")).toBe("asc");
+    expect(url.searchParams.get("per_page")).toBe("100");
+    expect(url.searchParams.get("page")).toBe("2");
+    expect(pages[0]?.issues.map((issue) => issue.number)).toEqual([84]);
   });
 
   it("keeps pull request facts scoped to fact-owned closing references", () => {
