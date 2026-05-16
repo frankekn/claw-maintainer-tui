@@ -437,9 +437,9 @@ export async function syncHotIssuesWorkflow(params: {
     }
   }
 
-  params.setMeta(params.metaKeys.hotSyncAt, hotSyncAt);
   const lastSyncAt = processedIssues > 0 ? hotSyncAt : params.existingLastSyncAt;
   if (processedIssues > 0) {
+    params.setMeta(params.metaKeys.hotSyncAt, hotSyncAt);
     params.setMeta(params.metaKeys.lastSyncAt, hotSyncAt);
   }
   emitProgress("complete");

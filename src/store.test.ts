@@ -2745,7 +2745,7 @@ describe("PrIndexStore", () => {
       );
 
       const statusAfter = await store.status();
-      expect(statusAfter.issueHotSyncAt).toBe(hotSyncAt);
+      expect(statusAfter.issueHotSyncAt).toBe(statusBefore.issueHotSyncAt);
       expect(statusAfter.issueLastSyncAt).toBe(statusBefore.issueLastSyncAt);
       expect(summary.lastSyncAt).toBe(statusBefore.issueLastSyncAt);
     });
