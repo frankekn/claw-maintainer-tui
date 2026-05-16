@@ -6,6 +6,7 @@ import * as embeddingModule from "./embedding.js";
 import * as timeModule from "./lib/time.js";
 import { PrIndexStore } from "./store.js";
 import { resolveMergeReadiness } from "./store/merge-readiness.js";
+import { HOT_ISSUE_PAGE_BUDGET } from "./store/sync-workflow.js";
 import type {
   HydratedPullRequest,
   IssueDataSource,
@@ -201,6 +202,7 @@ class FakeIssueDataSource implements IssueDataSource {
   getIssueCalls: number[] = [];
   listAllIssueCalls: ListAllIssueCallOptions[] = [];
   listIssuePageCalls: ListIssuePageCallOptions[] = [];
+  fetchedIssuePageNumbers: number[] = [];
   issuePages: FakeIssuePage[] | null = null;
   pageSize = 100;
   failAfterYielding: number | null = null;
@@ -285,6 +287,7 @@ class FakeIssueDataSource implements IssueDataSource {
         return;
       }
       const page = pages[pageIndex]!;
+      this.fetchedIssuePageNumbers.push(pageIndex + 1);
       yield {
         page: pageIndex + 1,
         issues: [...page.issues],
@@ -2540,7 +2543,7 @@ describe("PrIndexStore", () => {
   });
 
   describe("hot metadata sync", () => {
-    it("requests updated-desc ordering and writes only the hot timestamp", async () => {
+    it("requests updated-desc ordering and updates hot and planner timestamps without advancing the watermark", async () => {
       const store = await createStore();
       const prA = makePullRequest(70001, {
         title: "hot pr a",
@@ -2563,7 +2566,10 @@ describe("PrIndexStore", () => {
       source.factCalls = [];
       source.listAllPrCalls = [];
 
+      const hotSyncAt = "2026-03-13T00:00:00.000Z";
+      const isoNowSpy = vi.spyOn(timeModule, "isoNow").mockImplementation(() => hotSyncAt);
       const summary = await store.syncHotPullRequests({ repo, source });
+      isoNowSpy.mockRestore();
 
       expect(summary.mode).toBe("hot");
       expect(summary.processedPrs).toBe(2);
@@ -2578,8 +2584,10 @@ describe("PrIndexStore", () => {
       expect(source.factCalls).toEqual([]);
 
       const statusAfter = await store.status();
-      expect(statusAfter.prHotSyncAt).not.toBeNull();
+      expect(statusAfter.prHotSyncAt).toBe(hotSyncAt);
+      expect(statusAfter.lastSyncAt).toBe(hotSyncAt);
       expect(statusAfter.lastSyncWatermark).toBe(watermarkBefore);
+      expect(summary.lastSyncAt).toBe(hotSyncAt);
       expect(summary.lastSyncWatermark).toBe(watermarkBefore);
     });
 
@@ -2595,7 +2603,7 @@ describe("PrIndexStore", () => {
       expect(source.summaryCalls).toEqual([]);
     });
 
-    it("syncHotIssues writes only the issue hot timestamp", async () => {
+    it("syncHotIssues updates issue hot and planner timestamps without advancing the watermark", async () => {
       const store = await createStore();
       const issueA = makeIssue(80001, {
         updatedAt: "2026-03-10T00:00:00.000Z",
@@ -2611,21 +2619,58 @@ describe("PrIndexStore", () => {
       const statusBefore = await store.status();
       const issueWatermarkBefore = statusBefore.issueLastSyncWatermark;
       issueSource.listAllIssueCalls = [];
+      issueSource.listIssuePageCalls = [];
 
+      const hotSyncAt = "2026-03-13T01:00:00.000Z";
+      const isoNowSpy = vi.spyOn(timeModule, "isoNow").mockImplementation(() => hotSyncAt);
       const summary = await store.syncHotIssues({ repo, source: issueSource });
+      isoNowSpy.mockRestore();
 
       expect(summary.mode).toBe("hot");
       expect(summary.processedIssues).toBe(2);
       expect(summary.entity).toBe("issues");
-      expect(issueSource.listAllIssueCalls[0]).toMatchObject({
+      expect(issueSource.listAllIssueCalls).toEqual([]);
+      expect(issueSource.listIssuePageCalls[0]).toMatchObject({
         sort: "updated",
         direction: "desc",
-        limit: 500,
+        pageLimit: HOT_ISSUE_PAGE_BUDGET,
       });
 
       const statusAfter = await store.status();
-      expect(statusAfter.issueHotSyncAt).not.toBeNull();
+      expect(statusAfter.issueHotSyncAt).toBe(hotSyncAt);
+      expect(statusAfter.issueLastSyncAt).toBe(hotSyncAt);
       expect(statusAfter.issueLastSyncWatermark).toBe(issueWatermarkBefore);
+      expect(summary.lastSyncAt).toBe(hotSyncAt);
+      expect(summary.lastSyncWatermark).toBe(issueWatermarkBefore);
+    });
+
+    it("bounds hot issue sync by fetched page budget when pages are pull-request heavy", async () => {
+      const store = await createStore();
+      const issues = Array.from({ length: HOT_ISSUE_PAGE_BUDGET + 3 }, (_, index) =>
+        makeIssue(81000 + index, {
+          updatedAt: `2026-03-${String(20 - index).padStart(2, "0")}T00:00:00.000Z`,
+        }),
+      );
+      const issueSource = new FakeIssueDataSource(issues);
+      issueSource.issuePages = issues.map((issue) => ({
+        issues: [issue],
+        fetchedItemCount: 100,
+      }));
+
+      const summary = await store.syncHotIssues({ repo, source: issueSource });
+
+      expect(summary.mode).toBe("hot");
+      expect(summary.processedIssues).toBe(HOT_ISSUE_PAGE_BUDGET);
+      expect(issueSource.listAllIssueCalls).toEqual([]);
+      expect(issueSource.listIssuePageCalls).toHaveLength(1);
+      expect(issueSource.listIssuePageCalls[0]).toMatchObject({
+        sort: "updated",
+        direction: "desc",
+        pageLimit: HOT_ISSUE_PAGE_BUDGET,
+      });
+      expect(issueSource.fetchedIssuePageNumbers).toEqual(
+        Array.from({ length: HOT_ISSUE_PAGE_BUDGET }, (_, index) => index + 1),
+      );
     });
 
     it("returns processedPrs > 0 and mode 'hot' for the SyncSummary contract", async () => {

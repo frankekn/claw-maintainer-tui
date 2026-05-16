@@ -16,6 +16,7 @@ export const HOT_PR_LIMIT = 500;
 export const HOT_ISSUE_LIMIT = 500;
 export const BACKFILL_PAGES_PER_SLICE = 2;
 export const PAGE_SIZE = 100;
+export const HOT_ISSUE_PAGE_BUDGET = Math.ceil(HOT_ISSUE_LIMIT / PAGE_SIZE);
 
 export type PullRequestSyncWorkflowResult = {
   summary: SyncSummary;
@@ -307,6 +308,7 @@ export async function syncHotPullRequestsWorkflow(params: {
   metaKeys: {
     repo: string;
     hotSyncAt: string;
+    lastSyncAt: string;
   };
 }): Promise<SyncSummary> {
   const hotSyncAt = isoNow();
@@ -343,6 +345,7 @@ export async function syncHotPullRequestsWorkflow(params: {
   }
 
   params.setMeta(params.metaKeys.hotSyncAt, hotSyncAt);
+  params.setMeta(params.metaKeys.lastSyncAt, hotSyncAt);
   emitProgress("complete");
 
   return {
@@ -375,6 +378,7 @@ export async function syncHotIssuesWorkflow(params: {
   metaKeys: {
     repo: string;
     hotSyncAt: string;
+    lastSyncAt: string;
   };
 }): Promise<SyncSummary> {
   const hotSyncAt = isoNow();
@@ -399,18 +403,35 @@ export async function syncHotIssuesWorkflow(params: {
     });
   };
 
-  for await (const issue of params.source.listAllIssues(params.repo, {
-    sort: "updated",
-    direction: "desc",
-    limit: HOT_ISSUE_LIMIT,
-  })) {
+  const processIssue = (issue: IssueRecord): void => {
     emitProgress("syncing", issue.number, issue.title);
     params.upsertIssue(issue);
     processedIssues += 1;
     emitProgress("syncing", issue.number, issue.title);
+  };
+
+  if (params.source.listIssuePages) {
+    for await (const page of params.source.listIssuePages(params.repo, {
+      sort: "updated",
+      direction: "desc",
+      pageLimit: HOT_ISSUE_PAGE_BUDGET,
+    })) {
+      for (const issue of page.issues) {
+        processIssue(issue);
+      }
+    }
+  } else {
+    for await (const issue of params.source.listAllIssues(params.repo, {
+      sort: "updated",
+      direction: "desc",
+      limit: HOT_ISSUE_LIMIT,
+    })) {
+      processIssue(issue);
+    }
   }
 
   params.setMeta(params.metaKeys.hotSyncAt, hotSyncAt);
+  params.setMeta(params.metaKeys.lastSyncAt, hotSyncAt);
   emitProgress("complete");
 
   return {

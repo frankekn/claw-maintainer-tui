@@ -175,13 +175,15 @@ export class StoreBackedTuiDataService implements TuiDataService {
     activeTuiMode?: PlannerActiveTuiMode;
   }): Promise<SyncSummary> {
     if (isPlannerDisabled()) {
-      return this.store.sync({
-        repo: this.repo,
-        source: this.source,
-        full: false,
-        hydrateAll: false,
-        onProgress: options?.onProgress,
-      });
+      return this.runSyncWithRateLimitCacheInvalidation(() =>
+        this.store.sync({
+          repo: this.repo,
+          source: this.source,
+          full: false,
+          hydrateAll: false,
+          onProgress: options?.onProgress,
+        }),
+      );
     }
     const snapshot = await this.buildPlannerSnapshot(
       "prs",
@@ -194,34 +196,42 @@ export class StoreBackedTuiDataService implements TuiDataService {
     }
     switch (decision.mode) {
       case "full":
-        return this.store.sync({
-          repo: this.repo,
-          source: this.source,
-          full: true,
-          hydrateAll: false,
-          onProgress: options?.onProgress,
-        });
+        return this.runSyncWithRateLimitCacheInvalidation(() =>
+          this.store.sync({
+            repo: this.repo,
+            source: this.source,
+            full: true,
+            hydrateAll: false,
+            onProgress: options?.onProgress,
+          }),
+        );
       case "incremental":
-        return this.store.sync({
-          repo: this.repo,
-          source: this.source,
-          full: false,
-          hydrateAll: false,
-          onProgress: options?.onProgress,
-        });
+        return this.runSyncWithRateLimitCacheInvalidation(() =>
+          this.store.sync({
+            repo: this.repo,
+            source: this.source,
+            full: false,
+            hydrateAll: false,
+            onProgress: options?.onProgress,
+          }),
+        );
       case "hot":
-        return this.store.syncHotPullRequests({
-          repo: this.repo,
-          source: this.source,
-          onProgress: options?.onProgress,
-        });
+        return this.runSyncWithRateLimitCacheInvalidation(() =>
+          this.store.syncHotPullRequests({
+            repo: this.repo,
+            source: this.source,
+            onProgress: options?.onProgress,
+          }),
+        );
       case "backfill":
-        return this.store.runBackfillSlice({
-          entity: "prs",
-          repo: this.repo,
-          source: this.source,
-          onProgress: options?.onProgress,
-        });
+        return this.runSyncWithRateLimitCacheInvalidation(() =>
+          this.store.runBackfillSlice({
+            entity: "prs",
+            repo: this.repo,
+            source: this.source,
+            onProgress: options?.onProgress,
+          }),
+        );
     }
   }
 
@@ -231,12 +241,14 @@ export class StoreBackedTuiDataService implements TuiDataService {
     activeTuiMode?: PlannerActiveTuiMode;
   }): Promise<SyncSummary> {
     if (isPlannerDisabled()) {
-      return this.store.syncIssues({
-        repo: this.repo,
-        source: this.source,
-        full: false,
-        onProgress: options?.onProgress,
-      });
+      return this.runSyncWithRateLimitCacheInvalidation(() =>
+        this.store.syncIssues({
+          repo: this.repo,
+          source: this.source,
+          full: false,
+          onProgress: options?.onProgress,
+        }),
+      );
     }
     const snapshot = await this.buildPlannerSnapshot(
       "issues",
@@ -249,32 +261,40 @@ export class StoreBackedTuiDataService implements TuiDataService {
     }
     switch (decision.mode) {
       case "full":
-        return this.store.syncIssues({
-          repo: this.repo,
-          source: this.source,
-          full: true,
-          onProgress: options?.onProgress,
-        });
+        return this.runSyncWithRateLimitCacheInvalidation(() =>
+          this.store.syncIssues({
+            repo: this.repo,
+            source: this.source,
+            full: true,
+            onProgress: options?.onProgress,
+          }),
+        );
       case "incremental":
-        return this.store.syncIssues({
-          repo: this.repo,
-          source: this.source,
-          full: false,
-          onProgress: options?.onProgress,
-        });
+        return this.runSyncWithRateLimitCacheInvalidation(() =>
+          this.store.syncIssues({
+            repo: this.repo,
+            source: this.source,
+            full: false,
+            onProgress: options?.onProgress,
+          }),
+        );
       case "hot":
-        return this.store.syncHotIssues({
-          repo: this.repo,
-          source: this.source,
-          onProgress: options?.onProgress,
-        });
+        return this.runSyncWithRateLimitCacheInvalidation(() =>
+          this.store.syncHotIssues({
+            repo: this.repo,
+            source: this.source,
+            onProgress: options?.onProgress,
+          }),
+        );
       case "backfill":
-        return this.store.runBackfillSlice({
-          entity: "issues",
-          repo: this.repo,
-          source: this.source,
-          onProgress: options?.onProgress,
-        });
+        return this.runSyncWithRateLimitCacheInvalidation(() =>
+          this.store.runBackfillSlice({
+            entity: "issues",
+            repo: this.repo,
+            source: this.source,
+            onProgress: options?.onProgress,
+          }),
+        );
     }
   }
 
@@ -284,7 +304,7 @@ export class StoreBackedTuiDataService implements TuiDataService {
     activeTuiMode: PlannerActiveTuiMode,
   ): Promise<PlannerSnapshot> {
     const status = await this.store.status();
-    const rateLimit = await this.safeRateLimit();
+    const rateLimit = await this.safeFreshRateLimitForPlanner();
     return {
       entity,
       trigger,
@@ -296,12 +316,37 @@ export class StoreBackedTuiDataService implements TuiDataService {
     };
   }
 
-  private async safeRateLimit() {
+  private async safeFreshRateLimitForPlanner() {
     try {
-      return await this.rateLimit();
+      return await this.freshRateLimitForPlanner();
     } catch {
+      this.invalidateRateLimitCache();
       return null;
     }
+  }
+
+  private async freshRateLimitForPlanner() {
+    const value = await this.source.getRateLimitStatus();
+    this.cacheRateLimit(value);
+    return value;
+  }
+
+  private async runSyncWithRateLimitCacheInvalidation<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } finally {
+      this.invalidateRateLimitCache();
+    }
+  }
+
+  private cacheRateLimit(
+    value: Awaited<ReturnType<GhCliPullRequestDataSource["getRateLimitStatus"]>>,
+  ) {
+    this.rateLimitCache = { value, expiresAt: Date.now() + 60_000 };
+  }
+
+  private invalidateRateLimitCache() {
+    this.rateLimitCache = null;
   }
 
   private makeSkippedSummary(
@@ -344,7 +389,7 @@ export class StoreBackedTuiDataService implements TuiDataService {
       return this.rateLimitCache.value;
     }
     const value = await this.source.getRateLimitStatus();
-    this.rateLimitCache = { value, expiresAt: now + 60_000 };
+    this.cacheRateLimit(value);
     return value;
   }
 }

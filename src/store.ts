@@ -1484,6 +1484,7 @@ export class PrIndexStore {
       metaKeys: {
         repo: META_REPO,
         hotSyncAt: META_PR_HOT_SYNC_AT,
+        lastSyncAt: META_LAST_SYNC_AT,
       },
     });
   }
@@ -1508,6 +1509,7 @@ export class PrIndexStore {
       metaKeys: {
         repo: META_REPO,
         hotSyncAt: META_ISSUE_HOT_SYNC_AT,
+        lastSyncAt: META_ISSUE_LAST_SYNC_AT,
       },
     });
   }

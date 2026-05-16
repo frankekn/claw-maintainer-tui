@@ -12,6 +12,9 @@ type FakeStoreCalls = {
   runBackfillSlice: Array<{ entity: "prs" | "issues" }>;
 };
 
+type RateLimitSnapshot = Awaited<ReturnType<GhCliPullRequestDataSource["getRateLimitStatus"]>>;
+type FakeSource = GhCliPullRequestDataSource & { rateLimitCalls: number };
+
 const baseStatus: StatusSnapshot = {
   repo: "openclaw/openclaw",
   lastSyncAt: null,
@@ -98,10 +101,15 @@ function makeFakeStore(options?: {
   return { store, calls };
 }
 
-function makeFakeSource(rateLimit: { limit: number; remaining: number; resetAt: string } | null) {
-  return {
-    getRateLimitStatus: async () => rateLimit,
-  } as unknown as GhCliPullRequestDataSource;
+function makeFakeSource(rateLimit: RateLimitSnapshot): FakeSource {
+  const source = {
+    rateLimitCalls: 0,
+    getRateLimitStatus: async () => {
+      source.rateLimitCalls += 1;
+      return rateLimit;
+    },
+  } as unknown as FakeSource;
+  return source;
 }
 
 describe("StoreBackedTuiDataService planner dispatch", () => {
@@ -139,6 +147,32 @@ describe("StoreBackedTuiDataService planner dispatch", () => {
     expect(calls.syncHotIssues).toBe(1);
     expect(calls.syncIssues).toEqual([]);
     expect(summary.mode).toBe("hot");
+  });
+
+  it("keeps rateLimit cached for UI display calls", async () => {
+    const { store } = makeFakeStore();
+    const source = makeFakeSource({
+      limit: 5000,
+      remaining: 4500,
+      resetAt: "2026-03-12T09:00:00.000Z",
+    });
+    const service = new StoreBackedTuiDataService(store, source, REPO);
+    await service.rateLimit();
+    await service.rateLimit();
+    expect(source.rateLimitCalls).toBe(1);
+  });
+
+  it("fetches fresh rate limits for consecutive planner-backed PR and issue syncs", async () => {
+    const { store } = makeFakeStore();
+    const source = makeFakeSource({
+      limit: 5000,
+      remaining: 4500,
+      resetAt: "2026-03-12T09:00:00.000Z",
+    });
+    const service = new StoreBackedTuiDataService(store, source, REPO);
+    await service.syncPrs();
+    await service.syncIssues();
+    expect(source.rateLimitCalls).toBe(2);
   });
 
   it("synthesizes a skipped summary when the planner returns skip (rate limit reserve)", async () => {
