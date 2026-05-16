@@ -6,7 +6,7 @@ import * as embeddingModule from "./embedding.js";
 import * as timeModule from "./lib/time.js";
 import { PrIndexStore } from "./store.js";
 import { resolveMergeReadiness } from "./store/merge-readiness.js";
-import { HOT_ISSUE_LIMIT, HOT_ISSUE_SCAN_PAGE_BUDGET, PAGE_SIZE } from "./store/sync-workflow.js";
+import { HOT_ISSUE_LIMIT, PAGE_SIZE } from "./store/sync-workflow.js";
 import type {
   HydratedPullRequest,
   IssueDataSource,
@@ -2629,12 +2629,12 @@ describe("PrIndexStore", () => {
       expect(summary.mode).toBe("hot");
       expect(summary.processedIssues).toBe(2);
       expect(summary.entity).toBe("issues");
-      expect(issueSource.listAllIssueCalls).toEqual([]);
-      expect(issueSource.listIssuePageCalls[0]).toMatchObject({
+      expect(issueSource.listAllIssueCalls[0]).toMatchObject({
         sort: "updated",
         direction: "desc",
-        pageLimit: HOT_ISSUE_SCAN_PAGE_BUDGET,
+        limit: HOT_ISSUE_LIMIT,
       });
+      expect(issueSource.listIssuePageCalls).toEqual([]);
 
       const statusAfter = await store.status();
       expect(statusAfter.issueHotSyncAt).toBe(hotSyncAt);
@@ -2644,37 +2644,25 @@ describe("PrIndexStore", () => {
       expect(summary.lastSyncWatermark).toBe(issueWatermarkBefore);
     });
 
-    it("processes hot issues up to the issue limit with a small issue-page budget", async () => {
+    it("processes hot issues up to the issue limit without a raw page budget", async () => {
       const store = await createStore();
       const issues = Array.from({ length: HOT_ISSUE_LIMIT + PAGE_SIZE }, (_, index) =>
         makeIssue(81000 + index),
       );
       const issueSource = new FakeIssueDataSource(issues);
-      const pages: FakeIssuePage[] = [];
-      for (let index = 0; index < issues.length; index += PAGE_SIZE) {
-        pages.push({
-          issues: issues.slice(index, index + PAGE_SIZE),
-          fetchedItemCount: PAGE_SIZE,
-        });
-      }
-      issueSource.issuePages = pages;
 
       const summary = await store.syncHotIssues({ repo, source: issueSource });
 
       expect(summary.mode).toBe("hot");
       expect(summary.processedIssues).toBe(HOT_ISSUE_LIMIT);
-      expect(issueSource.listAllIssueCalls).toEqual([]);
-      expect(issueSource.listIssuePageCalls).toHaveLength(1);
-      expect(issueSource.listIssuePageCalls[0]).toMatchObject({
+      expect(issueSource.listAllIssueCalls).toHaveLength(1);
+      expect(issueSource.listAllIssueCalls[0]).toMatchObject({
         sort: "updated",
         direction: "desc",
-        pageLimit: HOT_ISSUE_SCAN_PAGE_BUDGET,
+        limit: HOT_ISSUE_LIMIT,
       });
-      expect(HOT_ISSUE_SCAN_PAGE_BUDGET).toBe(Math.ceil(HOT_ISSUE_LIMIT / PAGE_SIZE));
-      expect(HOT_ISSUE_SCAN_PAGE_BUDGET).toBeLessThan(HOT_ISSUE_LIMIT);
-      expect(issueSource.fetchedIssuePageNumbers).toEqual(
-        Array.from({ length: HOT_ISSUE_SCAN_PAGE_BUDGET }, (_, index) => index + 1),
-      );
+      expect(issueSource.listIssuePageCalls).toEqual([]);
+      expect(issueSource.fetchedIssuePageNumbers).toEqual([]);
     });
 
     it("returns processedPrs > 0 and mode 'hot' for the SyncSummary contract", async () => {
