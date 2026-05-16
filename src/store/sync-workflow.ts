@@ -375,6 +375,7 @@ export async function syncHotIssuesWorkflow(params: {
   setMeta: (key: string, value: string) => void;
   countRows: (table: string) => number;
   existingLastSyncWatermark: string | null;
+  existingLastSyncAt: string | null;
   metaKeys: {
     repo: string;
     hotSyncAt: string;
@@ -437,7 +438,10 @@ export async function syncHotIssuesWorkflow(params: {
   }
 
   params.setMeta(params.metaKeys.hotSyncAt, hotSyncAt);
-  params.setMeta(params.metaKeys.lastSyncAt, hotSyncAt);
+  const lastSyncAt = processedIssues > 0 ? hotSyncAt : params.existingLastSyncAt;
+  if (processedIssues > 0) {
+    params.setMeta(params.metaKeys.lastSyncAt, hotSyncAt);
+  }
   emitProgress("complete");
 
   return {
@@ -452,7 +456,7 @@ export async function syncHotIssuesWorkflow(params: {
     commentCount: params.countRows("pr_comments"),
     labelCount: params.countRows("issue_labels"),
     vectorAvailable: params.vectorAvailable,
-    lastSyncAt: hotSyncAt,
+    lastSyncAt,
     lastSyncWatermark: params.existingLastSyncWatermark,
   };
 }

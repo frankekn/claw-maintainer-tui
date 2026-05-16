@@ -1503,6 +1503,7 @@ export class PrIndexStore {
       repoName,
       vectorAvailable: this.vectorAvailable,
       existingLastSyncWatermark: this.getMeta(META_ISSUE_LAST_SYNC_WATERMARK),
+      existingLastSyncAt: this.getMeta(META_ISSUE_LAST_SYNC_AT),
       upsertIssue: (issue) => this.upsertIssue(issue),
       setMeta: (key, value) => this.setMeta(key, value),
       countRows: (table) => this.countRows(table),

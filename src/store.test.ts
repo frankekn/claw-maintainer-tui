@@ -2715,6 +2715,41 @@ describe("PrIndexStore", () => {
       expect(summary.lastSyncWatermark).toBe(issueWatermarkBefore);
     });
 
+    it("syncHotIssues does not mark issue metadata fresh when no issues are touched", async () => {
+      const store = await createStore();
+      const seedIssue = makeIssue(80003, {
+        updatedAt: "2026-03-10T00:00:00.000Z",
+        createdAt: "2026-03-09T00:00:00.000Z",
+      });
+      const issueSource = new FakeIssueDataSource([seedIssue]);
+
+      await store.syncIssues({ repo, source: issueSource, full: true });
+      const statusBefore = await store.status();
+      issueSource.listAllIssueCalls = [];
+      issueSource.listIssuePageCalls = [];
+      issueSource.issuePages = Array.from({ length: HOT_ISSUE_SCAN_PAGE_BUDGET }, () => ({
+        issues: [],
+        fetchedItemCount: PAGE_SIZE,
+      }));
+
+      const hotSyncAt = "2026-03-13T01:30:00.000Z";
+      const isoNowSpy = vi.spyOn(timeModule, "isoNow").mockImplementation(() => hotSyncAt);
+      const summary = await store.syncHotIssues({ repo, source: issueSource });
+      isoNowSpy.mockRestore();
+
+      expect(summary.mode).toBe("hot");
+      expect(summary.processedIssues).toBe(0);
+      expect(issueSource.listAllIssueCalls).toEqual([]);
+      expect(issueSource.fetchedIssuePageNumbers).toEqual(
+        Array.from({ length: HOT_ISSUE_SCAN_PAGE_BUDGET }, (_, index) => index + 1),
+      );
+
+      const statusAfter = await store.status();
+      expect(statusAfter.issueHotSyncAt).toBe(hotSyncAt);
+      expect(statusAfter.issueLastSyncAt).toBe(statusBefore.issueLastSyncAt);
+      expect(summary.lastSyncAt).toBe(statusBefore.issueLastSyncAt);
+    });
+
     it("bounds hot issue sync by fetched core issue pages", async () => {
       const store = await createStore();
       const issues = Array.from({ length: HOT_ISSUE_LIMIT + PAGE_SIZE }, (_, index) =>
