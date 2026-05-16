@@ -610,33 +610,61 @@ export async function backfillIssuesWorkflow(params: {
     });
   };
 
-  const limit = BACKFILL_PAGES_PER_SLICE * PAGE_SIZE;
-  let yielded = 0;
-  for await (const issue of params.source.listAllIssues(params.repo, {
-    sort: "created",
-    direction: "asc",
-    startPage: cursor,
-    limit,
-  })) {
+  const processIssue = (issue: IssueRecord): void => {
     emitProgress("syncing", issue.number, issue.title);
     params.upsertIssue(issue);
     processedIssues += 1;
-    yielded += 1;
-    itemsInCurrentPage += 1;
-    if (itemsInCurrentPage >= PAGE_SIZE) {
+    emitProgress("syncing", issue.number, issue.title);
+  };
+
+  const limit = BACKFILL_PAGES_PER_SLICE * PAGE_SIZE;
+  if (params.source.listIssuePages) {
+    let fetchedPages = 0;
+    for await (const page of params.source.listIssuePages(params.repo, {
+      sort: "created",
+      direction: "asc",
+      startPage: cursor,
+      pageLimit: BACKFILL_PAGES_PER_SLICE,
+    })) {
+      fetchedPages += 1;
+      for (const issue of page.issues) {
+        processIssue(issue);
+      }
+      cursor = Math.max(cursor + 1, page.page + 1);
+      params.setMeta(params.metaKeys.backfillCursor, String(cursor));
+      if (page.fetchedItemCount < PAGE_SIZE) {
+        lastPageWasPartial = true;
+        break;
+      }
+    }
+    if (fetchedPages < BACKFILL_PAGES_PER_SLICE) {
+      lastPageWasPartial = true;
+    }
+  } else {
+    let yielded = 0;
+    for await (const issue of params.source.listAllIssues(params.repo, {
+      sort: "created",
+      direction: "asc",
+      startPage: cursor,
+      limit,
+    })) {
+      processIssue(issue);
+      yielded += 1;
+      itemsInCurrentPage += 1;
+      if (itemsInCurrentPage >= PAGE_SIZE) {
+        cursor += 1;
+        params.setMeta(params.metaKeys.backfillCursor, String(cursor));
+        itemsInCurrentPage = 0;
+      }
+    }
+
+    if (itemsInCurrentPage > 0) {
+      lastPageWasPartial = true;
       cursor += 1;
       params.setMeta(params.metaKeys.backfillCursor, String(cursor));
-      itemsInCurrentPage = 0;
+    } else if (yielded < limit) {
+      lastPageWasPartial = true;
     }
-    emitProgress("syncing", issue.number, issue.title);
-  }
-
-  if (itemsInCurrentPage > 0) {
-    lastPageWasPartial = true;
-    cursor += 1;
-    params.setMeta(params.metaKeys.backfillCursor, String(cursor));
-  } else if (yielded < limit) {
-    lastPageWasPartial = true;
   }
 
   let nextBackfillCursor: number | null = cursor;

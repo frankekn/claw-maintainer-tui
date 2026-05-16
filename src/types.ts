@@ -83,6 +83,12 @@ export type IssueRecord = {
   labels: string[];
 };
 
+export type IssuePage = {
+  page: number;
+  issues: IssueRecord[];
+  fetchedItemCount: number;
+};
+
 export type SearchDocKind = "pr_body" | "comment";
 
 export type SearchDocument = {
@@ -561,6 +567,15 @@ export interface IssueDataSource {
       startPage?: number;
     },
   ): AsyncGenerator<IssueRecord>;
+  listIssuePages?(
+    repo: RepoRef,
+    options?: {
+      sort?: "created" | "updated";
+      direction?: "asc" | "desc";
+      startPage?: number;
+      pageLimit?: number;
+    },
+  ): AsyncGenerator<IssuePage>;
   listChangedIssueNumbersSince(repo: RepoRef, since: string): Promise<number[]>;
   listChangedIssuesSince?(repo: RepoRef, since: string): Promise<IssueRecord[]>;
   getIssue(repo: RepoRef, issueNumber: number): Promise<IssueRecord>;

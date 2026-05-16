@@ -34,6 +34,7 @@ import type {
   StatusSnapshot,
   SyncProgressEvent,
 } from "../types.js";
+import type { PlannerActiveTuiMode } from "../sync-planner.js";
 import type {
   TuiAction,
   TuiActionId,
@@ -2035,6 +2036,10 @@ export class TuiController {
     return ["prs"];
   }
 
+  private plannerActiveTuiMode(): PlannerActiveTuiMode {
+    return this.isListMode(this.mode) ? this.mode : null;
+  }
+
   private isMetadataStale(entity: MetadataEntity, thresholdMs: number): boolean {
     const value =
       entity === "prs"
@@ -2122,6 +2127,7 @@ export class TuiController {
     this.emit();
 
     const label = nextEntity === "prs" ? "PR" : "issue";
+    const activeTuiMode = this.plannerActiveTuiMode();
 
     try {
       const summary =
@@ -2129,10 +2135,12 @@ export class TuiController {
           ? await this.effects.syncPrs({
               onProgress: (event) => this.handleMetadataProgress(nextEntity, event),
               trigger,
+              activeTuiMode,
             })
           : await this.effects.syncIssues({
               onProgress: (event) => this.handleMetadataProgress(nextEntity, event),
               trigger,
+              activeTuiMode,
             });
       await this.refreshStatus();
       const processed = nextEntity === "prs" ? summary.processedPrs : summary.processedIssues;
@@ -2143,8 +2151,11 @@ export class TuiController {
       job.nextBackfillCursor = summary.nextBackfillCursor ?? null;
 
       if (summary.mode === "skipped") {
-        // Skipped: do NOT advance nextAutoUpdateAt so auto-sync retries when
-        // quota recovers; expose reason in the job message.
+        // Reserve skips still need an idle retry so a user who stays in the same
+        // mode is not stranded after quota recovers.
+        if (summary.reason === "rate_limit_reserve") {
+          job.nextAutoUpdateAt = new Date(Date.now() + IDLE_INTERVAL_MS).toISOString();
+        }
         job.state = "cooldown";
         job.progress = {
           entity: nextEntity,

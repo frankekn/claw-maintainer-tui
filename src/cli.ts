@@ -504,6 +504,54 @@ async function buildCliPlannerSnapshot(
   };
 }
 
+async function runPullRequestPlannerMode({
+  mode,
+  repo,
+  source,
+  store,
+}: Pick<CommandContext, "repo" | "source" | "store"> & {
+  mode: PlannerMode;
+}): Promise<SyncSummary> {
+  if (mode === "hot") {
+    return store.syncHotPullRequests({ repo, source });
+  }
+  if (mode === "backfill") {
+    return store.runBackfillSlice({ entity: "prs", repo, source });
+  }
+  if (mode === "incremental") {
+    return store.sync({ repo, source, full: false, hydrateAll: false });
+  }
+  if (mode === "full") {
+    return store.sync({ repo, source, full: true, hydrateAll: false });
+  }
+  const exhaustiveMode: never = mode;
+  throw new Error(`unknown PR planner mode: ${exhaustiveMode}`);
+}
+
+async function runIssuePlannerMode({
+  mode,
+  repo,
+  source,
+  store,
+}: Pick<CommandContext, "repo" | "source" | "store"> & {
+  mode: PlannerMode;
+}): Promise<SyncSummary> {
+  if (mode === "hot") {
+    return store.syncHotIssues({ repo, source });
+  }
+  if (mode === "backfill") {
+    return store.runBackfillSlice({ entity: "issues", repo, source });
+  }
+  if (mode === "incremental") {
+    return store.syncIssues({ repo, source, full: false });
+  }
+  if (mode === "full") {
+    return store.syncIssues({ repo, source, full: true });
+  }
+  const exhaustiveMode: never = mode;
+  throw new Error(`unknown issue planner mode: ${exhaustiveMode}`);
+}
+
 function printPullRequestShow(payload: PullRequestShowResult): number {
   if (!payload.pr) {
     return 1;
@@ -576,17 +624,10 @@ const commandHandlers: Record<Command, CommandHandler> = {
           includeDocs: true,
         });
       }
-      if (decision.mode === "hot") {
-        return printSyncSummary(await store.syncHotPullRequests({ repo, source }), {
-          includeDocs: true,
-        });
-      }
-      if (decision.mode === "backfill") {
-        return printSyncSummary(await store.runBackfillSlice({ entity: "prs", repo, source }), {
-          includeDocs: true,
-        });
-      }
-      // Unexpected mode for an override; fall through to legacy behavior.
+      return printSyncSummary(
+        await runPullRequestPlannerMode({ mode: decision.mode, repo, source, store }),
+        { includeDocs: true },
+      );
     }
     return printSyncSummary(
       await store.sync({
@@ -624,16 +665,10 @@ const commandHandlers: Record<Command, CommandHandler> = {
           includeDocs: false,
         });
       }
-      if (decision.mode === "hot") {
-        return printSyncSummary(await store.syncHotIssues({ repo, source }), {
-          includeDocs: false,
-        });
-      }
-      if (decision.mode === "backfill") {
-        return printSyncSummary(await store.runBackfillSlice({ entity: "issues", repo, source }), {
-          includeDocs: false,
-        });
-      }
+      return printSyncSummary(
+        await runIssuePlannerMode({ mode: decision.mode, repo, source, store }),
+        { includeDocs: false },
+      );
     }
     return printSyncSummary(
       await store.syncIssues({

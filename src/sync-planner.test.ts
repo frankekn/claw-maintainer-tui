@@ -256,7 +256,7 @@ describe("healthy band (>=500)", () => {
     }
   });
 
-  it("runs incremental when watermark is fresh and no backfill is pending", () => {
+  it("schedules backfill when watermark is fresh, cursor is null, and not on a list mode", () => {
     const decision = selectSyncDecision(
       snapshot({
         rateLimit: rateLimit(2000),
@@ -268,7 +268,7 @@ describe("healthy band (>=500)", () => {
     );
     expect(decision.kind).toBe("run");
     if (decision.kind === "run") {
-      expect(decision.mode).toBe<PlannerMode>("incremental");
+      expect(decision.mode).toBe<PlannerMode>("backfill");
     }
   });
 
@@ -324,7 +324,7 @@ describe("healthy band (>=500)", () => {
     }
   });
 
-  it("does NOT schedule backfill when the cursor is null", () => {
+  it("does NOT schedule backfill from a null cursor while on a list mode", () => {
     const decision = selectSyncDecision(
       snapshot({
         rateLimit: rateLimit(2000),
@@ -332,6 +332,7 @@ describe("healthy band (>=500)", () => {
           lastSyncWatermark: new Date(NOW - 1_000).toISOString(),
           lastSyncAt: new Date(NOW - 1_000).toISOString(),
         }),
+        activeTuiMode: "issue-search",
       }),
     );
     expect(decision.kind).toBe("run");
@@ -386,12 +387,13 @@ describe("healthy band (>=500)", () => {
 });
 
 describe("STALE_WATERMARK_MS boundary", () => {
-  it("treats now - lastSyncAt == STALE_WATERMARK_MS as fresh (incremental)", () => {
+  it("treats now - lastSyncAt == STALE_WATERMARK_MS as fresh", () => {
     const lastSyncAt = new Date(NOW - STALE_WATERMARK_MS).toISOString();
     const decision = selectSyncDecision(
       snapshot({
         rateLimit: rateLimit(2000),
         freshness: freshness({ lastSyncWatermark: lastSyncAt, lastSyncAt }),
+        activeTuiMode: "pr-search",
       }),
     );
     expect(decision.kind).toBe("run");
@@ -400,12 +402,13 @@ describe("STALE_WATERMARK_MS boundary", () => {
     }
   });
 
-  it("treats now - lastSyncAt == STALE_WATERMARK_MS - 1 as fresh (incremental)", () => {
+  it("treats now - lastSyncAt == STALE_WATERMARK_MS - 1 as fresh", () => {
     const lastSyncAt = new Date(NOW - (STALE_WATERMARK_MS - 1)).toISOString();
     const decision = selectSyncDecision(
       snapshot({
         rateLimit: rateLimit(2000),
         freshness: freshness({ lastSyncWatermark: lastSyncAt, lastSyncAt }),
+        activeTuiMode: "pr-search",
       }),
     );
     expect(decision.kind).toBe("run");

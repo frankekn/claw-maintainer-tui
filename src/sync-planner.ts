@@ -143,14 +143,13 @@ export function selectSyncDecision(input: PlannerSnapshot): PlannerDecision {
   const natural = naturalMode(freshness, input.now);
 
   // Backfill consideration only replaces a natural `incremental` decision
-  // when quota is healthy, the cursor is open, completion sentinel is null,
-  // the watermark is fresh, and we are not on a list mode (those views
-  // prefer freshening visible rows first).
+  // when quota is healthy, the completion sentinel is null, the watermark is
+  // fresh, and we are not on a list mode (those views prefer freshening
+  // visible rows first). A null cursor is still open and starts at page 1.
   const canConsiderBackfill =
     natural.mode === "incremental" &&
     natural.watermarkFresh &&
     band === "healthy" &&
-    freshness.backfillCursor !== null &&
     freshness.backfillCompletedAt === null &&
     !isListMode(activeTuiMode);
 

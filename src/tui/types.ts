@@ -14,6 +14,7 @@ import type {
   SyncProgressEvent,
   SyncSummary,
 } from "../types.js";
+import type { PlannerActiveTuiMode } from "../sync-planner.js";
 
 export type TuiMode =
   | "inbox"
@@ -438,10 +439,12 @@ export interface TuiDataService {
   syncPrs(options?: {
     onProgress?: (event: SyncProgressEvent) => void;
     trigger?: "manual" | "auto";
+    activeTuiMode?: PlannerActiveTuiMode;
   }): Promise<SyncSummary>;
   syncIssues(options?: {
     onProgress?: (event: SyncProgressEvent) => void;
     trigger?: "manual" | "auto";
+    activeTuiMode?: PlannerActiveTuiMode;
   }): Promise<SyncSummary>;
   refreshPrDetail(prNumber: number): Promise<void>;
   refreshIssueDetail(issueNumber: number): Promise<void>;

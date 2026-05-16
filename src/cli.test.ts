@@ -1,5 +1,101 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeSkippedSummary, parseArgs, printSyncSummary, runCli } from "./cli.js";
+import type { StatusSnapshot, SyncSummary } from "./types.js";
+
+function baseSyncSummary(mode: SyncSummary["mode"], entity: SyncSummary["entity"]): SyncSummary {
+  return {
+    mode,
+    entity,
+    repo: "openclaw/openclaw",
+    processedPrs: 0,
+    processedIssues: 0,
+    skippedPrs: 0,
+    skippedIssues: 0,
+    docCount: 0,
+    commentCount: 0,
+    labelCount: 0,
+    vectorAvailable: false,
+    lastSyncAt: null,
+    lastSyncWatermark: null,
+  };
+}
+
+function baseStatus(overrides: Partial<StatusSnapshot> = {}): StatusSnapshot {
+  return {
+    repo: "openclaw/openclaw",
+    lastSyncAt: null,
+    lastSyncWatermark: null,
+    issueLastSyncAt: null,
+    issueLastSyncWatermark: null,
+    prHotSyncAt: null,
+    issueHotSyncAt: null,
+    prBackfillCursor: null,
+    prBackfillCompletedAt: null,
+    issueBackfillCursor: null,
+    issueBackfillCompletedAt: null,
+    prCount: 0,
+    issueCount: 0,
+    labelCount: 0,
+    issueLabelCount: 0,
+    commentCount: 0,
+    docCount: 0,
+    vectorEnabled: false,
+    vectorAvailable: false,
+    embeddingModel: "test",
+    ...overrides,
+  };
+}
+
+async function loadCliWithPlannerMocks(params: {
+  status: StatusSnapshot;
+  rateLimit: { limit: number; remaining: number; resetAt: string } | null;
+}) {
+  vi.resetModules();
+  const statusMock = vi.fn().mockResolvedValue(params.status);
+  const syncMock = vi.fn().mockResolvedValue(baseSyncSummary("incremental", "prs"));
+  const syncIssuesMock = vi.fn().mockResolvedValue(baseSyncSummary("incremental", "issues"));
+  const syncHotPullRequestsMock = vi.fn().mockResolvedValue(baseSyncSummary("hot", "prs"));
+  const syncHotIssuesMock = vi.fn().mockResolvedValue(baseSyncSummary("hot", "issues"));
+  const runBackfillSliceMock = vi
+    .fn()
+    .mockImplementation((options: { entity: SyncSummary["entity"] }) =>
+      Promise.resolve(baseSyncSummary("backfill", options.entity)),
+    );
+
+  class FakePrIndexStore {
+    status = statusMock;
+    sync = syncMock;
+    syncIssues = syncIssuesMock;
+    syncHotPullRequests = syncHotPullRequestsMock;
+    syncHotIssues = syncHotIssuesMock;
+    runBackfillSlice = runBackfillSliceMock;
+  }
+  const getRateLimitStatusMock = vi.fn().mockResolvedValue(params.rateLimit);
+  class FakeGhCli {
+    getRateLimitStatus = getRateLimitStatusMock;
+  }
+
+  vi.doMock("./store.js", () => ({ PrIndexStore: FakePrIndexStore }));
+  vi.doMock("./github.js", async () => {
+    const actual = await vi.importActual<typeof import("./github.js")>("./github.js");
+    return {
+      ...actual,
+      GhCliPullRequestDataSource: FakeGhCli,
+    };
+  });
+
+  const { runCli: runCliReloaded } = await import("./cli.js");
+  return {
+    runCliReloaded,
+    statusMock,
+    getRateLimitStatusMock,
+    syncMock,
+    syncIssuesMock,
+    syncHotPullRequestsMock,
+    syncHotIssuesMock,
+    runBackfillSliceMock,
+  };
+}
 
 describe("runCli", () => {
   afterEach(() => {
@@ -143,6 +239,140 @@ describe("printSyncSummary output", () => {
     expect(exitCode).toBe(0);
     expect(logs).toContain("mode: backfill");
     expect(logs).toContain("next_backfill_cursor: 14");
+  });
+});
+
+describe("runCli planner backfill fallback dispatch", () => {
+  const originalEnv = process.env.CLAWLENS_SYNC_PLANNER;
+  const moderateRateLimit = {
+    limit: 5000,
+    remaining: 250,
+    resetAt: "2026-05-16T00:00:00.000Z",
+  };
+
+  beforeEach(() => {
+    delete process.env.CLAWLENS_SYNC_PLANNER;
+  });
+
+  afterEach(() => {
+    if (originalEnv === undefined) {
+      delete process.env.CLAWLENS_SYNC_PLANNER;
+    } else {
+      process.env.CLAWLENS_SYNC_PLANNER = originalEnv;
+    }
+    vi.doUnmock("./store.js");
+    vi.doUnmock("./github.js");
+    vi.resetModules();
+    vi.restoreAllMocks();
+  });
+
+  it("dispatches sync --backfill hot fallback to syncHotPullRequests without legacy sync", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { runCliReloaded, syncMock, syncHotPullRequestsMock, runBackfillSliceMock } =
+      await loadCliWithPlannerMocks({
+        status: baseStatus(),
+        rateLimit: moderateRateLimit,
+      });
+
+    const code = await runCliReloaded([
+      "sync",
+      "--backfill",
+      "--repo",
+      "openclaw/openclaw",
+      "--db",
+      "/tmp/clawlens-cli-test.sqlite",
+    ]);
+
+    expect(code).toBe(0);
+    expect(syncHotPullRequestsMock).toHaveBeenCalledTimes(1);
+    expect(runBackfillSliceMock).not.toHaveBeenCalled();
+    expect(syncMock).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith("mode: hot");
+  });
+
+  it("dispatches sync --backfill incremental fallback with hydrateAll disabled", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const freshWatermark = new Date().toISOString();
+    const { runCliReloaded, syncMock, syncHotPullRequestsMock, runBackfillSliceMock } =
+      await loadCliWithPlannerMocks({
+        status: baseStatus({
+          lastSyncAt: freshWatermark,
+          lastSyncWatermark: freshWatermark,
+        }),
+        rateLimit: moderateRateLimit,
+      });
+
+    const code = await runCliReloaded([
+      "sync",
+      "--backfill",
+      "--hydrate-all",
+      "--repo",
+      "openclaw/openclaw",
+      "--db",
+      "/tmp/clawlens-cli-test.sqlite",
+    ]);
+
+    expect(code).toBe(0);
+    expect(syncMock).toHaveBeenCalledTimes(1);
+    expect(syncMock).toHaveBeenCalledWith(
+      expect.objectContaining({ full: false, hydrateAll: false }),
+    );
+    expect(syncHotPullRequestsMock).not.toHaveBeenCalled();
+    expect(runBackfillSliceMock).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith("mode: incremental");
+  });
+
+  it("dispatches sync-issues --backfill hot fallback to syncHotIssues without legacy sync", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { runCliReloaded, syncIssuesMock, syncHotIssuesMock, runBackfillSliceMock } =
+      await loadCliWithPlannerMocks({
+        status: baseStatus(),
+        rateLimit: moderateRateLimit,
+      });
+
+    const code = await runCliReloaded([
+      "sync-issues",
+      "--backfill",
+      "--repo",
+      "openclaw/openclaw",
+      "--db",
+      "/tmp/clawlens-cli-test.sqlite",
+    ]);
+
+    expect(code).toBe(0);
+    expect(syncHotIssuesMock).toHaveBeenCalledTimes(1);
+    expect(runBackfillSliceMock).not.toHaveBeenCalled();
+    expect(syncIssuesMock).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith("mode: hot");
+  });
+
+  it("dispatches sync-issues --backfill incremental fallback with full disabled", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const freshWatermark = new Date().toISOString();
+    const { runCliReloaded, syncIssuesMock, syncHotIssuesMock, runBackfillSliceMock } =
+      await loadCliWithPlannerMocks({
+        status: baseStatus({
+          issueLastSyncAt: freshWatermark,
+          issueLastSyncWatermark: freshWatermark,
+        }),
+        rateLimit: moderateRateLimit,
+      });
+
+    const code = await runCliReloaded([
+      "sync-issues",
+      "--backfill",
+      "--repo",
+      "openclaw/openclaw",
+      "--db",
+      "/tmp/clawlens-cli-test.sqlite",
+    ]);
+
+    expect(code).toBe(0);
+    expect(syncIssuesMock).toHaveBeenCalledTimes(1);
+    expect(syncIssuesMock).toHaveBeenCalledWith(expect.objectContaining({ full: false }));
+    expect(syncHotIssuesMock).not.toHaveBeenCalled();
+    expect(runBackfillSliceMock).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith("mode: incremental");
   });
 });
 

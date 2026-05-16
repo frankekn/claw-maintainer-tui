@@ -1,7 +1,7 @@
 import { GhCliPullRequestDataSource } from "../github.js";
 import { PrIndexStore } from "../store.js";
 import { selectSyncDecision } from "../sync-planner.js";
-import type { PlannerEntity, PlannerSnapshot } from "../sync-planner.js";
+import type { PlannerActiveTuiMode, PlannerEntity, PlannerSnapshot } from "../sync-planner.js";
 import type { AttentionState, RepoRef, StatusSnapshot, SyncSummary } from "../types.js";
 import type {
   TuiClusterVerificationSummary,
@@ -172,6 +172,7 @@ export class StoreBackedTuiDataService implements TuiDataService {
   async syncPrs(options?: {
     onProgress?: (event: SyncProgressEvent) => void;
     trigger?: "manual" | "auto";
+    activeTuiMode?: PlannerActiveTuiMode;
   }): Promise<SyncSummary> {
     if (isPlannerDisabled()) {
       return this.store.sync({
@@ -182,7 +183,11 @@ export class StoreBackedTuiDataService implements TuiDataService {
         onProgress: options?.onProgress,
       });
     }
-    const snapshot = await this.buildPlannerSnapshot("prs", options?.trigger ?? "manual");
+    const snapshot = await this.buildPlannerSnapshot(
+      "prs",
+      options?.trigger ?? "manual",
+      options?.activeTuiMode ?? null,
+    );
     const decision = selectSyncDecision(snapshot);
     if (decision.kind === "skip") {
       return this.makeSkippedSummary("prs", decision.reason);
@@ -223,6 +228,7 @@ export class StoreBackedTuiDataService implements TuiDataService {
   async syncIssues(options?: {
     onProgress?: (event: SyncProgressEvent) => void;
     trigger?: "manual" | "auto";
+    activeTuiMode?: PlannerActiveTuiMode;
   }): Promise<SyncSummary> {
     if (isPlannerDisabled()) {
       return this.store.syncIssues({
@@ -232,7 +238,11 @@ export class StoreBackedTuiDataService implements TuiDataService {
         onProgress: options?.onProgress,
       });
     }
-    const snapshot = await this.buildPlannerSnapshot("issues", options?.trigger ?? "manual");
+    const snapshot = await this.buildPlannerSnapshot(
+      "issues",
+      options?.trigger ?? "manual",
+      options?.activeTuiMode ?? null,
+    );
     const decision = selectSyncDecision(snapshot);
     if (decision.kind === "skip") {
       return this.makeSkippedSummary("issues", decision.reason);
@@ -271,6 +281,7 @@ export class StoreBackedTuiDataService implements TuiDataService {
   private async buildPlannerSnapshot(
     entity: PlannerEntity,
     trigger: "manual" | "auto",
+    activeTuiMode: PlannerActiveTuiMode,
   ): Promise<PlannerSnapshot> {
     const status = await this.store.status();
     const rateLimit = await this.safeRateLimit();
@@ -280,7 +291,7 @@ export class StoreBackedTuiDataService implements TuiDataService {
       manualOverride: null,
       rateLimit,
       freshness: plannerFreshness(status, entity),
-      activeTuiMode: null,
+      activeTuiMode,
       now: Date.now(),
     };
   }

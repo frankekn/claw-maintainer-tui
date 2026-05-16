@@ -6,6 +6,7 @@ import type {
   SyncProgressEvent,
   SyncSummary,
 } from "../types.js";
+import type { PlannerActiveTuiMode } from "../sync-planner.js";
 import type { TuiDataService } from "./types.js";
 
 export class TuiEffects {
@@ -62,20 +63,24 @@ export class TuiEffects {
   syncPrs(options?: {
     onProgress?: (event: SyncProgressEvent) => void;
     trigger?: "manual" | "auto";
+    activeTuiMode?: PlannerActiveTuiMode;
   }): Promise<SyncSummary> {
     return this.service.syncPrs({
       onProgress: options?.onProgress,
       trigger: options?.trigger ?? "manual",
+      activeTuiMode: options?.activeTuiMode ?? null,
     });
   }
 
   syncIssues(options?: {
     onProgress?: (event: SyncProgressEvent) => void;
     trigger?: "manual" | "auto";
+    activeTuiMode?: PlannerActiveTuiMode;
   }): Promise<SyncSummary> {
     return this.service.syncIssues({
       onProgress: options?.onProgress,
       trigger: options?.trigger ?? "manual",
+      activeTuiMode: options?.activeTuiMode ?? null,
     });
   }
 

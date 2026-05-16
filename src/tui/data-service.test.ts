@@ -159,7 +159,7 @@ describe("StoreBackedTuiDataService planner dispatch", () => {
     expect(calls.syncHotPullRequests).toBe(0);
   });
 
-  it("dispatches incremental when watermark is fresh", async () => {
+  it("dispatches backfill when watermark is fresh with an open null cursor and healthy quota", async () => {
     const now = Date.now();
     const fresh = new Date(now - 60_000).toISOString();
     const { store, calls } = makeFakeStore({
@@ -175,9 +175,61 @@ describe("StoreBackedTuiDataService planner dispatch", () => {
       resetAt: "2026-03-12T09:00:00.000Z",
     });
     const service = new StoreBackedTuiDataService(store, source, REPO);
-    await service.syncPrs();
-    expect(calls.sync).toEqual([{ full: false, hydrateAll: false }]);
+    const summary = await service.syncPrs();
+    expect(summary.mode).toBe("backfill");
+    expect(calls.runBackfillSlice).toEqual([{ entity: "prs" }]);
+    expect(calls.sync).toEqual([]);
     expect(calls.syncHotPullRequests).toBe(0);
+  });
+
+  it("dispatches incremental when watermark is fresh but quota is moderate", async () => {
+    const now = Date.now();
+    const fresh = new Date(now - 60_000).toISOString();
+    const { store, calls } = makeFakeStore({
+      status: {
+        ...baseStatus,
+        lastSyncAt: fresh,
+        lastSyncWatermark: fresh,
+      },
+    });
+    const source = makeFakeSource({
+      limit: 5000,
+      remaining: 200,
+      resetAt: "2026-03-12T09:00:00.000Z",
+    });
+    const service = new StoreBackedTuiDataService(store, source, REPO);
+    const summary = await service.syncPrs();
+    expect(summary.mode).toBe("incremental");
+    expect(calls.sync).toEqual([{ full: false, hydrateAll: false }]);
+    expect(calls.runBackfillSlice).toEqual([]);
+    expect(calls.syncHotPullRequests).toBe(0);
+  });
+
+  it("passes active TUI mode into the planner so list views defer backfill", async () => {
+    const fresh = new Date(Date.now() - 60_000).toISOString();
+    const statusWithOpenBackfill = {
+      ...baseStatus,
+      lastSyncAt: fresh,
+      lastSyncWatermark: fresh,
+      prBackfillCursor: 7,
+    };
+    const source = makeFakeSource({
+      limit: 5000,
+      remaining: 4500,
+      resetAt: "2026-03-12T09:00:00.000Z",
+    });
+
+    const nonList = makeFakeStore({ status: statusWithOpenBackfill });
+    await new StoreBackedTuiDataService(nonList.store, source, REPO).syncPrs();
+    expect(nonList.calls.runBackfillSlice).toEqual([{ entity: "prs" }]);
+    expect(nonList.calls.sync).toEqual([]);
+
+    const listMode = makeFakeStore({ status: statusWithOpenBackfill });
+    await new StoreBackedTuiDataService(listMode.store, source, REPO).syncPrs({
+      activeTuiMode: "pr-search",
+    });
+    expect(listMode.calls.sync).toEqual([{ full: false, hydrateAll: false }]);
+    expect(listMode.calls.runBackfillSlice).toEqual([]);
   });
 
   it("falls back to legacy store.sync when CLAWLENS_SYNC_PLANNER='off'", async () => {
