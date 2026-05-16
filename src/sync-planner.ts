@@ -116,8 +116,11 @@ function naturalMode(
     return { mode: "hot", watermarkFresh: false, bootstrapFresh: false };
   }
   const age = now - lastSyncMs;
+  const lastSyncWatermarkMs = parseIsoMs(freshness.lastSyncWatermark);
+  const watermarkFresh =
+    lastSyncWatermarkMs !== null && now - lastSyncWatermarkMs <= STALE_WATERMARK_MS;
   if (age <= STALE_WATERMARK_MS) {
-    return { mode: "incremental", watermarkFresh: true, bootstrapFresh: false };
+    return { mode: "incremental", watermarkFresh, bootstrapFresh: false };
   }
   return { mode: "hot", watermarkFresh: false, bootstrapFresh: false };
 }

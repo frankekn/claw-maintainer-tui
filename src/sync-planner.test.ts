@@ -382,6 +382,25 @@ describe("healthy band (>=500)", () => {
     }
   });
 
+  it("runs incremental when hot sync made lastSyncAt fresh but the watermark is still stale", () => {
+    const decision = selectSyncDecision(
+      snapshot({
+        rateLimit: rateLimit(2000),
+        freshness: freshness({
+          lastSyncWatermark: new Date(NOW - STALE_WATERMARK_MS - 5_000).toISOString(),
+          lastSyncAt: new Date(NOW - 1_000).toISOString(),
+          backfillCursor: 12,
+        }),
+        activeTuiMode: null,
+      }),
+    );
+    expect(decision).toEqual({
+      kind: "run",
+      mode: "incremental",
+      reason: "natural_incremental",
+    });
+  });
+
   it("schedules backfill when watermark is fresh, cursor is open, and not on a list mode", () => {
     const decision = selectSyncDecision(
       snapshot({
