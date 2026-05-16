@@ -86,6 +86,18 @@ function parseIsoMs(value: string | null): number | null {
   return parsed;
 }
 
+function latestParsedMs(values: ReadonlyArray<string | null>): number | null {
+  let latest: number | null = null;
+  for (const value of values) {
+    const parsed = parseIsoMs(value);
+    if (parsed === null) {
+      continue;
+    }
+    latest = latest === null ? parsed : Math.max(latest, parsed);
+  }
+  return latest;
+}
+
 function isListMode(mode: PlannerActiveTuiMode): boolean {
   return LIST_MODES.has(mode);
 }
@@ -93,19 +105,21 @@ function isListMode(mode: PlannerActiveTuiMode): boolean {
 function naturalMode(
   freshness: PlannerFreshness,
   now: number,
-): { mode: PlannerMode; watermarkFresh: boolean } {
+): { mode: PlannerMode; watermarkFresh: boolean; bootstrapFresh: boolean } {
   if (freshness.lastSyncWatermark === null) {
-    return { mode: "hot", watermarkFresh: false };
+    const bootstrapMs = latestParsedMs([freshness.hotSyncAt, freshness.lastSyncAt]);
+    const bootstrapFresh = bootstrapMs !== null && now - bootstrapMs <= STALE_WATERMARK_MS;
+    return { mode: "hot", watermarkFresh: false, bootstrapFresh };
   }
   const lastSyncMs = parseIsoMs(freshness.lastSyncAt);
   if (lastSyncMs === null) {
-    return { mode: "hot", watermarkFresh: false };
+    return { mode: "hot", watermarkFresh: false, bootstrapFresh: false };
   }
   const age = now - lastSyncMs;
   if (age <= STALE_WATERMARK_MS) {
-    return { mode: "incremental", watermarkFresh: true };
+    return { mode: "incremental", watermarkFresh: true, bootstrapFresh: false };
   }
-  return { mode: "hot", watermarkFresh: false };
+  return { mode: "hot", watermarkFresh: false, bootstrapFresh: false };
 }
 
 export function selectSyncDecision(input: PlannerSnapshot): PlannerDecision {
@@ -142,19 +156,29 @@ export function selectSyncDecision(input: PlannerSnapshot): PlannerDecision {
 
   const natural = naturalMode(freshness, input.now);
 
-  // Backfill consideration only replaces a natural `incremental` decision
-  // when quota is healthy, the completion sentinel is null, the watermark is
-  // fresh, and we are not on a list mode (those views prefer freshening
-  // visible rows first). A null cursor is still open and starts at page 1.
+  // Backfill consideration replaces a natural `incremental` decision when
+  // quota is healthy, the completion sentinel is null, the watermark is fresh,
+  // and we are not on a list mode (those views prefer freshening visible rows
+  // first). It also follows a recent bootstrap hot pass even without a
+  // watermark, because dispatching `incremental` would silently become a full
+  // sync while dispatching `hot` again would loop forever. A null cursor is
+  // still open and starts at page 1.
   const canConsiderBackfill =
-    natural.mode === "incremental" &&
-    natural.watermarkFresh &&
+    ((natural.mode === "incremental" && natural.watermarkFresh && !isListMode(activeTuiMode)) ||
+      natural.bootstrapFresh) &&
     band === "healthy" &&
-    freshness.backfillCompletedAt === null &&
-    !isListMode(activeTuiMode);
+    freshness.backfillCompletedAt === null;
 
   if (canConsiderBackfill) {
-    return { kind: "run", mode: "backfill", reason: "natural_backfill" };
+    return {
+      kind: "run",
+      mode: "backfill",
+      reason: natural.bootstrapFresh ? "bootstrap_backfill" : "natural_backfill",
+    };
+  }
+
+  if (natural.bootstrapFresh) {
+    return { kind: "skip", reason: "already_fresh" };
   }
 
   const reason =

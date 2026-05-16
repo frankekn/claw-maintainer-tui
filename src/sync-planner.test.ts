@@ -90,6 +90,21 @@ describe("reserve band", () => {
     );
     expect(decision).toEqual({ kind: "skip", reason: "rate_limit_reserve" });
   });
+
+  it("skips even after a recent hot bootstrap pass with no watermark", () => {
+    const recentHot = new Date(NOW - 1_000).toISOString();
+    const decision = selectSyncDecision(
+      snapshot({
+        rateLimit: rateLimit(50),
+        freshness: freshness({
+          lastSyncAt: recentHot,
+          lastSyncWatermark: null,
+          hotSyncAt: recentHot,
+        }),
+      }),
+    );
+    expect(decision).toEqual({ kind: "skip", reason: "rate_limit_reserve" });
+  });
 });
 
 describe("null rate-limit snapshot (treated as moderate)", () => {
@@ -134,6 +149,21 @@ describe("null rate-limit snapshot (treated as moderate)", () => {
       expect(decision.mode).toBe<PlannerMode>("incremental");
     }
   });
+
+  it("stays conservative after a recent hot bootstrap pass with no watermark", () => {
+    const recentHot = new Date(NOW - 1_000).toISOString();
+    const decision = selectSyncDecision(
+      snapshot({
+        rateLimit: null,
+        freshness: freshness({
+          lastSyncAt: recentHot,
+          lastSyncWatermark: null,
+          hotSyncAt: recentHot,
+        }),
+      }),
+    );
+    expect(decision).toEqual({ kind: "skip", reason: "already_fresh" });
+  });
 });
 
 describe("moderate band (>=100 and <500)", () => {
@@ -143,6 +173,21 @@ describe("moderate band (>=100 and <500)", () => {
     if (decision.kind === "run") {
       expect(decision.mode).toBe<PlannerMode>("hot");
     }
+  });
+
+  it("stays conservative after a recent hot bootstrap pass with no watermark", () => {
+    const recentHot = new Date(NOW - 1_000).toISOString();
+    const decision = selectSyncDecision(
+      snapshot({
+        rateLimit: rateLimit(200),
+        freshness: freshness({
+          lastSyncAt: recentHot,
+          lastSyncWatermark: null,
+          hotSyncAt: recentHot,
+        }),
+      }),
+    );
+    expect(decision).toEqual({ kind: "skip", reason: "already_fresh" });
   });
 
   it("runs incremental when watermark is fresh", () => {
@@ -250,6 +295,55 @@ describe("moderate band (>=100 and <500)", () => {
 describe("healthy band (>=500)", () => {
   it("runs hot when no watermark exists", () => {
     const decision = selectSyncDecision(snapshot({ rateLimit: rateLimit(2000) }));
+    expect(decision.kind).toBe("run");
+    if (decision.kind === "run") {
+      expect(decision.mode).toBe<PlannerMode>("hot");
+    }
+  });
+
+  it("schedules backfill after a recent hot bootstrap pass with no watermark", () => {
+    const recentHot = new Date(NOW - 1_000).toISOString();
+    const decision = selectSyncDecision(
+      snapshot({
+        rateLimit: rateLimit(2000),
+        freshness: freshness({
+          lastSyncAt: recentHot,
+          lastSyncWatermark: null,
+          hotSyncAt: recentHot,
+        }),
+      }),
+    );
+    expect(decision).toEqual({ kind: "run", mode: "backfill", reason: "bootstrap_backfill" });
+  });
+
+  it("schedules backfill in list mode after a recent hot bootstrap pass with no watermark", () => {
+    const recentHot = new Date(NOW - 1_000).toISOString();
+    const decision = selectSyncDecision(
+      snapshot({
+        rateLimit: rateLimit(2000),
+        freshness: freshness({
+          lastSyncAt: recentHot,
+          lastSyncWatermark: null,
+          hotSyncAt: recentHot,
+        }),
+        activeTuiMode: "pr-search",
+      }),
+    );
+    expect(decision).toEqual({ kind: "run", mode: "backfill", reason: "bootstrap_backfill" });
+  });
+
+  it("runs hot when no watermark exists and the bootstrap hot timestamp is stale", () => {
+    const staleHot = new Date(NOW - STALE_WATERMARK_MS - 5_000).toISOString();
+    const decision = selectSyncDecision(
+      snapshot({
+        rateLimit: rateLimit(2000),
+        freshness: freshness({
+          lastSyncAt: staleHot,
+          lastSyncWatermark: null,
+          hotSyncAt: staleHot,
+        }),
+      }),
+    );
     expect(decision.kind).toBe("run");
     if (decision.kind === "run") {
       expect(decision.mode).toBe<PlannerMode>("hot");
