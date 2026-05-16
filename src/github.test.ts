@@ -144,27 +144,22 @@ describe("clawlens github retry", () => {
     expect(paths[1]).toContain("page=2");
   });
 
-  it("uses issue search pages for hot updated-desc issue pagination", async () => {
+  it("keeps updated-desc issue pagination on the repository issues endpoint", async () => {
     const paths: string[] = [];
     const fetchJson: GhJsonFetcher = async <T>(path: string): Promise<T> => {
       paths.push(path);
-      if (path.startsWith("search/issues?")) {
-        return {
-          items: [
-            {
-              number: 42,
-              title: "Hot issue",
-              body: "Recent issue body",
-              user: { login: "alice" },
-              html_url: "https://github.com/openclaw/openclaw/issues/42",
-              created_at: "2026-03-10T00:00:00.000Z",
-              updated_at: "2026-03-12T00:00:00.000Z",
-              labels: [{ name: "bug" }],
-            },
-          ],
-        } as T;
-      }
-      throw new Error(`unexpected path: ${path}`);
+      return [
+        {
+          number: 42,
+          title: "Hot issue",
+          body: "Recent issue body",
+          user: { login: "alice" },
+          html_url: "https://github.com/openclaw/openclaw/issues/42",
+          created_at: "2026-03-10T00:00:00.000Z",
+          updated_at: "2026-03-12T00:00:00.000Z",
+          labels: [{ name: "bug" }],
+        },
+      ] as T;
     };
     const source = new GhCliPullRequestDataSource({ fetchJson });
 
@@ -179,10 +174,10 @@ describe("clawlens github retry", () => {
 
     expect(paths).toHaveLength(1);
     const url = new URL(`https://api.github.test/${paths[0]}`);
-    expect(url.pathname).toBe("/search/issues");
-    expect(url.searchParams.get("q")).toBe("is:issue repo:openclaw/openclaw");
+    expect(url.pathname).toBe("/repos/openclaw/openclaw/issues");
+    expect(url.searchParams.get("state")).toBe("all");
     expect(url.searchParams.get("sort")).toBe("updated");
-    expect(url.searchParams.get("order")).toBe("desc");
+    expect(url.searchParams.get("direction")).toBe("desc");
     expect(url.searchParams.get("per_page")).toBe("100");
     expect(url.searchParams.get("page")).toBe("1");
     expect(pages).toHaveLength(1);

@@ -66,10 +66,6 @@ type RestIssue = {
   pull_request?: Record<string, unknown> | null;
 };
 
-type RestSearchIssuesResponse = {
-  items?: RestIssue[] | null;
-};
-
 type RestReview = {
   id: number;
   body?: string | null;
@@ -588,33 +584,6 @@ export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueD
       return;
     }
     let fetchedPages = 0;
-    if (sort === "updated" && direction === "desc" && startPage === 1) {
-      const query = encodeURIComponent(`is:issue repo:${repo.owner}/${repo.name}`);
-      for (let page = 1; ; page += 1) {
-        const payload = await this.fetchJson<RestSearchIssuesResponse>(
-          `search/issues?q=${query}&sort=updated&order=desc&per_page=${PAGE_SIZE}&page=${page}`,
-        );
-        const items = payload.items ?? [];
-        if (items.length === 0) {
-          break;
-        }
-        fetchedPages += 1;
-        yield {
-          page,
-          fetchedItemCount: items.length,
-          issues: items
-            .filter((item) => !hasPullRequestMarker(item))
-            .map((item) => toIssueRecord(item)),
-        };
-        if (items.length < PAGE_SIZE) {
-          break;
-        }
-        if (pageLimit !== undefined && fetchedPages >= pageLimit) {
-          break;
-        }
-      }
-      return;
-    }
     for (let page = startPage; ; page += 1) {
       const items = await this.fetchJson<RestIssue[]>(
         `repos/${repo.owner}/${repo.name}/issues?state=all&sort=${sort}&direction=${direction}&per_page=${PAGE_SIZE}&page=${page}`,

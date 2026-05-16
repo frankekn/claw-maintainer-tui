@@ -1965,6 +1965,47 @@ describe("TuiController", () => {
     expect(controller.getRenderModel().footer.message).toContain("rate_limit_reserve");
   });
 
+  it("skipped already-fresh bookkeeping: advances nextAutoUpdateAt", async () => {
+    const service = new FakeTuiDataService();
+    service.statusSnapshot = {
+      ...service.statusSnapshot,
+      lastSyncAt: new Date().toISOString(),
+      issueLastSyncAt: new Date().toISOString(),
+    };
+    service.syncPrsResult = {
+      mode: "skipped",
+      entity: "prs",
+      repo: "openclaw/openclaw",
+      processedPrs: 0,
+      processedIssues: 0,
+      skippedPrs: 0,
+      skippedIssues: 0,
+      docCount: 0,
+      commentCount: 0,
+      labelCount: 0,
+      vectorAvailable: false,
+      lastSyncAt: null,
+      lastSyncWatermark: null,
+      reason: "already_fresh",
+    };
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+    await controller.initialize();
+    await controller.syncPrs();
+    await flushMicrotasks();
+    await flushMicrotasks();
+    const job = controller.getRenderModel().header.syncJobs.find((item) => item.entity === "prs")!;
+    expect(job.state).toBe("cooldown");
+    expect(job.lastMode).toBe("skipped");
+    expect(job.lastReason).toBe("already_fresh");
+    expect(job.nextAutoUpdateAt).not.toBeNull();
+    expect(Date.parse(job.nextAutoUpdateAt!)).toBeGreaterThan(Date.now());
+    expect(controller.getRenderModel().footer.message).toContain("already_fresh");
+  });
+
   it("idle refresh retries after a reserve skipped sync", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-03-13T00:00:00.000Z"));

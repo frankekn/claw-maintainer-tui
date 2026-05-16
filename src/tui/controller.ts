@@ -2151,9 +2151,7 @@ export class TuiController {
       job.nextBackfillCursor = summary.nextBackfillCursor ?? null;
 
       if (summary.mode === "skipped") {
-        // Reserve skips still need an idle retry so a user who stays in the same
-        // mode is not stranded after quota recovers.
-        if (summary.reason === "rate_limit_reserve") {
+        if (summary.reason !== "backfill_complete") {
           job.nextAutoUpdateAt = new Date(Date.now() + IDLE_INTERVAL_MS).toISOString();
         }
         job.state = "cooldown";
