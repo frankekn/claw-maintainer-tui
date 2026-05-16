@@ -147,6 +147,7 @@ export function formatHeader(model: TuiHeaderModel, now = new Date()): string {
 
 export function formatActionBar(actions: TuiAction[]): string {
   return actions
+    .filter((action) => action.enabled)
     .map((action) => `${actionChip(action.shortcut, action.enabled)} ${action.label}`)
     .join(` ${text("·", "dim")} `);
 }

@@ -22,6 +22,7 @@ function makeModel(overrides: Partial<TuiRenderModel> = {}): TuiRenderModel {
       hintText: "",
       message: "Ready.",
       banner: null,
+      inputKind: "command",
       queryPrompt: "Inbox",
       queryValue: "",
       queryCursorIndex: 0,

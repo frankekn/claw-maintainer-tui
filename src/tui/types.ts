@@ -51,9 +51,10 @@ export type TuiModeMeta = {
 export const TUI_MODE_ORDER: TuiModeMeta[] = [
   {
     id: "inbox",
-    label: "Inbox",
-    browsePrompt: "Browse-only mode · use \u2190/\u2192 or 1-6 to switch desks · ? for help",
-    queryPrompt: "Inbox is browse-only",
+    label: "Priority",
+    browsePrompt:
+      "Priority queue · ranked PR work · use \u2190/\u2192 or 1-6 to switch desks · ? for help",
+    queryPrompt: "Priority queue is browse-only",
     queryFilters: [],
     queryExamples: [],
   },
@@ -268,6 +269,8 @@ export type TuiSessionState = {
   message: string;
   errorMessage: string | null;
   browseLimit: number;
+  resultViewportRows: number;
+  terminalColumns: number;
   isLandingView: boolean;
   banner: TuiBanner | null;
   bannerHidden: boolean;
@@ -356,6 +359,7 @@ export type TuiFooterModel = {
   hintText: string;
   message: string;
   banner: TuiBanner | null;
+  inputKind: "command" | "query";
   queryPrompt: string;
   queryValue: string;
   queryCursorIndex: number;

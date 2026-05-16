@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-05-16T00:00:00.000Z",
+  "title": "Design System: clawlens",
+  "extensions": {
+    "colorMeta": {
+      "focus": {
+        "role": "primary",
+        "displayName": "Focus Cyan",
+        "canonical": "#63c8ff",
+        "purpose": "Active mode, selected row, focused panel border, and current keyboard target."
+      },
+      "command-bg": {
+        "role": "secondary",
+        "displayName": "Command Amber",
+        "canonical": "#b88628",
+        "purpose": "Command/query rail and warning-like status."
+      },
+      "panel-bg": {
+        "role": "neutral",
+        "displayName": "Panel Navy",
+        "canonical": "#0a121b",
+        "purpose": "Results and detail pane bodies."
+      }
+    },
+    "elevationMeta": {
+      "strategy": "tonal-layering-and-borders",
+      "rule": "No shadows. Depth is conveyed through background steps, active border color, badge fills, and selected row fill."
+    },
+    "componentMeta": {
+      "results-row": {
+        "states": ["default", "selected", "unfocused-selected"],
+        "rule": "Selected rows must remain obvious in screenshots and when detail focus is active."
+      },
+      "query-command-rail": {
+        "states": ["search-input", "browse-command-help"],
+        "rule": "Never show a fake query prompt in browse-only modes."
+      },
+      "detail-section": {
+        "states": ["visible", "collapsed", "omitted-empty"],
+        "rule": "Detail starts with decision summary, then deeper context."
+      }
+    },
+    "terminalMeta": {
+      "minimumViewport": "80x24",
+      "density": "high",
+      "interaction": "keyboard-first",
+      "motion": "none"
+    }
+  }
+}

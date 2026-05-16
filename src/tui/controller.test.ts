@@ -533,7 +533,7 @@ describe("TuiController", () => {
     vi.useRealTimers();
   });
 
-  it("loads Inbox on startup", async () => {
+  it("loads Priority on startup", async () => {
     const service = new FakeTuiDataService();
     const controller = new TuiController(service, {
       repo: "openclaw/openclaw",
@@ -545,9 +545,9 @@ describe("TuiController", () => {
 
     let model = controller.getRenderModel();
     expect(model.mode).toBe("inbox");
-    expect(model.resultsPane.title).toBe("Inbox");
+    expect(model.resultsPane.title).toBe("Priority");
     expect(model.resultsPane.rows).toHaveLength(20);
-    expect(model.detailPane.lines.join("\n")).toContain("collapsed priority queue");
+    expect(model.detailPane.lines.join("\n")).toContain("ranked priority queue");
     expect(service.priorityInboxCalls).toEqual([{ limit: 20, scanLimit: 300 }]);
   });
 
@@ -611,7 +611,7 @@ describe("TuiController", () => {
 
     controller.goBack();
     model = controller.getRenderModel();
-    expect(model.resultsPane.title).toBe("Inbox");
+    expect(model.resultsPane.title).toBe("Priority");
     expect(model.resultsPane.rows[0]?.kind).toBe("pr");
   });
 
@@ -659,11 +659,7 @@ describe("TuiController", () => {
       shortcut: "e",
       enabled: true,
     });
-    expect(model.footer.actions.find((action) => action.id === "detail")).toMatchObject({
-      label: "Detail",
-      shortcut: "Enter",
-      enabled: false,
-    });
+    expect(model.footer.actions.find((action) => action.id === "detail")).toBeUndefined();
 
     await controller.refreshSelected();
     model = controller.getRenderModel();
@@ -721,7 +717,7 @@ describe("TuiController", () => {
 
     model = controller.getRenderModel();
     expect(model.mode).toBe("inbox");
-    expect(model.resultsPane.title).toBe("Inbox");
+    expect(model.resultsPane.title).toBe("Priority");
     expect(model.resultsPane.rows[0]?.kind).toBe("pr");
   });
 
@@ -933,6 +929,36 @@ describe("TuiController", () => {
     await openPromise;
   });
 
+  it("uses viewport row capacity for the initial Inbox load", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.updateResultViewportRows(32);
+    await controller.initialize();
+
+    expect(controller.getRenderModel().resultsPane.rows).toHaveLength(32);
+    expect(service.priorityInboxCalls).toEqual([{ limit: 32, scanLimit: 300 }]);
+  });
+
+  it("falls back to 20 rows for small viewport capacity", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.updateResultViewportRows(8);
+    await controller.initialize();
+
+    expect(controller.getRenderModel().resultsPane.rows).toHaveLength(20);
+    expect(service.priorityInboxCalls).toEqual([{ limit: 20, scanLimit: 300 }]);
+  });
+
   it("uses x and c to jump within detail without changing mode", async () => {
     const service = new FakeTuiDataService();
     const controller = new TuiController(service, {
@@ -1082,7 +1108,7 @@ describe("TuiController", () => {
     const model = controller.getRenderModel();
     expect(model.detailPane.visible).toBe(false);
     expect(model.detailPane.title).toBe("Start Here");
-    expect(model.detailPane.lines.join("\n")).toContain("collapsed priority queue");
+    expect(model.detailPane.lines.join("\n")).toContain("ranked priority queue");
 
     service.releaseRefreshPr();
     await openPromise;
@@ -1224,7 +1250,7 @@ describe("TuiController", () => {
     expect(controller.getRenderModel().footer.banner?.message).toContain("Undid triage change");
   });
 
-  it("loads more Inbox rows in batches of 20", async () => {
+  it("marks only the visible viewport rows after more rows are loaded", async () => {
     const service = new FakeTuiDataService();
     const controller = new TuiController(service, {
       repo: "openclaw/openclaw",
@@ -1234,9 +1260,62 @@ describe("TuiController", () => {
 
     await controller.initialize();
     await controller.loadMore();
+    await controller.markVisiblePageSeen();
 
     expect(controller.getRenderModel().resultsPane.rows).toHaveLength(40);
-    expect(service.priorityQueueCalls.at(-1)).toEqual({ limit: 40, scanLimit: 300 });
+    expect(service.attentionState.get(41793)).toBe("seen");
+    expect(service.attentionState.get(41812)).toBe("seen");
+    expect(service.attentionState.get(41813)).toBeUndefined();
+  });
+
+  it("loads more Inbox rows in viewport-sized batches", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.updateResultViewportRows(30);
+    await controller.initialize();
+    await controller.loadMore();
+
+    expect(controller.getRenderModel().resultsPane.rows).toHaveLength(60);
+    expect(service.priorityQueueCalls.at(-1)).toEqual({ limit: 60, scanLimit: 300 });
+  });
+
+  it("refills a larger viewport without losing the selected row", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.initialize();
+    controller.moveSelection(6);
+    await controller.updateResultViewportRows(28);
+
+    const model = controller.getRenderModel();
+    expect(model.resultsPane.rows).toHaveLength(28);
+    expect(model.resultsPane.selectedIndex).toBe(6);
+    expect(model.activeUrl).toContain("41799");
+  });
+
+  it("keeps loaded rows when the viewport gets smaller", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    await controller.updateResultViewportRows(28);
+    await controller.initialize();
+    await controller.updateResultViewportRows(20);
+
+    expect(controller.getRenderModel().resultsPane.rows).toHaveLength(28);
+    expect(service.priorityInboxCalls).toEqual([{ limit: 28, scanLimit: 300 }]);
   });
 
   it("restores browse limit when navigating back", async () => {
@@ -1411,8 +1490,34 @@ describe("TuiController", () => {
     await controller.initialize();
 
     const model = controller.getRenderModel();
-    expect(model.footer.queryPlaceholder).toContain("Browse-only mode");
+    expect(model.footer.inputKind).toBe("command");
+    expect(model.footer.queryPrompt).toBe("Priority");
+    expect(model.footer.queryPlaceholder).toContain("Priority queue");
     expect(model.footer.queryHelpText).toBe("");
+  });
+
+  it("switches the footer rail to query only while editing search input", async () => {
+    const service = new FakeTuiDataService();
+    const controller = new TuiController(service, {
+      repo: "openclaw/openclaw",
+      dbPath: "/tmp/clawlens.sqlite",
+      ftsOnly: false,
+    });
+
+    controller.activateMode("pr-search");
+    await flushMicrotasks();
+
+    const browseModel = controller.getRenderModel();
+    expect(browseModel.footer.inputKind).toBe("command");
+    expect(browseModel.footer.queryPrompt).toBe("PRs");
+    expect(browseModel.footer.queryPlaceholder).toBe("Press / to search");
+
+    controller.startQueryEntry();
+
+    const queryModel = controller.getRenderModel();
+    expect(queryModel.footer.inputKind).toBe("query");
+    expect(queryModel.footer.queryPrompt).toBe("PR query");
+    expect(queryModel.footer.queryHelpText).toContain("[Enter] search");
   });
 
   it("keeps inbox pagination enabled when collapsed clusters compress visible rows", async () => {

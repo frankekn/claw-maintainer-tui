@@ -66,6 +66,100 @@ function buildBanner(session: TuiSessionState, options: PresenterOptions): TuiBa
   return session.banner;
 }
 
+function isSearchMode(session: TuiSessionState): boolean {
+  return (
+    session.mode === "cross-search" ||
+    session.mode === "pr-search" ||
+    session.mode === "issue-search"
+  );
+}
+
+function percentRatio(value: string): number {
+  if (!value.endsWith("%")) {
+    return 1;
+  }
+  const parsed = Number(value.slice(0, -1));
+  if (!Number.isFinite(parsed)) {
+    return 1;
+  }
+  return parsed / 100;
+}
+
+function resultLineWidth(session: TuiSessionState, detailVisible: boolean): number {
+  const widthPreset = DETAIL_WIDTH_PRESETS[session.detailWidthIndex] ?? DETAIL_WIDTH_PRESETS[0];
+  let ratio = 1;
+  if (detailVisible && session.detailLayoutMode === "split-pane") {
+    ratio = percentRatio(widthPreset.results);
+  }
+  return Math.max(40, Math.floor(session.terminalColumns * ratio) - 4);
+}
+
+function footerPlaceholder(
+  session: TuiSessionState,
+  modeInfo: (typeof TUI_MODE_ORDER)[number],
+): string {
+  if (session.focus === "query") {
+    return "";
+  }
+  if (isSearchMode(session)) {
+    return "Press / to search";
+  }
+  return modeInfo.browsePrompt;
+}
+
+function footerActionPriority(action: TuiAction): number {
+  switch (action.id) {
+    case "undo":
+      return 0;
+    case "query":
+      return 1;
+    case "detail":
+      return 2;
+    case "load-more":
+      return 3;
+    case "expand-cluster":
+      return 4;
+    case "cluster":
+      return 5;
+    case "mark-seen":
+      return 6;
+    case "refresh":
+      return 7;
+    case "back":
+      return 8;
+    case "sync-prs":
+      return 9;
+    case "sync-issues":
+      return 10;
+    case "open-url":
+      return 11;
+    case "jump-linked-issues":
+      return 12;
+    case "toggle-watch":
+      return 13;
+    case "toggle-ignore":
+      return 14;
+    case "clear-state":
+      return 15;
+    case "mark-page-seen":
+      return 16;
+    default:
+      return 99;
+  }
+}
+
+function buildFooterActions(actions: TuiAction[]): TuiAction[] {
+  return actions
+    .filter((action) => action.enabled)
+    .map((action, index) => ({ action, index }))
+    .sort((left, right) => {
+      const priorityDiff = footerActionPriority(left.action) - footerActionPriority(right.action);
+      return priorityDiff === 0 ? left.index - right.index : priorityDiff;
+    })
+    .slice(0, 4)
+    .map((entry) => entry.action);
+}
+
 function buildHelpOverlay(
   session: TuiSessionState,
   actions: TuiAction[],
@@ -129,6 +223,8 @@ export function buildRenderModel(
   options: PresenterOptions,
 ): TuiRenderModel {
   const modeInfo = TUI_MODE_ORDER.find((mode) => mode.id === session.mode)!;
+  const widthPreset = DETAIL_WIDTH_PRESETS[session.detailWidthIndex] ?? DETAIL_WIDTH_PRESETS[0];
+  const layoutMode = detail.visible ? session.detailLayoutMode : "single-pane";
   const resultsPane = formatResultsPaneModel({
     mode: session.mode,
     title: session.resultTitle,
@@ -139,6 +235,7 @@ export function buildRenderModel(
     message: session.errorMessage ?? session.message,
     isLandingView: session.isLandingView,
     status: options.status,
+    lineWidth: resultLineWidth(session, detail.visible),
   });
   const detailPane = buildDetailPaneModel({
     payload: detail.payload,
@@ -157,8 +254,9 @@ export function buildRenderModel(
       : modeInfo.queryExamples.length > 0
         ? `example: ${modeInfo.queryExamples[0]}`
         : "";
-  const widthPreset = DETAIL_WIDTH_PRESETS[session.detailWidthIndex] ?? DETAIL_WIDTH_PRESETS[0];
-  const layoutMode = detail.visible ? session.detailLayoutMode : "single-pane";
+  const inputKind = session.focus === "query" ? "query" : "command";
+  const queryPlaceholder = footerPlaceholder(session, modeInfo);
+  const footerActions = buildFooterActions(options.actions);
 
   return {
     header: {
@@ -178,19 +276,15 @@ export function buildRenderModel(
       hintText: queryHelpText,
       message: session.errorMessage ?? session.message,
       banner,
-      queryPrompt: modeInfo.queryPrompt,
+      inputKind,
+      queryPrompt: session.focus === "query" ? modeInfo.queryPrompt : modeInfo.label,
       queryValue: session.query,
       queryCursorIndex:
         session.queryState[session.mode as "cross-search" | "pr-search" | "issue-search"]
           ?.cursorIndex ?? session.query.length,
-      queryPlaceholder:
-        session.focus === "query"
-          ? ""
-          : modeInfo.queryFilters.length > 0
-            ? "Press / to search"
-            : modeInfo.browsePrompt,
+      queryPlaceholder,
       queryHelpText,
-      actions: options.actions,
+      actions: footerActions,
       keys: globalKeys,
       autoUpdateHint: "auto-update every 5m when idle",
     },

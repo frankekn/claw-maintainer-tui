@@ -8,6 +8,7 @@ import {
   formatListSummary,
   formatModeTabs,
   formatPriorityPrDetail,
+  formatResultsPaneModel,
   formatResultRow,
   formatSearchLandingDetail,
   formatStatusDetail,
@@ -48,7 +49,7 @@ const status: StatusSnapshot = {
 const headerModel: TuiHeaderModel = {
   repo: "openclaw/openclaw",
   dbPath: "/tmp/clawlens.sqlite",
-  activeModeLabel: "Inbox",
+  activeModeLabel: "Priority",
   ftsOnly: false,
   status,
   rateLimit: {
@@ -255,7 +256,7 @@ describe("tui formatting", () => {
   it("formats the header with sync badges", () => {
     const header = formatHeader(headerModel, new Date("2026-03-11T08:28:13.832Z"));
 
-    expect(header).toContain("MODE Inbox");
+    expect(header).toContain("MODE Priority");
     expect(header).toContain("REPO openclaw/openclaw");
     expect(header).toContain("PR 1h");
     expect(header).toContain("ISSUE 44m");
@@ -277,6 +278,19 @@ describe("tui formatting", () => {
     );
     expect(row).toContain("WATCH");
     expect(row).toContain("I2 R3");
+    const compactRow = formatResultRow(
+      {
+        kind: "pr",
+        pr: candidate.pr,
+        freshness: "fresh",
+        priority: candidate,
+      },
+      "inbox",
+      72,
+    );
+    expect(compactRow).toContain("PR #41793");
+    expect(compactRow).toContain("I2 R3");
+    expect(compactRow).not.toContain("watchlist pin");
 
     const clusterRow = formatResultRow(
       {
@@ -311,6 +325,44 @@ describe("tui formatting", () => {
     expect(collapsed.lines.join("\n")).not.toContain("Issue 41789");
   });
 
+  it("omits empty PR detail sections and uses compact headers for narrow results", () => {
+    const sparseBundle: PrContextBundle = {
+      ...makeBundle(),
+      linkedIssues: [],
+      relatedPullRequests: [],
+      cluster: null,
+      comments: [],
+    };
+    const detail = formatPriorityPrDetail(sparseBundle);
+    const joined = detail.lines.join("\n");
+    expect(joined).not.toContain("LINKED ISSUES");
+    expect(joined).not.toContain("RELATED PRS");
+    expect(joined).not.toContain("CLUSTER");
+    expect(joined).toContain("MAINTAINER STATE");
+
+    const pane = formatResultsPaneModel({
+      mode: "inbox",
+      title: "Priority",
+      rows: [
+        {
+          kind: "pr",
+          pr: makeCandidate().pr,
+          freshness: "fresh",
+          priority: makeCandidate(),
+        },
+      ],
+      selectedIndex: 0,
+      focus: "results",
+      summary: null,
+      message: "Loaded.",
+      isLandingView: false,
+      status,
+      lineWidth: 72,
+    });
+    expect(pane.lines[0]).toContain("Kind ID Score Triage Age Ctx Title");
+    expect(pane.lines[1]).not.toContain("Title / reasons");
+  });
+
   it("uses recent cached copy on PR and issue search landings", () => {
     const now = new Date("2026-03-11T08:28:13.832Z");
     const prLanding = formatSearchLandingDetail("pr-search", status, now);
@@ -322,28 +374,28 @@ describe("tui formatting", () => {
     expect(issueLanding.join("\n")).toContain("issues");
   });
 
-  it("formats Inbox landing copy and mode tabs", () => {
+  it("formats Priority landing copy and mode tabs", () => {
     const detail = formatInboxLandingDetail(status, new Date("2026-03-11T08:28:13.832Z"));
 
     expect(detail.join("\n")).toContain("START HERE");
-    expect(detail.join("\n")).toContain("collapsed priority queue");
+    expect(detail.join("\n")).toContain("ranked priority queue");
     expect(detail.join("\n")).toContain("Press e to expand");
     expect(detail.join("\n")).toContain("v / w / i / u");
 
     const tabs = formatModeTabs("inbox", "results");
-    expect(tabs).toContain("Inbox");
+    expect(tabs).toContain("Priority");
     expect(tabs).toContain("Watchlist");
     expect(tabs).toContain("Explore");
   });
 
-  it("includes disabled actions in the action bar dimmed", () => {
+  it("omits disabled actions from the action bar", () => {
     const bar = formatActionBar([
       { id: "detail", label: "Detail", shortcut: "Enter", enabled: true },
       { id: "refresh", label: "Refresh", shortcut: "r", enabled: false },
       { id: "back", label: "Back", shortcut: "b", enabled: true },
     ]);
     expect(bar).toContain("Detail");
-    expect(bar).toContain("Refresh");
+    expect(bar).not.toContain("Refresh");
     expect(bar).toContain("Back");
   });
 

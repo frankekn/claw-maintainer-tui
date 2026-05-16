@@ -62,11 +62,7 @@ function formatPrioritySummary(candidate: PriorityCandidate): string[] {
   return [
     `${text(`PR #${candidate.pr.prNumber}`, "accent")} ${candidate.pr.title}`,
     `${valueTone(candidate.pr.state.toUpperCase(), stateTone(candidate.pr.state))}  ${text(candidate.pr.author, "muted")}  ${text(candidate.pr.updatedAt, "dim")}`,
-    accentMeta("labels", formatLabelBlock(candidate.pr.labels)),
-    accentMeta("github", candidate.pr.url),
-    accentMeta("attention", candidate.attentionState),
-    accentMeta("priority_score", String(candidate.score)),
-    accentMeta("badges", badges.length > 0 ? badges.join(", ") : "(none)"),
+    `${accentMeta("priority_score", String(candidate.score))}  ${accentMeta("attention", candidate.attentionState)}  ${accentMeta("badges", badges.length > 0 ? badges.join(", ") : "(none)")}`,
   ];
 }
 
@@ -159,77 +155,73 @@ export function formatPriorityPrDetail(
   }
   lines.push(sectionLabel("Why Prioritized"));
   lines.push(...formatReasonLines(bundle.candidate.reasons));
-  appendSection(
-    lines,
-    anchors,
-    foldedSections,
-    "linked-issues",
-    "Linked Issues",
-    [
-      `${text("count", "muted")} ${bundle.linkedIssues.length}`,
-      ...(bundle.linkedIssues.length > 0
-        ? bundle.linkedIssues.map((issue) => `- #${issue.issueNumber} ${issue.title}`)
-        : ["(none)"]),
-    ],
-    { foldable: true },
-  );
-  appendSection(
-    lines,
-    anchors,
-    foldedSections,
-    "related-prs",
-    "Related PRs",
-    [
-      `${text("count", "muted")} ${bundle.relatedPullRequests.length}`,
-      ...(bundle.relatedPullRequests.length > 0
-        ? bundle.relatedPullRequests.map((pr) => `- #${pr.prNumber} ${pr.title}`)
-        : ["(none)"]),
-    ],
-    { foldable: true },
-  );
+  if (bundle.linkedIssues.length > 0) {
+    appendSection(
+      lines,
+      anchors,
+      foldedSections,
+      "linked-issues",
+      "Linked Issues",
+      [
+        `${text("count", "muted")} ${bundle.linkedIssues.length}`,
+        ...bundle.linkedIssues.map((issue) => `- #${issue.issueNumber} ${issue.title}`),
+      ],
+      { foldable: true },
+    );
+  }
+  if (bundle.relatedPullRequests.length > 0) {
+    appendSection(
+      lines,
+      anchors,
+      foldedSections,
+      "related-prs",
+      "Related PRs",
+      [
+        `${text("count", "muted")} ${bundle.relatedPullRequests.length}`,
+        ...bundle.relatedPullRequests.map((pr) => `- #${pr.prNumber} ${pr.title}`),
+      ],
+      { foldable: true },
+    );
+  }
   const bestBase = bundle.cluster?.bestBase ?? null;
   const sameClusterCandidates = bundle.cluster?.sameClusterCandidates ?? [];
   const nearbyButExcluded = bundle.cluster?.nearbyButExcluded ?? [];
   const clusterCandidates =
     (bestBase ? 1 : 0) + sameClusterCandidates.length + nearbyButExcluded.length;
-  appendSection(
-    lines,
-    anchors,
-    foldedSections,
-    "cluster",
-    "Cluster",
-    [
-      bundle.cluster
-        ? `${text("basis", "muted")} ${bundle.cluster.clusterBasis}`
-        : `${text("basis", "muted")} (none)`,
-      bundle.cluster && bundle.cluster.clusterIssueNumbers.length > 0
-        ? `${text("issues", "muted")} ${bundle.cluster.clusterIssueNumbers.map((issue) => `#${issue}`).join(", ")}`
-        : `${text("issues", "muted")} (none)`,
-      `${text("rows", "muted")} ${clusterCandidates}`,
-      ...(bestBase ? [formatClusterCandidateLine(bestBase, "★", "best base")] : []),
-      ...(sameClusterCandidates.length > 0
-        ? sameClusterCandidates
-            .filter((candidate) => candidate.prNumber !== bestBase?.prNumber)
-            .map((candidate) =>
-              formatClusterCandidateLine(
-                candidate,
-                candidate.status === "superseded_candidate" ? "└" : "├",
-                candidate.status.replaceAll("_", " "),
-              ),
-            )
-        : bestBase
-          ? []
-          : ["(none)"]),
-      ...(nearbyButExcluded.length > 0
-        ? [
-            `${text("excluded", "muted")} +${nearbyButExcluded.length} candidate${
-              nearbyButExcluded.length === 1 ? "" : "s"
-            } hidden  ${text("[e to show]", "dim")}`,
-          ]
-        : []),
-    ],
-    { foldable: true },
-  );
+  if (bundle.cluster) {
+    appendSection(
+      lines,
+      anchors,
+      foldedSections,
+      "cluster",
+      "Cluster",
+      [
+        `${text("basis", "muted")} ${bundle.cluster.clusterBasis}`,
+        bundle.cluster.clusterIssueNumbers.length > 0
+          ? `${text("issues", "muted")} ${bundle.cluster.clusterIssueNumbers.map((issue) => `#${issue}`).join(", ")}`
+          : `${text("issues", "muted")} (none)`,
+        `${text("rows", "muted")} ${clusterCandidates}`,
+        ...(bestBase ? [formatClusterCandidateLine(bestBase, "★", "best base")] : []),
+        ...sameClusterCandidates
+          .filter((candidate) => candidate.prNumber !== bestBase?.prNumber)
+          .map((candidate) =>
+            formatClusterCandidateLine(
+              candidate,
+              candidate.status === "superseded_candidate" ? "└" : "├",
+              candidate.status.replaceAll("_", " "),
+            ),
+          ),
+        ...(nearbyButExcluded.length > 0
+          ? [
+              `${text("excluded", "muted")} +${nearbyButExcluded.length} candidate${
+                nearbyButExcluded.length === 1 ? "" : "s"
+              } hidden  ${text("[e to show]", "dim")}`,
+            ]
+          : []),
+      ],
+      { foldable: true },
+    );
+  }
   appendSection(
     lines,
     anchors,
@@ -240,6 +232,7 @@ export function formatPriorityPrDetail(
       `${text("attention", "muted")} ${bundle.candidate.attentionState}`,
       `${text("watchlist", "muted")} ${bundle.candidate.attentionState === "watch" ? "yes" : "no"}`,
       `${text("ignore", "muted")} ${bundle.candidate.attentionState === "ignore" ? "yes" : "no"}`,
+      `${text("labels", "muted")} ${formatLabelBlock(bundle.candidate.pr.labels)}`,
     ],
     { foldable: true },
   );
@@ -376,7 +369,7 @@ export function formatCrossSearchLandingDetail(
     sectionLabel("Workflow"),
     "1 Browse the cached list or press / to refine it.",
     "2 Press Enter to open the selected detail drawer.",
-    "3 Press m to load 20 more rows.",
+    "3 Press m to load another visible page of rows.",
     "4 Use x or c to jump to linked issues or cluster context.",
   );
   return lines;
@@ -388,7 +381,7 @@ export function formatInboxLandingDetail(
 ): string[] {
   const lines = [
     sectionLabel("Start Here"),
-    "Inbox collapses overlapping PR work so you can review clusters before individual PRs.",
+    "Priority ranks and collapses PR work so you can review the highest-signal queue first.",
   ];
   if (status) {
     lines.push(accentMeta("repo", status.repo));
@@ -399,7 +392,7 @@ export function formatInboxLandingDetail(
   lines.push(
     "",
     sectionLabel("Workflow"),
-    "1 Review the collapsed priority queue.",
+    "1 Review the ranked priority queue.",
     "2 Press Enter to open the selected PR or cluster investigation workspace.",
     "3 Press e to expand a collapsed cluster into member PRs.",
     "4 Press x or c to jump to linked issues or cluster.",
@@ -455,7 +448,7 @@ export function formatSearchLandingDetail(
     sectionLabel("Workflow"),
     `1 Browse recent cached ${plural.toLowerCase()} or press / to search.`,
     `2 Press Enter to inspect the selected ${noun.toLowerCase()}.`,
-    "3 Press m to load 20 more rows.",
+    "3 Press m to load another visible page of rows.",
   );
   return lines;
 }

@@ -10,6 +10,7 @@ import {
   selectedRowIdentity,
 } from "./rows.js";
 import { canLoadMoreRows, isPriorityDetailRow } from "./capabilities.js";
+import { MIN_RESULT_VIEWPORT_ROWS, visibleRowRange } from "./viewport.js";
 import type {
   ListLoadResult,
   ListMode,
@@ -65,7 +66,7 @@ type ControllerOptions = {
 };
 
 const PRIORITY_SCAN_LIMIT = 300;
-const DEFAULT_PAGE_SIZE = 20;
+const DEFAULT_PAGE_SIZE = MIN_RESULT_VIEWPORT_ROWS;
 const ENTRY_STALE_MS = 10 * 60 * 1000;
 const IDLE_INTERVAL_MS = 5 * 60 * 1000;
 const IDLE_TIMEOUT_MS = 30 * 1000;
@@ -308,6 +309,22 @@ export class TuiController {
     this.sessionState.browseLimit = value;
   }
 
+  private get resultViewportRows(): number {
+    return this.sessionState.resultViewportRows;
+  }
+
+  private set resultViewportRows(value: number) {
+    this.sessionState.resultViewportRows = value;
+  }
+
+  private get terminalColumns(): number {
+    return this.sessionState.terminalColumns;
+  }
+
+  private set terminalColumns(value: number) {
+    this.sessionState.terminalColumns = value;
+  }
+
   private get isLandingView(): boolean {
     return this.sessionState.isLandingView;
   }
@@ -392,12 +409,41 @@ export class TuiController {
   }
 
   async initialize(): Promise<void> {
-    this.message = "Loading Inbox...";
+    this.message = "Loading Priority...";
     this.emit();
     await this.refreshStatus();
     await this.loadLandingRows("inbox");
     this.scheduleAutoSync("inbox");
     this.ensureIdleRefreshTimer();
+    this.emit();
+  }
+
+  async updateTerminalSize(rowCount: number, columnCount: number): Promise<void> {
+    this.terminalColumns = Math.max(40, Math.floor(columnCount));
+    await this.updateResultViewportRows(rowCount);
+  }
+
+  async updateResultViewportRows(rowCount: number): Promise<void> {
+    const nextRows = Math.max(this.resultLimit, Math.floor(rowCount));
+    if (nextRows === this.resultViewportRows) {
+      return;
+    }
+    const previousRows = this.resultViewportRows;
+    this.resultViewportRows = nextRows;
+    if (this.browseLimit < nextRows) {
+      this.browseLimit = nextRows;
+    }
+    if (nextRows <= previousRows || !this.isListMode(this.mode) || this.rows.length === 0) {
+      this.emit();
+      return;
+    }
+    const selectionIdentity = this.selectedRowIdentity();
+    if (this.isQueryMode(this.mode) && this.query) {
+      await this.submitQuery(this.query);
+    } else {
+      await this.loadLandingRows(this.mode);
+    }
+    this.restoreSelection(selectionIdentity);
     this.emit();
   }
 
@@ -652,7 +698,7 @@ export class TuiController {
     this.context = null;
     this.activeUrl = null;
     this.query = this.queryForMode(mode);
-    this.browseLimit = this.resultLimit;
+    this.browseLimit = this.resultViewportRows;
     this.errorMessage = null;
     this.banner = null;
     this.bannerHidden = false;
@@ -844,7 +890,7 @@ export class TuiController {
     if (!this.isQueryMode(this.mode)) {
       return;
     }
-    this.browseLimit = this.resultLimit;
+    this.browseLimit = this.resultViewportRows;
     await this.submitQuery(this.query);
     this.focus = "results";
     this.emit();
@@ -1051,7 +1097,7 @@ export class TuiController {
         : this.clusterAttentionState(row);
     await this.updateAttentionState(
       current === "ignore" ? null : "ignore",
-      current === "ignore" ? "Cleared ignore state." : "Ignored PR in Inbox.",
+      current === "ignore" ? "Cleared ignore state." : "Ignored PR in Priority.",
     );
   }
 
@@ -1109,6 +1155,8 @@ export class TuiController {
     this.context = snapshot.session.context;
     this.isLandingView = snapshot.session.isLandingView;
     this.browseLimit = snapshot.session.browseLimit;
+    this.resultViewportRows = snapshot.session.resultViewportRows;
+    this.terminalColumns = snapshot.session.terminalColumns;
     this.banner = snapshot.session.banner;
     this.bannerHidden = snapshot.session.bannerHidden;
     this.helpVisible = snapshot.session.helpVisible;
@@ -1460,9 +1508,14 @@ export class TuiController {
   }
 
   private visiblePriorityPrNumbers(): number[] {
+    const range = visibleRowRange({
+      rowCount: this.rows.length,
+      selectedIndex: this.selectedIndex,
+      viewportRows: this.resultViewportRows,
+    });
     return Array.from(
       new Set(
-        this.rows.flatMap((row) => {
+        this.rows.slice(range.start, range.end).flatMap((row) => {
           if (row.kind === "pr") {
             return [row.pr.prNumber];
           }
@@ -1481,7 +1534,7 @@ export class TuiController {
     const hasHistory = this.history.length > 0;
     const clusterWorkspace = this.clusterWorkspace;
     const inClusterWorkspace = clusterWorkspace !== null;
-    const canLinked = row?.kind === "pr";
+    const canLinked = canJumpLinkedIssues(row);
     const canCluster = isPriorityDetailRow(row);
     const canOpenClusterWorkspace = isPriorityDetailRow(row);
     const canToggleExcluded =
@@ -1521,12 +1574,7 @@ export class TuiController {
         }
         return [
           this.action("detail", this.showDetail ? "Close" : "Detail", "Enter", hasRow),
-          this.action(
-            "jump-linked-issues",
-            "Linked Issues",
-            "x",
-            canLinked || row?.kind === "priority-cluster",
-          ),
+          this.action("jump-linked-issues", "Linked Issues", "x", canLinked),
           this.action("cluster", "Cluster", "c", canCluster),
           this.action("expand-cluster", "Cluster Workspace", "e", canOpenClusterWorkspace),
           this.action("mark-seen", "Seen", "v", canTriage),
@@ -1957,7 +2005,7 @@ export class TuiController {
       return;
     }
     const selectionIdentity = this.selectedRowIdentity();
-    this.browseLimit += this.resultLimit;
+    this.browseLimit += this.resultViewportRows;
     if (this.isQueryMode(this.mode) && this.query) {
       await this.submitQuery(this.query);
     } else {
@@ -2340,6 +2388,22 @@ function defaultFoldedSections(payload: TuiDetailState["payload"]): TuiDetailFol
     return {};
   }
   return { "sparse-extras": true };
+}
+
+function canJumpLinkedIssues(row: TuiResultRow | undefined): boolean {
+  if (!row) {
+    return false;
+  }
+  if (row.kind === "priority-cluster") {
+    return row.cluster.linkedIssueCount > 0;
+  }
+  if (row.kind !== "pr") {
+    return false;
+  }
+  if (!row.priority) {
+    return true;
+  }
+  return row.priority.linkedIssueCount > 0;
 }
 
 function currentFoldableSection(detail: TuiDetailState): TuiDetailSection | null {

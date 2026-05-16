@@ -10,6 +10,7 @@ import {
 } from "./format.js";
 import { resolveKeyAction } from "./keymap.js";
 import { TUI_THEME, keyLabel, panelLabel, text, valueTone } from "./theme.js";
+import { calculateResultViewportRows, visibleRowRange } from "./viewport.js";
 import type { TuiController } from "./controller.js";
 import type { TuiLayoutMode, TuiRenderModel } from "./types.js";
 
@@ -130,6 +131,9 @@ export class BlessedTuiRenderer {
       padding: { left: 1, right: 1 },
     });
     this.bindKeys();
+    this.screen.on("resize", () => {
+      void this.syncViewportRows();
+    });
   }
 
   async run(): Promise<void> {
@@ -142,6 +146,7 @@ export class BlessedTuiRenderer {
     this.unsubscribe = this.controller.subscribe(() => {
       this.render(this.controller.getRenderModel());
     });
+    await this.syncViewportRows();
     this.render(this.controller.getRenderModel());
     try {
       await this.controller.initialize();
@@ -158,6 +163,20 @@ export class BlessedTuiRenderer {
     this.screen.on("keypress", (ch, key) => {
       void this.handleKeypress(ch, key);
     });
+  }
+
+  private async syncViewportRows(): Promise<void> {
+    try {
+      await this.controller.updateTerminalSize(
+        calculateResultViewportRows(this.screen.rows),
+        this.screen.cols,
+      );
+    } catch (error) {
+      this.controller.reportError(
+        error instanceof Error ? error.message : String(error),
+        "viewport resize",
+      );
+    }
   }
 
   private render(model: TuiRenderModel): void {
@@ -211,7 +230,8 @@ export class BlessedTuiRenderer {
     this.messageBox.setContent(
       `${bannerLine}  ${keyLabel("ACTIONS")} ${formatActionBar(model.footer.actions)}`,
     );
-    const promptPrefix = `${keyLabel("QUERY")} ${text(model.footer.queryPrompt.toUpperCase(), "dim")} >`;
+    const inputLabel = model.footer.inputKind === "query" ? "QUERY" : "COMMAND";
+    const promptPrefix = `${keyLabel(inputLabel)} ${text(model.footer.queryPrompt.toUpperCase(), "dim")} >`;
     const rawQuery = model.footer.queryValue;
     const cursorIndex = model.footer.queryCursorIndex;
     const cursor = model.focus === "query" ? "█" : "";
@@ -350,7 +370,12 @@ export class BlessedTuiRenderer {
   }
 
   private syncScroll(model: TuiRenderModel): void {
-    this.resultsBox.setScroll(Math.max(0, model.resultsPane.selectedIndex - 4));
+    const range = visibleRowRange({
+      rowCount: model.resultsPane.rows.length,
+      selectedIndex: model.resultsPane.selectedIndex,
+      viewportRows: calculateResultViewportRows(this.screen.rows),
+    });
+    this.resultsBox.setScroll(range.start);
     if (
       model.detailPane.visible &&
       (!this.detailVisible || this.lastDetailIdentity !== model.detailPane.identity)

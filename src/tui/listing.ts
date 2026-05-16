@@ -65,7 +65,7 @@ export function buildListSummary(params: {
     return {
       yieldLabel: `${count} row${count === 1 ? "" : "s"} · ${representedCount} PR${representedCount === 1 ? "" : "s"}${count >= browseLimit ? ` · ${browseLimit} shown` : ""}`,
       confidenceLabel: `issue-linked ${linkedCount} · related ${relatedCount}`,
-      coverageLabel: mode === "watchlist" ? "local watch state" : "collapsed priority queue",
+      coverageLabel: mode === "watchlist" ? "local watch state" : "priority queue",
     };
   }
 
@@ -190,11 +190,9 @@ export async function resolveListRows(params: {
     return {
       mode,
       rows,
-      resultTitle: "Inbox",
+      resultTitle: "Priority",
       message:
-        rows.length > 0
-          ? `Loaded ${rows.length} collapsed inbox row(s).`
-          : "No prioritized PRs found.",
+        rows.length > 0 ? `Loaded ${rows.length} priority row(s).` : "No prioritized PRs found.",
       activeUrl: rowUrl(rows[0]),
       isLandingView: true,
     };

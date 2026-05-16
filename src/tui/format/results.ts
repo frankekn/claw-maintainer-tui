@@ -28,6 +28,14 @@ function padRight(value: string, width: number): string {
   return value.length >= width ? value.slice(0, width) : value.padEnd(width);
 }
 
+function useCompactRows(lineWidth: number): boolean {
+  return lineWidth < 86;
+}
+
+function titleLimit(lineWidth: number, fixedWidth: number): number {
+  return Math.max(24, lineWidth - fixedWidth);
+}
+
 function formatFreshness(freshness: TuiFreshness): string {
   return padRight(freshness.toUpperCase(), 7);
 }
@@ -65,7 +73,13 @@ function formatDateShort(value: string): string {
   return value.slice(0, 10);
 }
 
-function formatPriorityRow(candidate: PriorityCandidate): string {
+function formatPriorityRow(candidate: PriorityCandidate, lineWidth: number): string {
+  const age = formatRelativeAge(candidate.pr.updatedAt);
+  const context = `I${candidate.linkedIssueCount} R${candidate.relatedPullRequestCount}`;
+  if (useCompactRows(lineWidth)) {
+    const prefix = `PR #${candidate.pr.prNumber} ${String(candidate.score).padStart(4)} ${candidate.attentionState.toUpperCase()} ${age} ${context} `;
+    return `${prefix}${truncate(candidate.pr.title, titleLimit(lineWidth, prefix.length))}`;
+  }
   const reasons = candidate.reasons
     .slice(0, 3)
     .map((reason) => truncate(reason.label, 18))
@@ -74,11 +88,10 @@ function formatPriorityRow(candidate: PriorityCandidate): string {
   const badges = [candidate.badges.draft ? "D" : "", candidate.badges.maintainer ? "M" : ""]
     .filter(Boolean)
     .join("");
-  const context = `I${candidate.linkedIssueCount} R${candidate.relatedPullRequestCount}`;
   return `${padRight("PR", 8)} ${padRight(`#${candidate.pr.prNumber}`, 9)} ${String(
     candidate.score,
   ).padStart(4)} ${padRight(attention, 7)} ${padRight(
-    formatRelativeAge(candidate.pr.updatedAt),
+    age,
     4,
   )} ${padRight(context, 7)} ${padRight(badges || "-", 3)} ${truncate(
     `${candidate.pr.title}${reasons ? ` · ${reasons}` : ""}`,
@@ -86,11 +99,19 @@ function formatPriorityRow(candidate: PriorityCandidate): string {
   )}`;
 }
 
-function formatPrRow(row: Extract<TuiResultRow, { kind: "pr" }>, mode: TuiMode): string {
+function formatPrRow(
+  row: Extract<TuiResultRow, { kind: "pr" }>,
+  mode: TuiMode,
+  lineWidth: number,
+): string {
   if ((mode === "inbox" || mode === "watchlist") && row.priority) {
-    return formatPriorityRow(row.priority);
+    return formatPriorityRow(row.priority, lineWidth);
   }
   const result = row.pr;
+  if (useCompactRows(lineWidth)) {
+    const prefix = `PR #${result.prNumber} ${result.state.toUpperCase()} ${formatFreshness(row.freshness).trim()} `;
+    return `${prefix}${truncate(result.title, titleLimit(lineWidth, prefix.length))}`;
+  }
   return `${padRight(formatKind(row.kind), 8)} ${padRight(`#${result.prNumber}`, 9)} ${result.score
     .toFixed(3)
     .padStart(5)} ${padRight(result.state.toUpperCase(), 9)} ${padRight(
@@ -101,6 +122,7 @@ function formatPrRow(row: Extract<TuiResultRow, { kind: "pr" }>, mode: TuiMode):
 
 function formatPriorityClusterRow(
   row: Extract<TuiResultRow, { kind: "priority-cluster" }>,
+  lineWidth: number,
 ): string {
   const cluster = row.cluster;
   const representative = cluster.representative;
@@ -111,6 +133,13 @@ function formatPriorityClusterRow(
         ? "VAR"
         : "SEM";
   const context = `P${cluster.totalPrCount} I${cluster.linkedIssueCount}`;
+  if (useCompactRows(lineWidth)) {
+    const prefix = `CLUSTER #${representative.pr.prNumber} ${badge} ${context} `;
+    return `${prefix}${truncate(
+      `${representative.pr.title} · ${cluster.statusReason}`,
+      titleLimit(lineWidth, prefix.length),
+    )}`;
+  }
   return `${padRight(formatKind(row.kind), 8)} ${padRight(`#${representative.pr.prNumber}`, 9)} ${String(
     Math.round(cluster.score),
   ).padStart(4)} ${padRight(cluster.statusLabel.toUpperCase().slice(0, 7), 7)} ${padRight(
@@ -122,8 +151,12 @@ function formatPriorityClusterRow(
   )}`;
 }
 
-function formatIssueRow(row: Extract<TuiResultRow, { kind: "issue" }>): string {
+function formatIssueRow(row: Extract<TuiResultRow, { kind: "issue" }>, lineWidth: number): string {
   const result = row.issue;
+  if (useCompactRows(lineWidth)) {
+    const prefix = `ISSUE #${result.issueNumber} ${result.state.toUpperCase()} ${formatFreshness(row.freshness).trim()} `;
+    return `${prefix}${truncate(result.title, titleLimit(lineWidth, prefix.length))}`;
+  }
   return `${padRight(formatKind(row.kind), 8)} ${padRight(`#${result.issueNumber}`, 9)} ${result.score
     .toFixed(3)
     .padStart(5)} ${padRight(result.state.toUpperCase(), 9)} ${padRight(
@@ -134,6 +167,7 @@ function formatIssueRow(row: Extract<TuiResultRow, { kind: "issue" }>): string {
 
 function formatClusterCandidateRow(
   row: Extract<TuiResultRow, { kind: "cluster-candidate" }>,
+  lineWidth: number,
 ): string {
   const candidate = row.candidate;
   const status =
@@ -142,6 +176,10 @@ function formatClusterCandidateRow(
       : candidate.status === "superseded_candidate"
         ? "SUPER"
         : "POSSIB";
+  if (useCompactRows(lineWidth)) {
+    const prefix = `CLUSTER #${candidate.prNumber} ${status} ${formatVerification(row.verification).trim()} `;
+    return `${prefix}${truncate(candidate.title, titleLimit(lineWidth, prefix.length))}`;
+  }
   return `${padRight(formatKind(row.kind), 8)} ${padRight(`#${candidate.prNumber}`, 9)} ${padRight(
     candidate.matchedBy,
     11,
@@ -153,8 +191,13 @@ function formatClusterCandidateRow(
 
 function formatClusterExcludedRow(
   row: Extract<TuiResultRow, { kind: "cluster-excluded" }>,
+  lineWidth: number,
 ): string {
   const candidate = row.candidate;
+  if (useCompactRows(lineWidth)) {
+    const prefix = `CLUSTER #${candidate.prNumber} EXCLUDED ${formatVerification(row.verification).trim()} `;
+    return `${prefix}${truncate(candidate.title, titleLimit(lineWidth, prefix.length))}`;
+  }
   return `${padRight(formatKind(row.kind), 8)} ${padRight(`#${candidate.prNumber}`, 9)} ${padRight(
     candidate.matchedBy,
     11,
@@ -164,24 +207,30 @@ function formatClusterExcludedRow(
   )} ${truncate(candidate.title, 46)}`;
 }
 
-export function formatResultRow(row: TuiResultRow, mode: TuiMode): string {
+export function formatResultRow(row: TuiResultRow, mode: TuiMode, lineWidth = 100): string {
   switch (row.kind) {
     case "pr":
-      return formatPrRow(row, mode);
+      return formatPrRow(row, mode, lineWidth);
     case "priority-cluster":
-      return formatPriorityClusterRow(row);
+      return formatPriorityClusterRow(row, lineWidth);
     case "issue":
-      return formatIssueRow(row);
+      return formatIssueRow(row, lineWidth);
     case "cluster-candidate":
-      return formatClusterCandidateRow(row);
+      return formatClusterCandidateRow(row, lineWidth);
     case "cluster-excluded":
-      return formatClusterExcludedRow(row);
+      return formatClusterExcludedRow(row, lineWidth);
     case "status":
       return `${row.label}: ${row.value}`;
   }
 }
 
-function formatTableHeader(mode: TuiMode): string {
+function formatTableHeader(mode: TuiMode, lineWidth: number): string {
+  if (useCompactRows(lineWidth)) {
+    if (mode === "inbox" || mode === "watchlist") {
+      return text("Kind ID Score Triage Age Ctx Title", "dim");
+    }
+    return text("Kind ID State Fresh Title", "dim");
+  }
   if (mode === "inbox" || mode === "watchlist") {
     return text(
       `${padRight("Kind", 8)} ${padRight("ID", 9)} ${padRight("Score", 4)} ${padRight(
@@ -200,7 +249,10 @@ function formatTableHeader(mode: TuiMode): string {
   );
 }
 
-function formatClusterWorkspaceHeader(): string {
+function formatClusterWorkspaceHeader(lineWidth: number): string {
+  if (useCompactRows(lineWidth)) {
+    return text("Kind ID Status Verify Title", "dim");
+  }
   return text(
     `${padRight("Kind", 8)} ${padRight("ID", 9)} ${padRight("State", 11)} ${padRight(
       "Status",
@@ -227,9 +279,9 @@ function wrapCard(title: string, body: string[]): string[] {
 
 function buildLandingCard(mode: TuiMode, status: StatusSnapshot | null): string[] {
   if (mode === "inbox") {
-    return wrapCard("Getting started", [
+    return wrapCard("Priority queue", [
       "No local PR index yet.",
-      "PR metadata will sync automatically if stale.",
+      "Sync PR metadata to rank review work.",
       "",
       "[s] Sync PRs   [S] Sync issues   [?] Help",
       "[1-6] Jump mode",
@@ -268,9 +320,11 @@ export function buildResultsPaneModel(input: {
   message: string;
   isLandingView: boolean;
   status: StatusSnapshot | null;
+  lineWidth?: number;
 }): TuiResultsPaneModel {
   const { mode, rows, selectedIndex, focus, title, summary, message, isLandingView, status } =
     input;
+  const lineWidth = input.lineWidth ?? 100;
   const isClusterWorkspace =
     rows.length > 0 &&
     rows.every((row) => row.kind === "cluster-candidate" || row.kind === "cluster-excluded");
@@ -327,10 +381,14 @@ export function buildResultsPaneModel(input: {
     };
   }
 
-  const lines = [isClusterWorkspace ? formatClusterWorkspaceHeader() : formatTableHeader(mode)];
+  const lines = [
+    isClusterWorkspace
+      ? formatClusterWorkspaceHeader(lineWidth)
+      : formatTableHeader(mode, lineWidth),
+  ];
   lines.push(
     ...rows.map((row, index) => {
-      const line = formatResultRow(row, mode);
+      const line = formatResultRow(row, mode, lineWidth);
       if (index !== selectedIndex) {
         return `${text("  ", "dim")}${line}`;
       }
