@@ -6,7 +6,7 @@ import * as embeddingModule from "./embedding.js";
 import * as timeModule from "./lib/time.js";
 import { PrIndexStore } from "./store.js";
 import { resolveMergeReadiness } from "./store/merge-readiness.js";
-import { HOT_ISSUE_PAGE_BUDGET } from "./store/sync-workflow.js";
+import { HOT_ISSUE_LIMIT, HOT_ISSUE_SCAN_PAGE_BUDGET, PAGE_SIZE } from "./store/sync-workflow.js";
 import type {
   HydratedPullRequest,
   IssueDataSource,
@@ -2633,7 +2633,7 @@ describe("PrIndexStore", () => {
       expect(issueSource.listIssuePageCalls[0]).toMatchObject({
         sort: "updated",
         direction: "desc",
-        pageLimit: HOT_ISSUE_PAGE_BUDGET,
+        pageLimit: HOT_ISSUE_SCAN_PAGE_BUDGET,
       });
 
       const statusAfter = await store.status();
@@ -2644,32 +2644,36 @@ describe("PrIndexStore", () => {
       expect(summary.lastSyncWatermark).toBe(issueWatermarkBefore);
     });
 
-    it("bounds hot issue sync by fetched page budget when pages are pull-request heavy", async () => {
+    it("processes hot issues up to the issue limit with a small issue-page budget", async () => {
       const store = await createStore();
-      const issues = Array.from({ length: HOT_ISSUE_PAGE_BUDGET + 3 }, (_, index) =>
-        makeIssue(81000 + index, {
-          updatedAt: `2026-03-${String(20 - index).padStart(2, "0")}T00:00:00.000Z`,
-        }),
+      const issues = Array.from({ length: HOT_ISSUE_LIMIT + PAGE_SIZE }, (_, index) =>
+        makeIssue(81000 + index),
       );
       const issueSource = new FakeIssueDataSource(issues);
-      issueSource.issuePages = issues.map((issue) => ({
-        issues: [issue],
-        fetchedItemCount: 100,
-      }));
+      const pages: FakeIssuePage[] = [];
+      for (let index = 0; index < issues.length; index += PAGE_SIZE) {
+        pages.push({
+          issues: issues.slice(index, index + PAGE_SIZE),
+          fetchedItemCount: PAGE_SIZE,
+        });
+      }
+      issueSource.issuePages = pages;
 
       const summary = await store.syncHotIssues({ repo, source: issueSource });
 
       expect(summary.mode).toBe("hot");
-      expect(summary.processedIssues).toBe(HOT_ISSUE_PAGE_BUDGET);
+      expect(summary.processedIssues).toBe(HOT_ISSUE_LIMIT);
       expect(issueSource.listAllIssueCalls).toEqual([]);
       expect(issueSource.listIssuePageCalls).toHaveLength(1);
       expect(issueSource.listIssuePageCalls[0]).toMatchObject({
         sort: "updated",
         direction: "desc",
-        pageLimit: HOT_ISSUE_PAGE_BUDGET,
+        pageLimit: HOT_ISSUE_SCAN_PAGE_BUDGET,
       });
+      expect(HOT_ISSUE_SCAN_PAGE_BUDGET).toBe(Math.ceil(HOT_ISSUE_LIMIT / PAGE_SIZE));
+      expect(HOT_ISSUE_SCAN_PAGE_BUDGET).toBeLessThan(HOT_ISSUE_LIMIT);
       expect(issueSource.fetchedIssuePageNumbers).toEqual(
-        Array.from({ length: HOT_ISSUE_PAGE_BUDGET }, (_, index) => index + 1),
+        Array.from({ length: HOT_ISSUE_SCAN_PAGE_BUDGET }, (_, index) => index + 1),
       );
     });
 

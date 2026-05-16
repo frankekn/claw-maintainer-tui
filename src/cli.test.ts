@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeSkippedSummary, parseArgs, printSyncSummary, runCli } from "./cli.js";
+import type { PlannerDecision } from "./sync-planner.js";
 import type { StatusSnapshot, SyncSummary } from "./types.js";
 
 function baseSyncSummary(mode: SyncSummary["mode"], entity: SyncSummary["entity"]): SyncSummary {
@@ -49,10 +50,15 @@ function baseStatus(overrides: Partial<StatusSnapshot> = {}): StatusSnapshot {
 async function loadCliWithPlannerMocks(params: {
   status: StatusSnapshot;
   rateLimit: { limit: number; remaining: number; resetAt: string } | null;
+  decision?: PlannerDecision;
 }) {
   vi.resetModules();
   const statusMock = vi.fn().mockResolvedValue(params.status);
-  const syncMock = vi.fn().mockResolvedValue(baseSyncSummary("incremental", "prs"));
+  const syncMock = vi
+    .fn()
+    .mockImplementation((options: { full?: boolean }) =>
+      Promise.resolve(baseSyncSummary(options.full ? "full" : "incremental", "prs")),
+    );
   const syncIssuesMock = vi.fn().mockResolvedValue(baseSyncSummary("incremental", "issues"));
   const syncHotPullRequestsMock = vi.fn().mockResolvedValue(baseSyncSummary("hot", "prs"));
   const syncHotIssuesMock = vi.fn().mockResolvedValue(baseSyncSummary("hot", "issues"));
@@ -83,6 +89,16 @@ async function loadCliWithPlannerMocks(params: {
       GhCliPullRequestDataSource: FakeGhCli,
     };
   });
+  const forcedDecision = params.decision;
+  if (forcedDecision) {
+    vi.doMock("./sync-planner.js", async () => {
+      const actual = await vi.importActual<typeof import("./sync-planner.js")>("./sync-planner.js");
+      return {
+        ...actual,
+        selectSyncDecision: vi.fn().mockReturnValue(forcedDecision),
+      };
+    });
+  }
 
   const { runCli: runCliReloaded } = await import("./cli.js");
   return {
@@ -262,6 +278,7 @@ describe("runCli planner backfill fallback dispatch", () => {
     }
     vi.doUnmock("./store.js");
     vi.doUnmock("./github.js");
+    vi.doUnmock("./sync-planner.js");
     vi.resetModules();
     vi.restoreAllMocks();
   });
@@ -290,7 +307,7 @@ describe("runCli planner backfill fallback dispatch", () => {
     expect(logSpy).toHaveBeenCalledWith("mode: hot");
   });
 
-  it("dispatches sync --backfill incremental fallback with hydrateAll disabled", async () => {
+  it("preserves sync --backfill hydrate-all on incremental fallback", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const freshWatermark = new Date().toISOString();
     const { runCliReloaded, syncMock, syncHotPullRequestsMock, runBackfillSliceMock } =
@@ -315,11 +332,40 @@ describe("runCli planner backfill fallback dispatch", () => {
     expect(code).toBe(0);
     expect(syncMock).toHaveBeenCalledTimes(1);
     expect(syncMock).toHaveBeenCalledWith(
-      expect.objectContaining({ full: false, hydrateAll: false }),
+      expect.objectContaining({ full: false, hydrateAll: true }),
     );
     expect(syncHotPullRequestsMock).not.toHaveBeenCalled();
     expect(runBackfillSliceMock).not.toHaveBeenCalled();
     expect(logSpy).toHaveBeenCalledWith("mode: incremental");
+  });
+
+  it("preserves sync --hot hydrate-all on full fallback dispatch", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { runCliReloaded, syncMock, syncHotPullRequestsMock, runBackfillSliceMock } =
+      await loadCliWithPlannerMocks({
+        status: baseStatus(),
+        rateLimit: moderateRateLimit,
+        decision: { kind: "run", mode: "full", reason: "test_full_fallback" },
+      });
+
+    const code = await runCliReloaded([
+      "sync",
+      "--hot",
+      "--hydrate-all",
+      "--repo",
+      "openclaw/openclaw",
+      "--db",
+      "/tmp/clawlens-cli-test.sqlite",
+    ]);
+
+    expect(code).toBe(0);
+    expect(syncMock).toHaveBeenCalledTimes(1);
+    expect(syncMock).toHaveBeenCalledWith(
+      expect.objectContaining({ full: true, hydrateAll: true }),
+    );
+    expect(syncHotPullRequestsMock).not.toHaveBeenCalled();
+    expect(runBackfillSliceMock).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith("mode: full");
   });
 
   it("dispatches sync-issues --backfill hot fallback to syncHotIssues without legacy sync", async () => {

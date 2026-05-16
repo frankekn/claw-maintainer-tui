@@ -505,11 +505,13 @@ async function buildCliPlannerSnapshot(
 }
 
 async function runPullRequestPlannerMode({
+  hydrateAll,
   mode,
   repo,
   source,
   store,
 }: Pick<CommandContext, "repo" | "source" | "store"> & {
+  hydrateAll: boolean;
   mode: PlannerMode;
 }): Promise<SyncSummary> {
   if (mode === "hot") {
@@ -519,10 +521,10 @@ async function runPullRequestPlannerMode({
     return store.runBackfillSlice({ entity: "prs", repo, source });
   }
   if (mode === "incremental") {
-    return store.sync({ repo, source, full: false, hydrateAll: false });
+    return store.sync({ repo, source, full: false, hydrateAll });
   }
   if (mode === "full") {
-    return store.sync({ repo, source, full: true, hydrateAll: false });
+    return store.sync({ repo, source, full: true, hydrateAll });
   }
   const exhaustiveMode: never = mode;
   throw new Error(`unknown PR planner mode: ${exhaustiveMode}`);
@@ -625,7 +627,13 @@ const commandHandlers: Record<Command, CommandHandler> = {
         });
       }
       return printSyncSummary(
-        await runPullRequestPlannerMode({ mode: decision.mode, repo, source, store }),
+        await runPullRequestPlannerMode({
+          hydrateAll: args.hydrateAll,
+          mode: decision.mode,
+          repo,
+          source,
+          store,
+        }),
         { includeDocs: true },
       );
     }
