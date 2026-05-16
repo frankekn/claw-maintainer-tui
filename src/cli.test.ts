@@ -226,6 +226,30 @@ describe("printSyncSummary output", () => {
     expect(logs).toContain("last_sync_watermark: ");
   });
 
+  it("renders real index counters for skipped summaries", () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown) => {
+      logs.push(String(line));
+    });
+
+    const repo = { owner: "openclaw", name: "openclaw" };
+    const summary = makeSkippedSummary("prs", repo, "rate_limit_reserve", null, {
+      ...baseStatus(),
+      docCount: 12,
+      commentCount: 34,
+      labelCount: 56,
+      vectorAvailable: true,
+    });
+    const exitCode = printSyncSummary(summary, { includeDocs: true });
+
+    expect(exitCode).toBe(0);
+    expect(logs).toContain("mode: skipped");
+    expect(logs).toContain("labels: 56");
+    expect(logs).toContain("docs: 12");
+    expect(logs).toContain("comments: 34");
+    expect(logs).toContain("vector_available: true");
+  });
+
   it("renders next_backfill_cursor for a backfill summary", () => {
     const logs: string[] = [];
     vi.spyOn(console, "log").mockImplementation((line: unknown) => {
@@ -305,6 +329,40 @@ describe("runCli planner backfill fallback dispatch", () => {
     expect(runBackfillSliceMock).not.toHaveBeenCalled();
     expect(syncMock).not.toHaveBeenCalled();
     expect(logSpy).toHaveBeenCalledWith("mode: hot");
+  });
+
+  it("prints current index counters when planner skips sync", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { runCliReloaded, syncMock, syncHotPullRequestsMock, runBackfillSliceMock } =
+      await loadCliWithPlannerMocks({
+        status: baseStatus({
+          docCount: 11,
+          commentCount: 22,
+          labelCount: 33,
+          vectorAvailable: true,
+        }),
+        rateLimit: { limit: 5000, remaining: 50, resetAt: "2026-05-16T00:00:00.000Z" },
+        decision: { kind: "skip", reason: "rate_limit_reserve" },
+      });
+
+    const code = await runCliReloaded([
+      "sync",
+      "--backfill",
+      "--repo",
+      "openclaw/openclaw",
+      "--db",
+      "/tmp/clawlens-cli-test.sqlite",
+    ]);
+
+    expect(code).toBe(0);
+    expect(syncMock).not.toHaveBeenCalled();
+    expect(syncHotPullRequestsMock).not.toHaveBeenCalled();
+    expect(runBackfillSliceMock).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith("mode: skipped");
+    expect(logSpy).toHaveBeenCalledWith("docs: 11");
+    expect(logSpy).toHaveBeenCalledWith("comments: 22");
+    expect(logSpy).toHaveBeenCalledWith("labels: 33");
+    expect(logSpy).toHaveBeenCalledWith("vector_available: true");
   });
 
   it("preserves sync --backfill hydrate-all on incremental fallback", async () => {

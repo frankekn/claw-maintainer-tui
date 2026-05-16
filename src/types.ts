@@ -89,6 +89,12 @@ export type IssuePage = {
   fetchedItemCount: number;
 };
 
+export type PullRequestPage = {
+  page: number;
+  pullRequests: PullRequestRecord[];
+  fetchedItemCount: number;
+};
+
 export type SearchDocKind = "pr_body" | "comment";
 
 export type SearchDocument = {
@@ -539,6 +545,15 @@ export interface PullRequestDataSource {
       startPage?: number;
     },
   ): AsyncGenerator<PullRequestRecord>;
+  listPullRequestPages?(
+    repo: RepoRef,
+    options?: {
+      sort?: "created" | "updated";
+      direction?: "asc" | "desc";
+      startPage?: number;
+      pageLimit?: number;
+    },
+  ): AsyncGenerator<PullRequestPage>;
   listChangedPullRequestNumbersSince(repo: RepoRef, since: string): Promise<number[]>;
   listChangedPullRequestsSince?(repo: RepoRef, since: string): Promise<PullRequestRecord[]>;
   getPullRequestSummary?(repo: RepoRef, prNumber: number): Promise<PullRequestRecord>;

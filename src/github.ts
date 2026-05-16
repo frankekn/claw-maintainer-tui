@@ -8,6 +8,7 @@ import type {
   IssueDataSource,
   IssuePage,
   IssueRecord,
+  PullRequestPage,
   PullRequestChangedFile,
   PullRequestChangedFileKind,
   PullRequestCommentRecord,
@@ -477,6 +478,38 @@ export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueD
     const direction = options.direction ?? (options.newestFirst ? "desc" : "asc");
     const startPage = Math.max(1, options.startPage ?? 1);
     let yielded = 0;
+    for await (const page of this.listPullRequestPages(repo, {
+      sort,
+      direction,
+      startPage,
+    })) {
+      for (const item of page.pullRequests) {
+        yield item;
+        yielded += 1;
+        if (options.limit !== undefined && yielded >= options.limit) {
+          return;
+        }
+      }
+    }
+  }
+
+  async *listPullRequestPages(
+    repo: RepoRef,
+    options: {
+      sort?: "created" | "updated";
+      direction?: "asc" | "desc";
+      startPage?: number;
+      pageLimit?: number;
+    } = {},
+  ): AsyncGenerator<PullRequestPage> {
+    const sort = options.sort ?? "created";
+    const direction = options.direction ?? "asc";
+    const startPage = Math.max(1, options.startPage ?? 1);
+    const pageLimit = options.pageLimit === undefined ? undefined : Math.max(0, options.pageLimit);
+    if (pageLimit !== undefined && pageLimit <= 0) {
+      return;
+    }
+    let fetchedPages = 0;
     for (let page = startPage; ; page += 1) {
       const items = await this.fetchJson<RestPullRequest[]>(
         `repos/${repo.owner}/${repo.name}/pulls?state=all&sort=${sort}&direction=${direction}&per_page=${PAGE_SIZE}&page=${page}`,
@@ -484,14 +517,16 @@ export class GhCliPullRequestDataSource implements PullRequestDataSource, IssueD
       if (items.length === 0) {
         break;
       }
-      for (const item of items) {
-        yield toPullRequestRecord(item);
-        yielded += 1;
-        if (options.limit !== undefined && yielded >= options.limit) {
-          return;
-        }
-      }
+      fetchedPages += 1;
+      yield {
+        page,
+        fetchedItemCount: items.length,
+        pullRequests: items.map((item) => toPullRequestRecord(item)),
+      };
       if (items.length < PAGE_SIZE) {
+        break;
+      }
+      if (pageLimit !== undefined && fetchedPages >= pageLimit) {
         break;
       }
     }

@@ -16,6 +16,7 @@ export const HOT_PR_LIMIT = 500;
 export const HOT_ISSUE_LIMIT = 500;
 export const BACKFILL_PAGES_PER_SLICE = 2;
 export const PAGE_SIZE = 100;
+export const HOT_ISSUE_SCAN_PAGE_BUDGET = Math.ceil(HOT_ISSUE_LIMIT / PAGE_SIZE);
 
 export type PullRequestSyncWorkflowResult = {
   summary: SyncSummary;
@@ -409,12 +410,30 @@ export async function syncHotIssuesWorkflow(params: {
     emitProgress("syncing", issue.number, issue.title);
   };
 
-  for await (const issue of params.source.listAllIssues(params.repo, {
-    sort: "updated",
-    direction: "desc",
-    limit: HOT_ISSUE_LIMIT,
-  })) {
-    processIssue(issue);
+  if (params.source.listIssuePages) {
+    for await (const page of params.source.listIssuePages(params.repo, {
+      sort: "updated",
+      direction: "desc",
+      pageLimit: HOT_ISSUE_SCAN_PAGE_BUDGET,
+    })) {
+      for (const issue of page.issues) {
+        if (processedIssues >= HOT_ISSUE_LIMIT) {
+          break;
+        }
+        processIssue(issue);
+      }
+      if (processedIssues >= HOT_ISSUE_LIMIT) {
+        break;
+      }
+    }
+  } else {
+    for await (const issue of params.source.listAllIssues(params.repo, {
+      sort: "updated",
+      direction: "desc",
+      limit: HOT_ISSUE_LIMIT,
+    })) {
+      processIssue(issue);
+    }
   }
 
   params.setMeta(params.metaKeys.hotSyncAt, hotSyncAt);
@@ -499,35 +518,59 @@ export async function backfillPullRequestsWorkflow(params: {
     });
   };
 
-  const limit = BACKFILL_PAGES_PER_SLICE * PAGE_SIZE;
-  let yielded = 0;
-  for await (const pr of params.source.listAllPullRequests(params.repo, {
-    sort: "created",
-    direction: "asc",
-    startPage: cursor,
-    limit,
-  })) {
-    emitProgress("syncing", pr.number, pr.title);
-    params.upsertPullRequestSummary(pr, "partial");
-    processedPrs += 1;
-    yielded += 1;
-    itemsInCurrentPage += 1;
-    if (itemsInCurrentPage >= PAGE_SIZE) {
+  if (params.source.listPullRequestPages) {
+    let fetchedPages = 0;
+    for await (const page of params.source.listPullRequestPages(params.repo, {
+      sort: "created",
+      direction: "asc",
+      startPage: cursor,
+      pageLimit: BACKFILL_PAGES_PER_SLICE,
+    })) {
+      fetchedPages += 1;
+      for (const pr of page.pullRequests) {
+        emitProgress("syncing", pr.number, pr.title);
+        params.upsertPullRequestSummary(pr, "partial");
+        processedPrs += 1;
+        emitProgress("syncing", pr.number, pr.title);
+      }
+      cursor = Math.max(cursor + 1, page.page + 1);
+      params.setMeta(params.metaKeys.backfillCursor, String(cursor));
+      if (page.fetchedItemCount < PAGE_SIZE) {
+        lastPageWasPartial = true;
+        break;
+      }
+    }
+    if (fetchedPages < BACKFILL_PAGES_PER_SLICE) {
+      lastPageWasPartial = true;
+    }
+  } else {
+    const limit = BACKFILL_PAGES_PER_SLICE * PAGE_SIZE;
+    let yielded = 0;
+    for await (const pr of params.source.listAllPullRequests(params.repo, {
+      sort: "created",
+      direction: "asc",
+      startPage: cursor,
+      limit,
+    })) {
+      emitProgress("syncing", pr.number, pr.title);
+      params.upsertPullRequestSummary(pr, "partial");
+      processedPrs += 1;
+      yielded += 1;
+      itemsInCurrentPage += 1;
+      if (itemsInCurrentPage >= PAGE_SIZE) {
+        cursor += 1;
+        params.setMeta(params.metaKeys.backfillCursor, String(cursor));
+        itemsInCurrentPage = 0;
+      }
+      emitProgress("syncing", pr.number, pr.title);
+    }
+
+    if (itemsInCurrentPage > 0) {
       cursor += 1;
       params.setMeta(params.metaKeys.backfillCursor, String(cursor));
-      itemsInCurrentPage = 0;
+    } else if (yielded === 0) {
+      lastPageWasPartial = true;
     }
-    emitProgress("syncing", pr.number, pr.title);
-  }
-
-  // If the last page (or only page) returned a partial result, the data source has been exhausted.
-  if (itemsInCurrentPage > 0) {
-    lastPageWasPartial = true;
-    cursor += 1;
-    params.setMeta(params.metaKeys.backfillCursor, String(cursor));
-  } else if (yielded < limit) {
-    // We may have yielded an exact page boundary but no further pages exist.
-    lastPageWasPartial = true;
   }
 
   let nextBackfillCursor: number | null = cursor;
@@ -667,10 +710,9 @@ export async function backfillIssuesWorkflow(params: {
     }
 
     if (itemsInCurrentPage > 0) {
-      lastPageWasPartial = true;
       cursor += 1;
       params.setMeta(params.metaKeys.backfillCursor, String(cursor));
-    } else if (yielded < limit) {
+    } else if (yielded === 0) {
       lastPageWasPartial = true;
     }
   }

@@ -6,12 +6,13 @@ import * as embeddingModule from "./embedding.js";
 import * as timeModule from "./lib/time.js";
 import { PrIndexStore } from "./store.js";
 import { resolveMergeReadiness } from "./store/merge-readiness.js";
-import { HOT_ISSUE_LIMIT, PAGE_SIZE } from "./store/sync-workflow.js";
+import { HOT_ISSUE_LIMIT, HOT_ISSUE_SCAN_PAGE_BUDGET, PAGE_SIZE } from "./store/sync-workflow.js";
 import type {
   HydratedPullRequest,
   IssueDataSource,
   IssuePage,
   IssueRecord,
+  PullRequestPage,
   PullRequestCommentRecord,
   PullRequestDataSource,
   PullRequestFactRecord,
@@ -39,6 +40,13 @@ type ListAllIssueCallOptions = {
   startPage?: number;
 };
 
+type ListPullRequestPageCallOptions = {
+  sort?: "created" | "updated";
+  direction?: "asc" | "desc";
+  startPage?: number;
+  pageLimit?: number;
+};
+
 type ListIssuePageCallOptions = {
   sort?: "created" | "updated";
   direction?: "asc" | "desc";
@@ -48,6 +56,11 @@ type ListIssuePageCallOptions = {
 
 type FakeIssuePage = {
   issues: IssueRecord[];
+  fetchedItemCount: number;
+};
+
+type FakePullRequestPage = {
+  pullRequests: PullRequestRecord[];
   fetchedItemCount: number;
 };
 
@@ -62,6 +75,9 @@ class FakePullRequestDataSource implements PullRequestDataSource {
   factCalls: number[] = [];
   searchCalls: Array<{ query: string; state: "open" | "closed"; limit: number }> = [];
   listAllPrCalls: ListAllPrCallOptions[] = [];
+  listPullRequestPageCalls: ListPullRequestPageCallOptions[] = [];
+  fetchedPullRequestPageNumbers: number[] = [];
+  pullRequestPages: FakePullRequestPage[] | null = null;
   pageSize = 100;
   failAfterYielding: number | null = null;
   searchDelayMs = 0;
@@ -94,14 +110,16 @@ class FakePullRequestDataSource implements PullRequestDataSource {
     this.searchResults.set(`${state}:${query}`, [...prNumbers]);
   }
 
-  async *listAllPullRequests(
-    _repo: RepoRef,
-    options: ListAllPrCallOptions = {},
-  ): AsyncGenerator<PullRequestRecord> {
-    this.listAllPrCalls.push({ ...options });
+  private sortedPullRequests(
+    options: {
+      newestFirst?: boolean;
+      sort?: "created" | "updated";
+      direction?: "asc" | "desc";
+    } = {},
+  ): PullRequestRecord[] {
     const sort = options.sort ?? "created";
     const direction = options.direction ?? (options.newestFirst ? "desc" : "asc");
-    const sorted = Array.from(this.hydrated.values())
+    return Array.from(this.hydrated.values())
       .map((item) => item.pr)
       .sort((a, b) => {
         const cmpField = sort === "updated" ? "updatedAt" : "createdAt";
@@ -112,6 +130,24 @@ class FakePullRequestDataSource implements PullRequestDataSource {
         }
         return direction === "desc" ? right.localeCompare(left) : left.localeCompare(right);
       });
+  }
+
+  private defaultPullRequestPages(options: ListPullRequestPageCallOptions): FakePullRequestPage[] {
+    const sorted = this.sortedPullRequests(options);
+    const pages: FakePullRequestPage[] = [];
+    for (let index = 0; index < sorted.length; index += this.pageSize) {
+      const pullRequests = sorted.slice(index, index + this.pageSize);
+      pages.push({ pullRequests, fetchedItemCount: pullRequests.length });
+    }
+    return pages;
+  }
+
+  async *listAllPullRequests(
+    _repo: RepoRef,
+    options: ListAllPrCallOptions = {},
+  ): AsyncGenerator<PullRequestRecord> {
+    this.listAllPrCalls.push({ ...options });
+    const sorted = this.sortedPullRequests(options);
     const startPage = Math.max(1, options.startPage ?? 1);
     const skip = (startPage - 1) * this.pageSize;
     const limit = options.limit;
@@ -124,6 +160,41 @@ class FakePullRequestDataSource implements PullRequestDataSource {
         throw new Error("simulated listAllPullRequests failure");
       }
       if (limit !== undefined && yielded >= limit) {
+        return;
+      }
+    }
+  }
+
+  async *listPullRequestPages(
+    _repo: RepoRef,
+    options: ListPullRequestPageCallOptions = {},
+  ): AsyncGenerator<PullRequestPage> {
+    this.listPullRequestPageCalls.push({ ...options });
+    const startPage = Math.max(1, options.startPage ?? 1);
+    const pageLimit = options.pageLimit === undefined ? undefined : Math.max(0, options.pageLimit);
+    if (pageLimit !== undefined && pageLimit <= 0) {
+      return;
+    }
+    const pages = this.pullRequestPages ?? this.defaultPullRequestPages(options);
+    let yieldedPages = 0;
+    let yieldedItems = 0;
+    for (let pageIndex = startPage - 1; pageIndex < pages.length; pageIndex += 1) {
+      if (pageLimit !== undefined && yieldedPages >= pageLimit) {
+        return;
+      }
+      const page = pages[pageIndex]!;
+      yieldedItems += page.pullRequests.length;
+      if (this.failAfterYielding !== null && yieldedItems >= this.failAfterYielding) {
+        throw new Error("simulated listAllPullRequests failure");
+      }
+      this.fetchedPullRequestPageNumbers.push(pageIndex + 1);
+      yield {
+        page: pageIndex + 1,
+        pullRequests: [...page.pullRequests],
+        fetchedItemCount: page.fetchedItemCount,
+      };
+      yieldedPages += 1;
+      if (page.fetchedItemCount < this.pageSize) {
         return;
       }
     }
@@ -2629,12 +2700,12 @@ describe("PrIndexStore", () => {
       expect(summary.mode).toBe("hot");
       expect(summary.processedIssues).toBe(2);
       expect(summary.entity).toBe("issues");
-      expect(issueSource.listAllIssueCalls[0]).toMatchObject({
+      expect(issueSource.listAllIssueCalls).toEqual([]);
+      expect(issueSource.listIssuePageCalls[0]).toMatchObject({
         sort: "updated",
         direction: "desc",
-        limit: HOT_ISSUE_LIMIT,
+        pageLimit: HOT_ISSUE_SCAN_PAGE_BUDGET,
       });
-      expect(issueSource.listIssuePageCalls).toEqual([]);
 
       const statusAfter = await store.status();
       expect(statusAfter.issueHotSyncAt).toBe(hotSyncAt);
@@ -2644,25 +2715,35 @@ describe("PrIndexStore", () => {
       expect(summary.lastSyncWatermark).toBe(issueWatermarkBefore);
     });
 
-    it("processes hot issues up to the issue limit without a raw page budget", async () => {
+    it("bounds hot issue sync by fetched core issue pages", async () => {
       const store = await createStore();
       const issues = Array.from({ length: HOT_ISSUE_LIMIT + PAGE_SIZE }, (_, index) =>
         makeIssue(81000 + index),
       );
       const issueSource = new FakeIssueDataSource(issues);
+      const pages: FakeIssuePage[] = [];
+      for (let index = 0; index < issues.length; index += PAGE_SIZE) {
+        pages.push({
+          issues: issues.slice(index, index + PAGE_SIZE),
+          fetchedItemCount: PAGE_SIZE,
+        });
+      }
+      issueSource.issuePages = pages;
 
       const summary = await store.syncHotIssues({ repo, source: issueSource });
 
       expect(summary.mode).toBe("hot");
       expect(summary.processedIssues).toBe(HOT_ISSUE_LIMIT);
-      expect(issueSource.listAllIssueCalls).toHaveLength(1);
-      expect(issueSource.listAllIssueCalls[0]).toMatchObject({
+      expect(issueSource.listAllIssueCalls).toEqual([]);
+      expect(issueSource.listIssuePageCalls).toHaveLength(1);
+      expect(issueSource.listIssuePageCalls[0]).toMatchObject({
         sort: "updated",
         direction: "desc",
-        limit: HOT_ISSUE_LIMIT,
+        pageLimit: HOT_ISSUE_SCAN_PAGE_BUDGET,
       });
-      expect(issueSource.listIssuePageCalls).toEqual([]);
-      expect(issueSource.fetchedIssuePageNumbers).toEqual([]);
+      expect(issueSource.fetchedIssuePageNumbers).toEqual(
+        Array.from({ length: HOT_ISSUE_SCAN_PAGE_BUDGET }, (_, index) => index + 1),
+      );
     });
 
     it("returns processedPrs > 0 and mode 'hot' for the SyncSummary contract", async () => {
@@ -2720,6 +2801,12 @@ describe("PrIndexStore", () => {
       expect(summary.processedPrs).toBe(200);
       // Start was page 1; after two complete pages cursor advances to 3.
       expect(summary.nextBackfillCursor).toBe(3);
+      expect(source.listPullRequestPageCalls[0]).toMatchObject({
+        sort: "created",
+        direction: "asc",
+        startPage: 1,
+        pageLimit: 2,
+      });
       const status = await store.status();
       expect(status.prBackfillCursor).toBe(3);
       expect(status.prBackfillCompletedAt).toBeNull();
@@ -2741,19 +2828,44 @@ describe("PrIndexStore", () => {
       expect(summary.lastSyncAt).toBeNull();
     });
 
+    it("uses fetched page size, not yielded PR count, for PR backfill completion", async () => {
+      const store = await createStore();
+      const hydrated = makeManyPrs(100);
+      const source = new FakePullRequestDataSource(hydrated);
+      source.pullRequestPages = [
+        {
+          pullRequests: hydrated.slice(0, 50).map((item) => item.pr),
+          fetchedItemCount: 100,
+        },
+        {
+          pullRequests: hydrated.slice(50, 100).map((item) => item.pr),
+          fetchedItemCount: 100,
+        },
+      ];
+
+      const summary = await store.runBackfillSlice({ entity: "prs", repo, source });
+
+      expect(summary.mode).toBe("backfill");
+      expect(summary.processedPrs).toBe(100);
+      expect(summary.nextBackfillCursor).toBe(3);
+      const status = await store.status();
+      expect(status.prBackfillCursor).toBe(3);
+      expect(status.prBackfillCompletedAt).toBeNull();
+    });
+
     it("returns backfill_complete without fetching once completion sentinel is set", async () => {
       const store = await createStore();
       const source = new FakePullRequestDataSource(makeManyPrs(50));
 
       const first = await store.runBackfillSlice({ entity: "prs", repo, source });
       expect(first.nextBackfillCursor).toBeNull();
-      source.listAllPrCalls = [];
+      source.listPullRequestPageCalls = [];
 
       const second = await store.runBackfillSlice({ entity: "prs", repo, source });
       expect(second.mode).toBe("backfill");
       expect(second.reason).toBe("backfill_complete");
       expect(second.nextBackfillCursor).toBeNull();
-      expect(source.listAllPrCalls).toEqual([]);
+      expect(source.listPullRequestPageCalls).toEqual([]);
     });
 
     it("is idempotent on retry after a thrown error mid-page", async () => {
@@ -2773,15 +2885,16 @@ describe("PrIndexStore", () => {
       // Retry without the failure injection should start over from cursor 1
       // and successfully advance through 2 pages.
       source.failAfterYielding = null;
-      source.listAllPrCalls = [];
+      source.listPullRequestPageCalls = [];
       const retry = await store.runBackfillSlice({ entity: "prs", repo, source });
 
       expect(retry.processedPrs).toBe(200);
       expect(retry.nextBackfillCursor).toBe(3);
-      expect(source.listAllPrCalls[0]).toMatchObject({
+      expect(source.listPullRequestPageCalls[0]).toMatchObject({
         sort: "created",
         direction: "asc",
         startPage: 1,
+        pageLimit: 2,
       });
 
       const finalStatus = await store.status();
@@ -2833,6 +2946,30 @@ describe("PrIndexStore", () => {
       expect(summary.processedIssues).toBe(100);
       expect(summary.nextBackfillCursor).toBeNull();
       const status = await store.status();
+      expect(status.issueBackfillCursor).toBe(2);
+      expect(status.issueBackfillCompletedAt).not.toBeNull();
+    });
+
+    it("does not infer fallback issue backfill completion from yielded issue count", async () => {
+      const store = await createStore();
+      const source = new FakeIssueDataSource(makeManyIssues(50));
+      Object.defineProperty(source, "listIssuePages", { value: undefined });
+
+      const first = await store.runBackfillSlice({ entity: "issues", repo, source });
+
+      expect(first.mode).toBe("backfill");
+      expect(first.processedIssues).toBe(50);
+      expect(first.nextBackfillCursor).toBe(2);
+      let status = await store.status();
+      expect(status.issueBackfillCursor).toBe(2);
+      expect(status.issueBackfillCompletedAt).toBeNull();
+
+      const second = await store.runBackfillSlice({ entity: "issues", repo, source });
+
+      expect(second.mode).toBe("backfill");
+      expect(second.processedIssues).toBe(0);
+      expect(second.nextBackfillCursor).toBeNull();
+      status = await store.status();
       expect(status.issueBackfillCursor).toBe(2);
       expect(status.issueBackfillCompletedAt).not.toBeNull();
     });

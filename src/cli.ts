@@ -460,6 +460,7 @@ export function makeSkippedSummary(
   repo: RepoRef,
   reason: PlannerSkipReason,
   nextBackfillCursor?: number | null,
+  status?: StatusSnapshot,
 ): SyncSummary {
   return {
     mode: "skipped",
@@ -469,10 +470,10 @@ export function makeSkippedSummary(
     processedIssues: 0,
     skippedPrs: 0,
     skippedIssues: 0,
-    docCount: 0,
-    commentCount: 0,
-    labelCount: 0,
-    vectorAvailable: false,
+    docCount: status?.docCount ?? 0,
+    commentCount: status?.commentCount ?? 0,
+    labelCount: entity === "prs" ? (status?.labelCount ?? 0) : (status?.issueLabelCount ?? 0),
+    vectorAvailable: status?.vectorAvailable ?? false,
     lastSyncAt: null,
     lastSyncWatermark: null,
     reason,
@@ -622,9 +623,12 @@ const commandHandlers: Record<Command, CommandHandler> = {
       const snapshot = await buildCliPlannerSnapshot(store, source, "prs", manualOverride);
       const decision = selectSyncDecision(snapshot);
       if (decision.kind === "skip") {
-        return printSyncSummary(makeSkippedSummary("prs", repo, decision.reason, null), {
-          includeDocs: true,
-        });
+        return printSyncSummary(
+          makeSkippedSummary("prs", repo, decision.reason, null, await store.status()),
+          {
+            includeDocs: true,
+          },
+        );
       }
       return printSyncSummary(
         await runPullRequestPlannerMode({
@@ -669,9 +673,12 @@ const commandHandlers: Record<Command, CommandHandler> = {
       const snapshot = await buildCliPlannerSnapshot(store, source, "issues", manualOverride);
       const decision = selectSyncDecision(snapshot);
       if (decision.kind === "skip") {
-        return printSyncSummary(makeSkippedSummary("issues", repo, decision.reason, null), {
-          includeDocs: false,
-        });
+        return printSyncSummary(
+          makeSkippedSummary("issues", repo, decision.reason, null, await store.status()),
+          {
+            includeDocs: false,
+          },
+        );
       }
       return printSyncSummary(
         await runIssuePlannerMode({ mode: decision.mode, repo, source, store }),
